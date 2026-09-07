@@ -32,32 +32,34 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/q8_repack/repack.cuh"
 
+#include <atomic>
+
 // Opt-in per-type per-width histogram of fused MoE up/gate mat-vec launches, host side only, no synchronization.
 // GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
-static uint64_t g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
+static std::atomic<uint64_t> g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
 
 static void ggml_cuda_repack_moe_fusion_dump() {
     for (int t = 0; t < GGML_TYPE_COUNT; t++) {
         for (int c = 0; c <= 64; c++) {
-            if (g_repack_moe_fusion_hist[t][c] != 0) {
+            const uint64_t n = g_repack_moe_fusion_hist[t][c].load(std::memory_order_relaxed);
+            if (n != 0) {
                 GGML_LOG_WARN("[repack-moe-fusion-stats] type=%s cols=%d launches=%llu\n",
-                              ggml_type_name((ggml_type) t), c, (unsigned long long) g_repack_moe_fusion_hist[t][c]);
+                              ggml_type_name((ggml_type) t), c, (unsigned long long) n);
             }
         }
     }
 }
 
 static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
-    static uint64_t total = 0;
-    static bool registered = false;
-    if (!registered) {
-        registered = true;
+    static std::atomic<uint64_t> total{0};
+    static std::atomic<bool> registered{false};
+    if (!registered.load(std::memory_order_relaxed) && !registered.exchange(true, std::memory_order_acq_rel)) {
         atexit(ggml_cuda_repack_moe_fusion_dump);
     }
     if ((int) type < GGML_TYPE_COUNT) {
-        g_repack_moe_fusion_hist[type][cols < 0 ? 0 : (cols > 64 ? 64 : cols)]++;
+        g_repack_moe_fusion_hist[type][cols < 0 ? 0 : (cols > 64 ? 64 : cols)].fetch_add(1, std::memory_order_relaxed);
     }
-    if (++total % 8192 == 0) {
+    if ((total.fetch_add(1, std::memory_order_relaxed) + 1) % 8192 == 0) {
         ggml_cuda_repack_moe_fusion_dump();
     }
 }
@@ -4972,9 +4974,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                     ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
                 } else {
                     // Activation witness for the K-quant expert fusion, once per type per process.
-                    static bool witnessed[GGML_TYPE_COUNT] = {};
-                    if (src0->type < GGML_TYPE_COUNT && !witnessed[src0->type]) {
-                        witnessed[src0->type] = true;
+                    // Lane worker threads reach this under parallel meta dispatch, so the once flag is an atomic exchange.
+                    static std::atomic<bool> witnessed[GGML_TYPE_COUNT];
+                    // A relaxed load guards the exchange so the steady state is a read, not a cache-line ownership transfer per call.
+                    if (src0->type < GGML_TYPE_COUNT && !witnessed[src0->type].load(std::memory_order_relaxed)
+                            && !witnessed[src0->type].exchange(true, std::memory_order_acq_rel)) {
                         GGML_LOG_WARN("[repack-moe-fusion] type=%s cols=%d fused up/gate mat-vec engaged\n",
                                       ggml_type_name(src0->type), (int) glu->ne[2]);
                     }
