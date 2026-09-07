@@ -31,6 +31,36 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/q8_repack/repack.cuh"
+
+// Opt-in per-type per-width histogram of fused MoE up/gate mat-vec launches, host side only, no synchronization.
+// GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
+static uint64_t g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
+
+static void ggml_cuda_repack_moe_fusion_dump() {
+    for (int t = 0; t < GGML_TYPE_COUNT; t++) {
+        for (int c = 0; c <= 64; c++) {
+            if (g_repack_moe_fusion_hist[t][c] != 0) {
+                GGML_LOG_WARN("[repack-moe-fusion-stats] type=%s cols=%d launches=%llu\n",
+                              ggml_type_name((ggml_type) t), c, (unsigned long long) g_repack_moe_fusion_hist[t][c]);
+            }
+        }
+    }
+}
+
+static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
+    static uint64_t total = 0;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        atexit(ggml_cuda_repack_moe_fusion_dump);
+    }
+    if ((int) type < GGML_TYPE_COUNT) {
+        g_repack_moe_fusion_hist[type][cols < 0 ? 0 : (cols > 64 ? 64 : cols)]++;
+    }
+    if (++total % 8192 == 0) {
+        ggml_cuda_repack_moe_fusion_dump();
+    }
+}
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -4925,11 +4955,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // the canonical path runs one, which is the whole of its decode
             // deficit - and a speculative verify step is 2 to 4 tokens wide, so
             // fusing only at one token never fired under MTP at all.
-            // Q8_0 only: the fused MMV has no MXFP4 port.
+            // The dense fusion admits Q8_0 and MXFP4, the MoE fusion admits every repacked type.
+            const bool fusion_types_ok = ids == nullptr
+                ? ggml_cuda_repack_mmv_fusion_supported(src0) && ggml_cuda_repack_mmv_fusion_supported(gate->src[0])
+                : ggml_cuda_repack_mmv_id_fusion_supported(src0) && ggml_cuda_repack_mmv_id_fusion_supported(gate->src[0]);
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
-                ggml_cuda_repack_mmv_fusion_supported(src0) &&
-                ggml_cuda_repack_mmv_fusion_supported(gate->src[0]) &&
+                fusion_types_ok &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
                     ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -4939,6 +4971,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ids == nullptr) {
                     ggml_cuda_mul_mat_vec_repacked_fused(*cuda_ctx, src0, src1, glu, &fusion_data);
                 } else {
+                    // Activation witness for the K-quant expert fusion, once per type per process.
+                    static bool witnessed[GGML_TYPE_COUNT] = {};
+                    if (src0->type < GGML_TYPE_COUNT && !witnessed[src0->type]) {
+                        witnessed[src0->type] = true;
+                        GGML_LOG_WARN("[repack-moe-fusion] type=%s cols=%d fused up/gate mat-vec engaged\n",
+                                      ggml_type_name(src0->type), (int) glu->ne[2]);
+                    }
+                    static const bool fusion_stats = getenv("GGML_CUDA_REPACK_MOE_FUSION_STATS") != nullptr
+                                                  && atoi(getenv("GGML_CUDA_REPACK_MOE_FUSION_STATS")) != 0;
+                    if (fusion_stats) {
+                        ggml_cuda_repack_moe_fusion_count(src0->type, (int) glu->ne[2]);
+                    }
                     ggml_cuda_mul_mat_id_vec_repacked_fused(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 }
                 fused_mul_mat_vec = true;
