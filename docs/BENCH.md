@@ -142,3 +142,12 @@ parameter-table map and vecdotq path study were recovered and used.
   Decode ceiling ~46 t/s aggregate; currently 36% of it.
 - Optional: quantify llama-swap co-residency effects (Mistral-Large fine-tune tensor + small
   model on leftover VRAM).
+
+## 13. DEPLOYED (2026-09-08)
+
+llama-swap Mistral-Large fine-tune entry swapped to validated config (backup: config.yaml.bak-20260908):
+-sm tensor --fit off -ctk f16 -ctv f16 (dropped -ts 30/29/30). Live check via :8181
+proxy PASS: correct flags on spawned process, coherent output, warm round-trip 69 tok
+in 4.6s (~15 t/s through HTTP, server-side 16.2-16.8). Deployed binary = /mx-llama.cpp
+Sep-4 build (independently passed tensor bench + quality gate); tuning tree at
+/root/mx-Mistral-Large fine-tune stays on Gitea gfx906-w4a4 for the next phase (AR latency work).
