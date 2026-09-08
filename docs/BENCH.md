@@ -83,9 +83,58 @@ Recommended:
 Expected: tg 7.6 -> ~16.5 t/s (+117%), pp512 72 -> ~89; pp2048+ slower than
 layer (135 -> 90) — acceptable for decode-dominant RP use.
 
-## 9. PENDING (next session)
-- llama-server tensor validation end-to-end (was blocked by active llama-swap
-  workloads — Qwen3.8-27B on ROCm1+2, Ornith on ROCm0).
+## 10. Kernel profile — tensor decode (rocprof, 2026-09-08)
+
+tg96 run (64p+96g), instrumented 14.0 t/s (~19% overhead vs 16.75 clean). Raw:
+mi50:/root/prof-tensor/tg.stats.csv. Decode-time attribution per token:
+
+| consumer | share of decode | detail |
+|---|---:|---|
+| mul_mat_vec_q Q4_0 (type 2) | **~72%** | 2 shape classes: 52.7us x 124,845 (rows 12288-class) + 226us x 25,614 (need_sum=true, 1/layer/GPU — big rows: MLP/vocab class) |
+| custom AR (k_broadcast_reduce<3>) | **~25%** | 176 calls/token (2/layer), 88us each — latency-bound, 48KB msgs over 2-hop PCIe |
+| rms_norm + quantize_q8_1 | ~4% | 52569 + 102741 calls, 12us/4.4us |
+| rest | <2% | |
+
+Prefill-only in profile: mul_mat_q MMQ 14.3%, k_twoshot_f32 AR 8.5% (2.3ms each),
+rocclr_copyBufferRectAligned 7.6% (4.7ms x 451 — KV/layer-seam copies).
+
+**Implication: mat-vec (72%) >> AR latency (25%) >> everything else. AR at 88us/call
+is ~3x pure-transfer time — a sync-protocol cost; candidate: fewer/lazier barriers,
+but kernel-level AR surgery is higher risk than mat-vec work.**
+
+## 11. Tuning experiments — mvq warp sweep (2026-09-08)
+
+Target: `mul_mat_vec_q` Q4_0 (72% of decode time per profile). Tested GCN-table
+nwarps for Q4_0 batch-1 (stock=2; RDNA4/DGX-Spark uses 8 for same shape, #26843).
+Method: edit mmvq.cu calc_nwarps GCN table -> Q4_0 special case -> incremental
+rebuild (~1 min) -> same bench params as T1 (r3).
+
+| variant | tensor tg128 | layer tg128 | verdict |
+|---|---:|---:|---|
+| stock nwarps=2 | 16.68 | 7.62 | **best — keep** |
+| nwarps=4 | 16.48 | 7.26 | -4.7% layer — reject |
+| nwarps=1 | 15.16 | 7.25 | -9% tensor — reject |
+
+**Negative result: RDNA4's 8-warp finding does NOT transfer to GCN5. Fork stock
+warp config is optimal at this level.** (Thermal note: post-sweep stock re-verify
+read 16.48 vs 16.68 earlier — sustained-bench drift; relative ordering valid.)
+
+Remaining decode levers (mapped, not yet attempted):
+1. AR latency: k_broadcast_reduce 88us x 176/token = 25% of decode. Pure transfer
+   is ~25us for 48KB over 2-hop PCIe -> ~3x sync-protocol overhead. Needs barrier
+   laziness/overlap work in tp-allreduce.cu (high risk, high value ~+15-20% tg).
+2. Fused dequant+dot inside mul_mat_vec_q for Q4_0 (the 226us need_sum class).
+3. MMVQ->MMQ crossover knobs are MoE-only (MUL_MAT_ID batch caps) — N/A dense.
+4. rms_norm/quantize are 4% combined — not worth fusing first.
+
+## 12. Subagent delegation status (2026-09-08)
+Delegation model degraded (qwen3.8-flash-next: 10 API calls/900s, 4/5 dispatches
+timed out). Parent did analysis + patches directly. Partial transcripts at
+~/.hermes/cache/delegation/live/{deleg_970b9ec5,deleg_7d8c0a0d}/ — the mmvq
+parameter-table map and vecdotq path study were recovered and used.
+- ~~llama-server tensor validation end-to-end~~ **DONE 2026-09-08**: ready in ~20s,
+  short-prompt gen 16.18 t/s (matches bench), 613-tok prompt eval 86 t/s, 0 errors,
+  coherent output. Config validated: -sm tensor --fit off -ctk f16 -ctv f16 -lm dio.
 - Switch /root/mx-Mistral-Large fine-tune checkout to Gitea gfx906-w4a4 branch (currently
   GitHub detached at 50d5fdeb + no-RCCL rebuild).
 - Tuning: L2 q4_0 MMQ tile entry (mmq-config-gfx906.cuh has Q8_0/MXFP4 only),
