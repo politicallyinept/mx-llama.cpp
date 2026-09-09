@@ -143,11 +143,36 @@ parameter-table map and vecdotq path study were recovered and used.
 - Optional: quantify llama-swap co-residency effects (Mistral-Large fine-tune tensor + small
   model on leftover VRAM).
 
-## 13. DEPLOYED (2026-09-08)
+## 14. Mistral-Large-123B fine-tune-v3 Q4_0 validation (2026-09-08, same rig/method)
 
-llama-swap Mistral-Large fine-tune entry swapped to validated config (backup: config.yaml.bak-20260908):
--sm tensor --fit off -ctk f16 -ctv f16 (dropped -ts 30/29/30). Live check via :8181
-proxy PASS: correct flags on spawned process, coherent output, warm round-trip 69 tok
-in 4.6s (~15 t/s through HTTP, server-side 16.2-16.8). Deployed binary = /mx-llama.cpp
-Sep-4 build (independently passed tensor bench + quality gate); tuning tree at
-/root/mx-Mistral-Large fine-tune stays on Gitea gfx906-w4a4 for the next phase (AR latency work).
+125B params, 67.71 GiB. Quality gate passed (coherent, mode-wording differs as expected).
+
+| config | pp512 | pp2048 | pp4096 | tg32 | tg128 |
+|---|---:|---:|---:|---:|---:|
+| tensor + f16 KV | 90.05 | 89.33 | 88.35 | 16.04 | 15.93 |
+| tensor + q8_0 KV | — | 89.13 | — | — | 15.58 |
+| layer + f16 KV | 70.65 | 132.64 | 148.80 | 7.45 | 7.44 |
+
+Mistral-Large fine-tune findings REPLICATE on this independent finetune: tensor decode +114%,
+same flat-PP ~89 comm-bound signature, same ~800-token crossover, KV q8_0 costs
+2.2% tg. Conclusion: these are properties of the Mistral-Large arch + q4_0 +
+3xMI50 tensor split, not model-specific.
+
+### Config bug found + fixed in llama-swap Mistral-Large fine-tune entry (root cause)
+Symptom: entry 502'd on spawn ("upstream exited prematurely").
+Chain: `--fit on` aborts under SPLIT_MODE_TENSOR (known) -> `--fit-ctx 65536`
+is part of the fit machinery and was silently DROPPED with it -> ctx defaulted
+to model max 262144 -> with the original q8_0 KV the 256k KV (~4.3 GiB/GPU)
+barely fit, masking the bug; moving KV to f16 doubled it (~8.6 GiB/GPU) ->
+graph-reserve alloc failure (ggml_backend_meta_buffer_type_alloc_buffer abort,
+exit 134). The entry had been unspawnable-in-principle since -sm tensor was
+added; nobody noticed because q8 KV + luck kept it just inside VRAM.
+Fix deployed: --fit off, explicit -c 32768, f16 KV. Live-verified via proxy
+(ready, coherent output). Backups: config.yaml.bak-20260908{-Mistral-Large fine-tune,}.
+NOTE: 64k f16 KV does NOT fit on this model (1 GiB/GPU more weights than
+Mistral-Large fine-tune); 32k is the max comfortable ctx.
+
+## 15. Delegation timeout fixed
+config had delegation.child_timeout_seconds: 900 (explicitly set; code default
+is no cap) — raised to 3600 via hermes config set. Local qwen3.8-flash-next
+turns run 49-110s; the 900s cap was killing healthy runs.
