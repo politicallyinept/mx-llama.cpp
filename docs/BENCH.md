@@ -220,3 +220,41 @@ Worse than 09-08: both dispatches died to hard API timeouts (180s no-response,
 3 retries) + iteration cap at 3 API calls. LiteLLM qwen3.8-flash-next route
 unusable for delegation right now. Config-sync + AR analysis were completed
 in-parent instead (sections 16 and pending).
+
+## 19. AllReduce latency work (2026-09-09): twoshot found + deployed (+3.3% tg)
+
+Method: fork's built-in GGML_TP_AR_KTIMING=1 phase profiler (write/bar_start/
+reduce/bar_end per call), no code changes needed for diagnosis.
+
+Phase profile (22,706 decode AR calls, broadcast path): ~65us/call total;
+phases anti-correlated across ranks (rank0: write 31k ticks + WAIT 71k;
+rank2: write 62k + wait 27k) => pacing item = peer-write phase; reduce trivial
+(2.5%); rank-dependent write times = asymmetric PCIe paths.
+
+Root cause of missed win: auto-twoshot selection (5f65f9fa3) lists nranks in
+{5,8,10,4-conditional} but NOT 3. GGML_TP_AR_TWOSHOT=1 forces it (12288 %
+(4*3) == 0: alignment-eligible). Two-shot cuts per-rank wire 2x48KB -> 2x16KB.
+
+| config | tg128 | notes |
+|---|---:|---|
+| broadcast (auto) | 16.95 / 16.49-16.75 (r1/r3 class) | baseline |
+| GGML_TP_AR_TWOSHOT=1 | **17.42 ± 0.07 (r3)**, 17.57 (r1) | +3.3% decode, PP unchanged |
+| 2-rank Qwen3.8-27B Q4_0 | 43.23 vs 43.35 | CORRECTED: neutral on 2 ranks. (First measurement 27.2/26.8 was INVALID - llama-bench treats --device A,B as a cycle list of single-GPU runs, not one 2-GPU run; must HIP_VISIBLE_DEVICES-pin for multi-GPU bench. llama-server is unaffected - its --device takes a set.) |
+| quality gate (greedy) | PASS | coherent output, 17.5 t/s |
+
+DEPLOYED: GGML_TP_AR_TWOSHOT=1 added to /llama-swap/start.sh env (service
+restarted, live-verified via proxy). Cumulative Mistral-Large fine-tune decode: 7.6 -> 17.4 t/s.
+Remaining AR headroom: write phase still paces (asymmetric peer paths);
+next lever would be per-rank-pair tuning or barrier overlap - diminishing returns.
+
+## 20. Repack calibration (2026-09-09): dense K-quant repack = +8.7% DECODE on 3-rank tensor
+
+A/B on L3.3-70B-Euryale Q4_K_M (dense, 3-GPU tensor, twoshot on):
+- repack ON (default): pp512 109.80 / pp2048 110.53 / tg128 26.87
+- repack OFF (-nr 1):  pp512 108.90 / pp2048 108.29 / tg128 24.73
+=> +8.7% tg, +1-2% pp. Under 3-rank tensor, PP is AR-bound so kernel gains
+barely move it; decode reads via the repack buffer are the real payoff.
+(Fork author's +50-133% pp claims are MoE/full-row shapes - not our regime.)
+Implication: Q4_0 repack traits entry (subagent authoring, perf/q4_0-repack-gfx906,
+env GGML_CUDA_REPACK_Q4_0) is worth ~+5-9% decode on Mistral-Large fine-tune if it lands in
+the same class => potential 17.4 -> ~18.5-19 t/s.
