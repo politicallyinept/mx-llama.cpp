@@ -176,3 +176,29 @@ Mistral-Large fine-tune); 32k is the max comfortable ctx.
 config had delegation.child_timeout_seconds: 900 (explicitly set; code default
 is no cap) — raised to 3600 via hermes config set. Local qwen3.8-flash-next
 turns run 49-110s; the 900s cap was killing healthy runs.
+
+## 16. llama-swap full config sync (2026-09-09, owner-directed)
+
+Backup: config.yaml.bak-20260908-listsync. Applied via text-preserving transform
+(not yaml round-trip). Result: 26 entries, all validated.
+
+- REMOVED (9): model files gone from disk (Laguna-S-2.1, Qwen3.5-122B-heretic-v2,
+  RavenX v5.1/v6.2, Qwen3.6-35B-heretic-MTP, ace-saber x2, Fable-Fusion-iq4-amd,
+  Qwen3.6-27B-heretic-v2-MTP).
+- ADDED (8): Huihui-Qwen3.8-27B-abliterated(27.1G), Qwen3.8-27B base Q8/Q4(27.1/15.0G),
+  Muse-Glimmer-30B(27.6G, gemma preset), Ornith-1.5-35B Q8/Q4(34.4/19.7G),
+  endless-frontier-BigBang-v1(35.2G), Mistral-7B-v0.3-abliterated(4.1G, spec-draft
+  utility). my-stories-lora.gguf excluded (LoRA adapter, not servable).
+- DEVICE RULE applied per owner: <=35GB -> --device ROCm1,ROCm2 (low-latency pair);
+  >35GB -> all three GPUs. 15 existing entries migrated.
+- LANDMINE SWEEP: 0 remaining -sm layer / --fit on / --fit-ctx; every entry has
+  explicit -c; ${default_params} macro now has --fit on removed.
+- Mistral-Large fine-tune + Mistral-Large fine-tune entries preserved byte-identical (content-level; Mistral-Large fine-tune's
+  --fit off diff vs old backup is my earlier validated fix).
+- VALIDATION: yaml parse OK; llama-swap hot-reload OK ("Configuration Reloaded");
+  26 models listed; spawn test Qwen3.8-27B-Q4_0 PASS (content correct, reasoning
+  in reasoning_content, cache-reuse active 42 tokens).
+- PITFALL logged: python f-string escaping of ${...} llama-swap macros double-braced
+  them (${{PORT}}) and a blind sed half-fix left trailing }} - llama-swap rejected
+  the reload ("proxy uses ${PORT} but cmd does not"). Always grep for }} and
+  verify "Configuration Reloaded" (not "Unable to reload") in journalctl after edits.
