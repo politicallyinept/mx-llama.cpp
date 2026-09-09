@@ -202,3 +202,21 @@ Backup: config.yaml.bak-20260908-listsync. Applied via text-preserving transform
   them (${{PORT}}) and a blind sed half-fix left trailing }} - llama-swap rejected
   the reload ("proxy uses ${PORT} but cmd does not"). Always grep for }} and
   verify "Configuration Reloaded" (not "Unable to reload") in journalctl after edits.
+
+## 17. Speculative decode A/B/C — Mistral-Large fine-tune (2026-09-09): CLOSED, negative
+
+Via llama-server (only spec-capable path), validated tensor config, warm t/s:
+- A baseline: 16.83 t/s
+- B draft-simple (Mistral-7B-v0.3-abliterated Q4_K_M, uncensored): 17.03 (+1.2%,
+  within noise; not worth 4GB VRAM + drafter overhead)
+- C ngram-cache: 15.57 (-7.5%; acceptance 0.17-0.25, mean accepted len 1.7-3.0)
+Conclusion: spec decode does not pay for creative RP on this target. Do not
+retry with other drafts unless acceptance >0.5 is achievable (EAGLE3-class
+target-trained drafts do not exist for Mistral-Large). Raw: mi50:/root/spec-ab/.
+Remaining lever: AR latency surgery (tp-allreduce.cu, ~25% of decode).
+
+## 18. Subagent provider status (2026-09-09)
+Worse than 09-08: both dispatches died to hard API timeouts (180s no-response,
+3 retries) + iteration cap at 3 API calls. LiteLLM qwen3.8-flash-next route
+unusable for delegation right now. Config-sync + AR analysis were completed
+in-parent instead (sections 16 and pending).
