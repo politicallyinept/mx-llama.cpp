@@ -42,7 +42,7 @@ static __host__ __device__ inline T repack_qs_stride(const T ne0) {
 // (ne0/2 B) and 1 B e8m0 scales per sub-block. Both share the de-alias bump.
 template <typename T>
 static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, const T ne0) {
-    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1) ? ne0 / 2 : ne0);
+    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0) ? ne0 / 2 : ne0);
 }
 template <typename T>
 static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
@@ -64,6 +64,11 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // IQ4_NL: the MXFP4 nibble plane with a 2-byte f16 scale plane, 18 B/block = canonical size, VRAM-neutral like the other two.
         case GGML_TYPE_IQ4_NL:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
+        // Q4_0: IQ4_NL's twin layout (block_q4_0 is byte-identical to block_iq4_nl),
+        // but affine decode: x = d*(q-8), the -8 term folded through the DS4
+        // activation sum like Q4_K's min. Env-gated: GGML_CUDA_REPACK_Q4_0.
+        case GGML_TYPE_Q4_0:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
         // Q6_K: de-aliased low-nibble rows, then a highs plane [8 B/32], an int8 scale-pair plane [2 B/32] and an f16 d plane [2 B/256]: canonical 6.5625 bpw.
         case GGML_TYPE_Q6_K:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 10 + (size_t)((ne0 / 32 + 7) / 8) * 2);
@@ -82,7 +87,7 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
 
 // Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
 static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
-    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1) ? 16 : 32;
+    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0) ? 16 : 32;
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
@@ -398,6 +403,45 @@ template <> struct rp_traits<GGML_TYPE_IQ4_NL> {
 #endif
 };
 
+// Q4_0: IQ4_NL's twin repack layout (de-aliased nibble rows + f16 scale plane,
+// byte-identical converter), but affine decode: value = d*(nib - 8), so the
+// dot is d*(nib . x) - 8*d*(sum x). The mmq_get_q8_1_ds_layout table already
+// maps Q4_0 to DS4, so both the batched mat-vec (block_q8_1.ds.y) and the GEMM
+// (DS4 slot) activation sums arrive without further setup. scale2 returns
+// {d, 8*d} for the affine epilogue's dlo*dx*idot - dhi*sum form.
+template <> struct rp_traits<GGML_TYPE_Q4_0> {
+    using slot_t = uint16_t;   // f16 scale
+    static constexpr bool split_scales = false;
+    static constexpr bool affine       = true;
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_0, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+    static constexpr bool raw_lds = false;
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        const uint4  pk = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        lo = make_uint4(pk.x & 0x0F0F0F0Fu, pk.y & 0x0F0F0F0Fu,
+                        pk.z & 0x0F0F0F0Fu, pk.w & 0x0F0F0F0Fu);
+        hi = make_uint4((pk.x >> 4) & 0x0F0F0F0Fu, (pk.y >> 4) & 0x0F0F0F0Fu,
+                        (pk.z >> 4) & 0x0F0F0F0Fu, (pk.w >> 4) & 0x0F0F0F0Fu);
+        d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+    static __device__ __forceinline__ float2 scale2(const uint16_t s) {
+        const float d = __half2float(*reinterpret_cast<const __half *>(&s));
+        return make_float2(d, 8.0f * d);
+    }
+#endif
+};
+
 template <> struct rp_traits<GGML_TYPE_Q6_K> {
     // Four planes: de-aliased packed lows [16 B/32], packed 2-bit highs [8 B/32], int8 scale pairs [2 B/32] (Q6_K scales are per 16 values) and f16 d per 256.
     // Values are pre-shifted, ((q6 - 32) << 2) as int8 (a shift and an XOR 0x80, gfx906 has no byte subtract), and the exact 0.25 is folded into the scale.
@@ -601,7 +645,7 @@ template <> struct rp_traits<GGML_TYPE_Q5_1> {
 };
 
 // One entry per supported repack type - generates the dispatch switches.
-#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q5_1)
+#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q5_1)          X(GGML_TYPE_Q4_0)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_iq4nl_host(const block_iq4_nl * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
