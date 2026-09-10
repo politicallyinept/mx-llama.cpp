@@ -283,6 +283,9 @@ k_cross_device_reduce_1stage(
 // [4]=sample count. Ticks are shader-clock, so only RATIOS are meaningful.
 __device__ unsigned long long g_ar_ktime[5] = {0, 0, 0, 0, 0};
 __device__ int                g_ar_ktime_on = 0;
+// GGML_TP_AR_SKIP_XBAR: broadcast-path end-barrier elision via parity
+// double-buffering (see k_broadcast_reduce). Uploaded once from env.
+__device__ int                g_ar_xbar_on = 0;
 
 template <int NRANKS>
 __global__ void __launch_bounds__(kThreads, 1)
@@ -296,6 +299,40 @@ k_broadcast_reduce(
         int64_t                  n_elements) {
 
     auto dp = *_dp;
+
+    // GGML_TP_AR_SKIP_XBAR: elide barrier_end on the broadcast path by
+    // double-buffering the staging inbox per parity of the per-block call
+    // counter. barrier_end's only cross-call duty is preventing call N+1's
+    // phase-1 peer writes from overwriting call N's phase-2 read sources
+    // before every rank finished reading them. With parities alternating,
+    // call N+1 writes buffer set (N+1)%2 while call N reads set N%2, so no
+    // overlap exists and the barrier is redundant. Cross-call safety is
+    // otherwise provided by barrier_start: a rank can only enter call N+1's
+    // start barrier after all peers published call N+1's data-ready flags,
+    // which requires them to have finished call N's reduce (and passed its
+    // end flag store when the barrier is present). Stream ordering per rank
+    // serializes its own phase-1 writes after its phase-2 reads regardless.
+    // Parity is derived in-kernel from _flag[blockIdx.x] so captured graphs
+    // (whole-token graph capture) alternate sets on each replay without any
+    // host-side state. Reduction order is untouched: bit-exact.
+    // When the flag is off (default) the barrier runs and staging is the
+    // original single set, exactly stock behavior.
+    const bool use_xbar = (g_ar_xbar_on != 0);
+    uint32_t parity = 0;
+    if (use_xbar) {
+        // _flag advances +2 per stock call (once per barrier), so bit 0 never
+        // flips between calls; bit 1 flips exactly once per call. In xbar mode
+        // the epilogue also advances +1 (total +2), keeping the cadence, so
+        // (_flag >> 1) & 1 alternates every call on every block. Mixed
+        // broadcast/twoshot callers both advance +2, so parity stays sane.
+        parity = (self_sg->_flag[blockIdx.x] >> 1) & 1u;
+        // staging layout with XBAR: [2 sets][nranks slots][n_elements].
+        // Shift every rank's staging pointer to this call's set.
+        const int64_t par_off = (int64_t) parity * NRANKS * n_elements;
+        for (int r = 0; r < NRANKS; r++) {
+            dp.ptrs[r] = (const void *)(((float *)(uintptr_t) dp.ptrs[r]) + par_off);
+        }
+    }
 
     const bool ktm = (g_ar_ktime_on != 0) && (blockIdx.x == 0) && (threadIdx.x == 0);
     unsigned long long kt0 = 0, kt1 = 0, kt2 = 0;
@@ -412,7 +449,22 @@ k_broadcast_reduce(
     unsigned long long kt3 = 0;
     if (ktm) { kt3 = clock64(); }
 
-    barrier_end<NRANKS>(sg, self_sg, rank);
+    if (use_xbar) {
+        // XBAR: barrier_end elided (see the parity scheme at kernel top).
+        // Advance the block's call counter so the NEXT call lands on the
+        // other parity set, and keep the flag arithmetic of the stock path
+        // (barrier_start consumes _flag + 1 each call) intact: skipping the
+        // barrier would otherwise stall the next barrier_start's spin, since
+        // it waits for flag == _flag + 1 with _flag only advanced by the
+        // barriers themselves. Store the counter from thread 0 only, after
+        // all threads finished the reduce (they did - no code follows).
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            self_sg->_flag[blockIdx.x] = self_sg->_flag[blockIdx.x] + 1;
+        }
+    } else {
+        barrier_end<NRANKS>(sg, self_sg, rank);
+    }
 
     if (ktm) {
         const unsigned long long kt4 = clock64();
@@ -821,8 +873,14 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     // Broadcast path: F32 staging, N slots per rank (one inbox per peer + unused self slot).
     // Two-shot path: F32 staging, 2 buffers (scatter_buf + allgather_buf) each
     //   sized n_elements floats. Total = 2 * n_elements * sizeof(float) bytes.
+    // GGML_TP_AR_SKIP_XBAR doubles the broadcast staging (2 parity sets) so the
+    // end-barrier can be elided; see k_broadcast_reduce.
+    static const int s_xbar = []{
+        const char * e = getenv("GGML_TP_AR_SKIP_XBAR");
+        return (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }();
     const size_t per_slot   = bytes_f32;
-    const int    need_slots = s_twoshot ? 2 : (s_broadcast ? ctx->nranks : 1);
+    const int    need_slots = s_twoshot ? 2 : (s_broadcast ? ctx->nranks * (s_xbar ? 2 : 1) : 1);
     const size_t need_bytes = per_slot * need_slots;
 
     if (ctx->staging_slots != need_slots || ctx->staging_size < need_bytes) {
@@ -930,13 +988,18 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
         const char * e = getenv("GGML_TP_AR_KTIMING");
         return (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
     }();
-    if (s_ktiming) {
+    if (s_ktiming || s_xbar) {
         static bool uploaded = false;
         if (!uploaded) {
             uploaded = true;
             for (int r = 0; r < nranks; r++) {
                 ggml_cuda_set_device(ctx->dev_ids[r]);
-                CUDA_CHECK(AR_MEMCPY_TO_SYMBOL(g_ar_ktime_on, &s_ktiming, sizeof(int)));
+                if (s_ktiming) {
+                    CUDA_CHECK(AR_MEMCPY_TO_SYMBOL(g_ar_ktime_on, &s_ktiming, sizeof(int)));
+                }
+                if (s_xbar) {
+                    CUDA_CHECK(AR_MEMCPY_TO_SYMBOL(g_ar_xbar_on, &s_xbar, sizeof(int)));
+                }
             }
         }
     }
