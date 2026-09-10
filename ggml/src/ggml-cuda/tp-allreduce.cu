@@ -854,7 +854,7 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
     // traffic pays for the second phase. Four-rank communicators cross over
     // only when they are pipeline stages; standalone TP4 remains broadcast.
     const bool auto_small_twoshot =
-        nranks == 5 || nranks == 8 || nranks == 10 ||
+        nranks == 3 || nranks == 5 || nranks == 8 || nranks == 10 ||
         (nranks == 4 && ctx->prefer_small_twoshot);
     const int64_t twoshot_min_ne = auto_small_twoshot ? 1 : twoshot_legacy_min_ne;
     const bool s_twoshot =
