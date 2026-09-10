@@ -398,6 +398,12 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;
+            case GGML_TYPE_Q4_0:
+                // Byte-identical layout to IQ4_NL: reuse the converter kernel.
+                repack_iq4nl_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                break;
             case GGML_TYPE_Q6_K: {
                 const int64_t nds  = (n_blocks + 7) / 8;
                 const int64_t hoff = ne1 * qs_str;

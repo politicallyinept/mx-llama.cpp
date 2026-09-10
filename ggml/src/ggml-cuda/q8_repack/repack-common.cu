@@ -15,11 +15,20 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
+    // Q4_0 admission is opt-in: GGML_CUDA_REPACK_Q4_0=1. Unset/0 keeps the
+    // stock canonical-kernel path for Q4_0 exactly as before.
+    static const bool s_q4_0 = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+        return e != nullptr && atoi(e) != 0;
+    }();
     switch (t->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ4_NL: {
             return t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_Q4_0: {
+            return s_q4_0 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q4_K:
@@ -286,6 +295,11 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_IQ4_NL:
+            repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_0:
+            // block_q4_0 is byte-identical to block_iq4_nl (f16 d + 16 nibble
+            // bytes), so the converter is the same routine.
             repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_Q6_K:
