@@ -258,3 +258,32 @@ barely move it; decode reads via the repack buffer are the real payoff.
 Implication: Q4_0 repack traits entry (subagent authoring, perf/q4_0-repack-gfx906,
 env GGML_CUDA_REPACK_Q4_0) is worth ~+5-9% decode on Mistral-Large fine-tune if it lands in
 the same class => potential 17.4 -> ~18.5-19 t/s.
+
+## 21. Q4_0 repack LANDED (2026-09-09): +16.6% decode, production-deployed
+
+Patch: branch perf/q4_0-repack-gfx906 @ 3b884f00a (Gitea). 154 insertions, 6 files.
+Design (in-parent after 2 subagent attempts died to provider timeouts):
+- block_q4_0 byte-identical to block_iq4nl -> converter + layout REUSED from IQ4_NL
+- traits: affine decode d*(q-8), scale2 = {d, 8d}, -8 term folded via DS4 activation
+  sums (mmq_get_q8_1_ds_layout ALREADY mapped Q4_0->DS4; zero GEMM-side changes)
+- admission env-gated GGML_CUDA_REPACK_Q4_0=1 in BOTH gates (tensor_supported +
+  meta buft-selection), so off = exactly stock behavior
+- numerical class: reduction-order + f16 sum rounding, same as K-quant repack
+
+A/B (Mistral-Large fine-tune, tensor, twoshot on, r3):
+| config | pp512 | pp2048 | tg32 | tg128 |
+|---|---:|---:|---:|---:|
+| repack OFF | 90.13 | 89.77 | 17.13 | 17.12 |
+| repack ON | 94.67 | 93.89 | 20.12 | 19.96 |
+
+=> +16.6% tg128, +5% pp. (Q4_K_M calibration predicted +5-9% tg; actual beat it.)
+Quality gate: PASS — greedy tides paragraph coherent, primes 2,3,5,7,11,13,17,19
+exact; inline gen 20.3 t/s. Live proxy verify PASS.
+
+DEPLOYED: start.sh += GGML_CUDA_REPACK_Q4_0=1; ${llama-server} macro now points
+at /root/mx-Mistral-Large fine-tune/build/bin (perf branch build; old tree untouched; backups:
+config.yaml.bak-20260909-repack, start.sh.bak-20260909-repack).
+
+CUMULATIVE Mistral-Large fine-tune decode on 3x MI50: 7.62 (layer, deployed Sept 7 AM)
+-> 16.7 (tensor, f16 KV) -> 17.42 (twoshot AR) -> 19.96 (Q4_0 repack)
+= +162% total vs the original production config.
