@@ -363,3 +363,17 @@ Conclusions:
 - Twoshot vs broadcast AR: identical PPL — fork's lossless-AR claim verified.
 - f16 KV: not re-tested here (baked in config, predates patches; standard
   practice, was the chosen non-degrading option vs q8 in section 6).
+
+## 26. MTP speculative decode — tested, NOT deployable (2026-09-14)
+
+The fork ships a modern spec zoo (draft-mtp/eagle3/dflash/dspark, ngram-*).
+Tested Ornith-1.5-35B + its MTPv2 head (mtp-Ornith...gguf), 2rk, prod config:
+- Acceptance profile good: mean len 2.2-3.8, pos0 rate 0.94.
+- BUT throughput 23-24 t/s vs 82-94 t/s control = 4x REGRESSION. Server log:
+  "backend offload failed for seq_id; using CPU sampler" x4 — draft sampler
+  falls back to CPU per round (root-cause lead: the -sm tensor draft backend
+  offload path; likely meta-backend gap for draft contexts).
+- AND greedy MTP output != greedy control (both MTP runs skip prime 23;
+  control correct). Lossless contract violated -> correctness bug candidate.
+VERDICT: closed until the fork's draft-offload bug is fixed upstream. The
+Qwen3.6-family MTP-preserved models on disk remain dormant assets for then.
