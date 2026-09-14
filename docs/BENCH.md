@@ -339,3 +339,27 @@ the right thing per rank count). Verified: Mistral-Large fine-tune 3rk auto 20.2
 forced), Ornith 2rk auto 100.08, gates pass, live proxy OK.
 Per-model AR policy now: 3rk=twoshot(auto), 2rk=broadcast+xbar(auto+flag).
 Euryale dense Q4_K 3rk baseline for the record: 21.06 t/s (profiled run).
+
+## 25. Accuracy audit (2026-09-14): optimized stack PRESERVES PPL — PASS
+
+Method: llama-perplexity, same binary (prod build), same corpus (Dickens
+771KB, c=2048, fixed chunks), env-flip only per leg. Full logs /root/ppl-logs/.
+
+| model | leg | PPL | verdict |
+|---|---|---|---|
+| Mistral-Large-123B fine-tune Q4_0 3rk | A stock | 1.0573 ± 0.0035 | baseline |
+| | B +Q4_0-repack | 1.0564 ± 0.0035 | delta 0.0009 (4x inside SE) PASS |
+| | C B+broadcast-AR | 1.0564 ± 0.0035 | identical to B: AR paths equal PASS |
+| Qwen3.8-27B Q4_0 2rk | D stock | 4.9039 ± 0.0745 | baseline |
+| | D2 +repack | 4.8990 ± 0.0744 | delta 0.005 (15x inside SE) PASS |
+| | E +repack+xbar (prod) | 4.8990 ± 0.0744 | identical to D2: xbar bit-exact PASS |
+| Ornith-35B Q4_K_M 2rk | F xbar-off | 1.9495 ± 0.0160 | baseline |
+| | G xbar-on (prod) | 1.9495 ± 0.0160 | identical: xbar bit-exact PASS |
+
+Conclusions:
+- Q4_0 repack entry: PPL-neutral on both architectures (deltas negative but
+  far inside error = zero within measurement).
+- AR xbar (my patch): bit-exact confirmed on dense AND MoE (4-decimal match).
+- Twoshot vs broadcast AR: identical PPL — fork's lossless-AR claim verified.
+- f16 KV: not re-tested here (baked in config, predates patches; standard
+  practice, was the chosen non-degrading option vs q8 in section 6).
