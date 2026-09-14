@@ -287,3 +287,55 @@ config.yaml.bak-20260909-repack, start.sh.bak-20260909-repack).
 CUMULATIVE Mistral-Large fine-tune decode on 3x MI50: 7.62 (layer, deployed Sept 7 AM)
 -> 16.7 (tensor, f16 KV) -> 17.42 (twoshot AR) -> 19.96 (Q4_0 repack)
 = +162% total vs the original production config.
+
+## 22. Fleet regression suite + AR xbar (2026-09-10): ALL CLEAR, +3.9% 2-rank
+
+Regression suite (5 models, prod binary, twoshot on, gates greedy):
+| model | type | ranks | tg128 | gate |
+|---|---|---|---:|---|
+| Mistral-Large-123B fine-tune | Q4_0 (patch) | 3 | 17.11 -> 19.66 (+14.9%) | PASS primes |
+| Qwen3.8-27B | Q4_0 (patch) | 2 | 43.59 -> 46.85 (+7.5%) | PASS |
+| Qwen3.8-27B | Q8_0 (stock) | 2 | 36.53 (nr: 35.50) | PASS |
+| Ornith-35B MoE | Q4_K_M (stock) | 2 | 96.81 (nr: 93.18) | PASS |
+| Ornith-35B MoE | Q8_0 (stock) | 2 | 102.05 | PASS |
+No regressions anywhere; stock repack types clean on patched binary.
+
+## 23. AR xbar: broadcast end-barrier elision (perf/ar-latency-gfx906 @ 7de6af95e)
+
+Analysis (in-parent; subagent died to provider timeouts - 3rd strike):
+- broadcast kernel: peer-write flush + __threadfence_system (rank-asymmetric,
+  31k vs 62k ticks) then TWO barrier RTs; reduce 2.5%.
+- barrier_end is cross-call-only (protects staging overwrite). Under parity
+  double-buffering (2 staging sets, alternated via _flag>>1&1 in-kernel; flag
+  advances +2/call in stock AND xbar mode) consecutive calls never touch the
+  same set => barrier provably redundant => elided. Bit-exact (reduce order
+  untouched). Twoshot's barrier_end is intra-call (allgather visibility),
+  NOT elided.
+- Merged to production @ 2094f4db5. Results: 2-rank broadcast path
+  43.12 -> 44.81 (+3.9%, variance 10x tighter); 3-rank twoshot no-op (as
+  designed). Mistral-Large fine-tune merged-build stack: 20.35 t/s. GGML_TP_AR_SKIP_XBAR=1
+  deployed fleet-wide in start.sh. Live proxy verify PASS.
+Cumulative Mistral-Large fine-tune: 7.62 -> 20.35 t/s (+167%). Remaining AR cost is the
+two PCIe-flush RTs per twoshot call (structural) - next lever would be
+fusing the two per-layer ARs, unexplored.
+
+## 24. Q4_K_M lever analysis + twoshot auto-fix (2026-09-10)
+
+Question: can K-quant (Q4_K_M) models be improved like Q4_0 was?
+Code + profile findings (rocprof decode, Euryale-70B 3rk / Ornith-35B 2rk):
+- Dense Q4_K already rides the repacked mat-vec (mul_mat_vec_rp<12> = 44% of
+  GPU time; canonical path gone). MoE GLU-fusion on by default. Dense fused
+  mat-vec is Q8_0/MXFP4-only AND measured-losing by the fork author even for
+  Q8_0. MMQ tile tables are bypassed under repack. => K-quant kernels are
+  already well-served; the real lever was elsewhere:
+- PROFILE BOMBSHELL: Ornith 2rk spent 39.6% of GPU time in k_twoshot_f32<2>
+  (98.9us/call) — our fleet-wide GGML_TP_AR_TWOSHOT=1 forced twoshot on 2-rank
+  models where the fork's auto-select correctly keeps broadcast.
+- Measured (2rk): Ornith Q4_K_M 99.15 forced -> 100.53 auto (+1.4%),
+  Qwen27B-Q4_0 46.07 -> 47.31 (+2.7%). 3rk unchanged (twoshot both ways).
+FIX: one-line auto-select correction (nranks==3 added; perf/tp-ar3-autotwoshot
+@ b6fa30224). GGML_TP_AR_TWOSHOT removed from prod start.sh (auto now does
+the right thing per rank count). Verified: Mistral-Large fine-tune 3rk auto 20.29 t/s (==
+forced), Ornith 2rk auto 100.08, gates pass, live proxy OK.
+Per-model AR policy now: 3rk=twoshot(auto), 2rk=broadcast+xbar(auto+flag).
+Euryale dense Q4_K 3rk baseline for the record: 21.06 t/s (profiled run).
