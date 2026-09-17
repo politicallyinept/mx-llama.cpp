@@ -171,18 +171,17 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_0: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
-                mul_mat_vec_rp<GGML_TYPE_Q5_1, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nchannels_y, expert_stride,
                     xs_id, dst_s1);
-            break;
+            } break;
             case GGML_TYPE_Q5_1: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_1, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nchannels_y, expert_stride,
                     xs_id, dst_s1);
-            break;
+            } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_K, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
