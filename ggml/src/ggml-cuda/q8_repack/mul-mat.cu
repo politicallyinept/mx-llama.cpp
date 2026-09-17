@@ -83,6 +83,8 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                         break;
                     case GGML_TYPE_Q4_0:
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0>(w, xq, dst_d,
+                            ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        break;
                     case GGML_TYPE_Q5_1:
                         ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q5_1>(w, xq, dst_d,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
