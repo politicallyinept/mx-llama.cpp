@@ -377,3 +377,27 @@ Tested Ornith-1.5-35B + its MTPv2 head (mtp-Ornith...gguf), 2rk, prod config:
   control correct). Lossless contract violated -> correctness bug candidate.
 VERDICT: closed until the fork's draft-offload bug is fixed upstream. The
 Qwen3.6-family MTP-preserved models on disk remain dormant assets for then.
+
+## 27. Upstream sync 2026-09-16 (32 commits) merged: CLEAN, deployed
+
+Merge: perf/upstream-20260916 @ f35c1bd3e (base b6fa30224 + upstream 62d4be47d).
+Conflicts (Q4_0 x Q5_1 in q8_repack) resolved keeping both types; 3 build-fix
+passes. Highlights: custom AR default-on, twoshot allgather-region fix
+(MEASURED on our rig: 76.9 -> 69.2 us/call, -10%), Q5_1 repack entry,
+DeepSeek-V4.1 arch, DSpark/MTP spec work, -tps mirrored weights.
+
+REGRESSION SCARE, RESOLVED: first post-merge suite read Mistral-Large fine-tune 19.56 (was
+20.29) and Qwen 44.37 (was 47.31). Interleaved same-day A/B against a fresh
+build of the PRE-MERGE commit: pre 19.37/19.56 + 44.38/44.27 vs merged
+19.53/19.32 + 44.37/44.47 => IDENTICAL. The Sep-10 reference numbers were
+simply from a faster box-day (~4-6% day-drift). Kernel profiles agree: merged
+GPU time LOWER (11.23 vs 11.56s), AR improved, repack gain intact
+(16.49 repack-off vs 19.38 on same day). PPL bit-identical. Gates pass.
+LESSON (now policy): never compare t/s across days; interleave a control.
+
+MTP RETEST on merged build (Ornith + MTPv2 head): still broken the same way —
+23-25 t/s vs 82-94 control, CPU-sampler fallback x4 in log, greedy output
+still skips prime 23 (lossless violation). Upstream's spec fixes did not
+address it; root cause still open (draft backend offload under -sm tensor).
+MTP stays closed. Reference-build trick retained: /root/mx-premerge (b6fa30224)
+for future interleaved controls.
