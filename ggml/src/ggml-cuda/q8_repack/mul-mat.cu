@@ -315,16 +315,15 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_0: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q4_0, 16, 16, false><<<grid, 1024, 0, stream>>>(
-                mul_mat_vec_rp<GGML_TYPE_Q5_1, 16, 16, false><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
-            break;
+            } break;
             case GGML_TYPE_Q5_1: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_1, 16, 16, false><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
-            break;
+            } break;
             case GGML_TYPE_Q5_K: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_K, 16, 16, false><<<grid, 1024, 0, stream>>>(
