@@ -289,6 +289,37 @@ static __global__ void repack_q4k_kernel(
     }
 }
 
+// Device-side Q5_1 repack, one thread per 32-value block: the canonical nibble bytes, the fifth-bit word and the half2 {d, m} are copied into their planes.
+static __global__ void repack_q51_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_sub, const int64_t qs_str,
+        const int64_t hoff, const int64_t doff,
+        const int64_t src_stride, const int64_t dst_stride, const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t sb  = i % n_sub;
+        const int64_t row = (i / n_sub) % ne1;
+        const int64_t e   = i / (n_sub * ne1);
+        const block_q5_1 * b = reinterpret_cast<const block_q5_1 *>(src + e * src_stride) + row * n_sub + sb;
+        uint8_t * base = dst + e * dst_stride;
+        const int64_t wi = row * n_sub + sb;
+        uint8_t * lows = base + row * qs_str + sb * 16;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            lows[j] = b->qs[j];
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            base[hoff + wi * 4 + j] = b->qh[j];
+        }
+        const uint8_t * bp = reinterpret_cast<const uint8_t *>(b);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            base[doff + wi * 4 + j] = bp[j];
+        }
+    }
+}
+
 // Device-side Q5_K repack, one thread per 32-value sub-block: Q4_K's nibble pick plus the fifth-bit word gathered from qh, the scale record and {d, dmin} by k == 0.
 static __global__ void repack_q5k_kernel(
         const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
@@ -430,6 +461,13 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     hoff, soff, doff, nsb, (int64_t) src_str, (int64_t) dst_str, n_out);
             } break;
+            case GGML_TYPE_Q5_1: {
+                const int64_t hoff = ne1 * qs_str;
+                const int64_t doff = hoff + ne1 * n_blocks * 4;
+                repack_q51_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    hoff, doff, (int64_t) src_str, (int64_t) dst_str, n_out);
+            } break;
             default:
                 GGML_ABORT("unsupported repack type for async upload");
         }
@@ -437,6 +475,21 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         st.cur      = nullptr;
         st.received = 0;
     }
+}
+
+bool ggml_cuda_repack_try_release_scratch(int device) {
+    // The scratch is sized to the largest repacked tensor of this device, which on a MoE layer split is a whole expert tensor.
+    // Compute reserves run before the first graph compute, so an allocation that fails for lack of VRAM can retry after this frees it.
+    std::lock_guard<std::mutex> lock(s_async_mutex);
+    repack_async_state & st = s_async[device];
+    if (st.scratch == nullptr || st.cur != nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaFree(st.scratch));
+    st.scratch = nullptr;
+    st.cap     = 0;
+    return true;
 }
 
 void ggml_cuda_repack_async_release(int device) {

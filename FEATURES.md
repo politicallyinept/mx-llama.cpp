@@ -29,7 +29,6 @@ cmake --build build --config Release -j
 Recommended environment (each variable enables one of the features above):
 
 ```bash
-export GGML_ENABLE_CUSTOM_AR=1      # custom multi-GPU AllReduce
 export HSA_FORCE_FINE_GRAIN_PCIE=1  # peer-write AllReduce fast path (AMD over PCIe, validated gfx906)
 export GPU_MAX_HW_QUEUES=8          # MoE throughput on -tps
 export LLAMA_ENABLE_MTP_OPT=1       # MTP optimizations (with --spec-type draft-mtp)
@@ -73,7 +72,7 @@ requires `n_gpus % T == 0`. Backend-generic.
 An optional peer-write broadcast plus two-shot reduce-scatter / allgather
 AllReduce for the tensor-parallel reduction (in addition to upstream's
 `allreduce.cu`). F32 on the wire and faster than the RCCL / NCCL ring for token
-generation over PCIe. Enable with `GGML_ENABLE_CUSTOM_AR=1`; the fast peer-write
+generation over PCIe. On by default, `GGML_ENABLE_CUSTOM_AR=0` turns it off; the fast peer-write
 path needs fine-grain PCIe coherence (`HSA_FORCE_FINE_GRAIN_PCIE=1` on any AMD
 over PCIe, a no-op on hardware-coherent GPUs and ignored on NVIDIA). Decode-size
 collectives automatically use two-shot for TP5, TP8, TP10, and TP4 pipeline
@@ -88,6 +87,24 @@ Qwen3.6 head are upstream), enabled with `LLAMA_ENABLE_MTP_OPT=1`: deferred-pref
 KV staging, a KV-only prefill replay, disabling the draft context's pipeline ring,
 and a non-finite-draft fail-safe. Default off uses the standard `draft-mtp` path
 with these disabled. Backend-generic.
+
+## Recurrent state rollback (snapshot ring)
+
+Recurrent and hybrid models checkpointed their state by whole planes, so a rejected
+speculative draft had no cheap way back and the state was rebuilt rather than rewound.
+That is what made MTP drafting on a delta-net model cost more than it saved. Each
+sequence now keeps its snapshots in a ring of physical planes with a head and a valid
+depth, the delta-net kernels scatter per-token snapshot rows as they run, and a graph
+that fails invalidates the affected sequences instead of leaving a half-written plane
+visible. Measured on 4x MI50 with Qwen3.8-Flash-Next MTP UD-Q4_K_XL, 554-token prompt
+at draft depth 2: speculative generation 29.8 to 42.4 t/s on `-sm layer` and 16.4 to
+42.5 t/s on `-sm tensor`, where before the change speculating was slower than not
+speculating at all. Plain generation goes 30.3 to 31.4 t/s with byte-identical output,
+and Qwen3.6-35B-A3B-Q4_K_M single-GPU prefill is unchanged, 955 to 953 (guardrail). No
+flag: rollback engages when a caller asks for it with a single sequence, and it is
+clamped off above one sequence and below a minimum micro-batch with a warning. It lives
+in the recurrent memory layer, so every delta-net model shares it. Backend-generic, the
+delta-net kernels are validated on gfx906.
 
 ## Concurrent lane dispatch
 
@@ -134,6 +151,34 @@ sounds on long prompts: 8x MI50 `-sm layer` with a 23k prompt, 182 to 759 t/s, a
 `-tps 4` generation 23.9 to 26.8 t/s. Three identical requests return identical
 output and identical draft acceptance.
 
+## DeepSeek-V4.1-Flash architecture support
+
+V4.1 keeps V4's grouped-LoRA output projection and single-head KV latent, and changes three things the V4 path cannot express.
+Its compressed tiers are declared per layer in model metadata rather than keyed off V4's fixed compression ratio of 4, so the pooled compressor serves both of V4.1's tiers instead of only the plain one.
+The hyper-connection mix is shifted by one sublayer, so the mix a sublayer computes is consumed by the next one and the run starts from a one-hot mix that selects copy 0.
+V4.1 ships no `output_hc_*` head tensors and reuses the mix the last stage computed, so their absence selects the fold rather than failing the load.
+The per-head query norm V4 applies is absent in V4.1 and is dropped.
+
+Engram is an n-gram hash memory written into the hyper-connection residual at two layers.
+Each position hashes the 2-, 3- and 4-gram ending on it, once per head, giving row indices into that layer's table, and the rows become one key per hyper-connection copy plus a shared value added through a gate that measures how well the key matches the stream.
+The hash runs host side because it is int64 multiply, xor and modulo over the token history, none of which ggml has.
+The two tables are 48.6 GiB each and only a few rows are read per token, so they are mapped and read on demand rather than loaded as weights: put them on the fastest storage available.
+
+Measured on ten MI50 with a 16965-token prompt at temperature 0, `-sm layer`, `-ngl 41` with an explicit `-ts` split.
+The same greedy completion came back on every boot, so the architecture is reproducible, but prompt processing is not stable enough to quote as a single number: the two tables are 97 GiB against 32 GiB of host page cache, so throughput depends on which rows happen to be resident.
+
+```
+prefill  106 to 254 t/s     decode  12.5 to 13.9 t/s
+```
+
+The Engram gather is the dominant prompt-processing cost and is not yet solved.
+A 16965-token prompt takes about 678 thousand major faults and 63 GB of reads on a cold cache, and a load-time prefault of the tables makes it worse rather than better, because a 97 GiB sequential scan evicts the working set that demand paging had already assembled.
+
+Three diagnostic env gates ship with the support, all default off and each logging once when engaged: `LLAMA_DSV41_NO_ENGRAM` drops the Engram contribution, `LLAMA_DSV41_NO_COMPRESS` drops the compressed tier, and `LLAMA_DSV41_QNORM` restores the V4 query norm.
+
+Scope: `-sm layer`, and `-sm tensor -tps 2` since the incremental stage transfer for persistent caches, which reproduces its own output and beats layer mode on decode.
+Speculative decoding against a V4.1 DSpark sidecar is not supported yet.
+
 ## Qwen3.8-Flash-Next tensor parallelism
 
 Qwen3.8-Flash-Next carries a PLE n-gram table - 27465 MiB on the UD-Q4_K_XL quant, larger at
@@ -152,12 +197,35 @@ the loader maps lazily-read tensors even under `-lm dio`: the mapping is virtual
 prefetch is zero and the range is never populated, which avoids whole-model mmap's
 page thrashing while still letting the table be demand paged.
 
+The table can instead be warmed at load: `LLAMA_PLE_PREFAULT=1` touches one byte per
+page of it from eight threads once the weights are in, so the first request does not
+fault the rows in one at a time. That moves the read out of the first request and into
+load time, so how much it is worth is bounded by storage throughput, and it buys
+nothing once the table is already in page cache - it pays on a fresh process, not on a
+warm one. The log line reports the size touched and how long it took, so the cost is
+visible per machine. Off by default, inert when the table is not host resident, and it
+uses no VRAM.
+
 A NextN/MTP draft head is supported with `--spec-type draft-mtp`, converted by
 `convert_hf_to_gguf.py --mtp`. Draft acceptance runs 75-90 percent at `n_max 2` and
-is strongly text dependent (46 to 90 percent across prompts). Whether it is a net
-throughput win depends on the split mode - under `-sm tensor` the multi-GPU verify
-costs more than the drafting saves, while `-sm layer` lands near parity - so measure
-on your own topology before enabling it.
+is strongly text dependent (46 to 90 percent across prompts). With the recurrent
+snapshot ring above it is a throughput win in both split modes on this quant - see
+that section for the numbers - where previously the multi-GPU verify under `-sm tensor`
+cost more than the drafting saved. Acceptance still tracks the text, so measure on your
+own prompts.
+
+Speculating used to cost most of the prefill throughput on this architecture, because two
+graph shapes moved from chunk to chunk and the scheduler could not keep a plan across them.
+Changing the NextN mode altered the graph output requirements without invalidating the
+reservation, so the following graph ran on a plan sized for the previous mode, and the
+rollback convolution snapshot graph emitted one window per snapshot the batch happened to
+carry, so its node count tracked history length. The snapshot graph now emits one window
+per ring plane and crops back to the snapshots actually present, which holds the node count
+constant while producing the same rows. On 4x MI50 with the MTP UD-Q4_K_XL quant, a
+15.8k-token prompt under `-sm layer` goes 421 to 1047 t/s of prefill, against 1184 t/s for
+the same prompt without speculation - so drafting now costs about a tenth of prefill rather
+than two thirds. Generation and draft acceptance are unchanged and the output is
+byte-identical. On by default, with no flag.
 
 ## Shared-expert tensor-parallel split
 
@@ -226,6 +294,42 @@ byte-identical in every arm:
 Hardware-queue handling (`GPU_MAX_HW_QUEUES`) and an optional RCCL point-to-point
 stage-transfer path (`GGML_META_XFER_RCCL`) for the multi-stage pipeline.
 
+## Incremental stage transfer for persistent caches
+
+A multi-stage `-sm tensor` pipeline hands every mirrored tensor a later stage reads across the stage boundary.
+When the reader is a view of a persistent cache, the boundary tensor used to be the writer's set_rows output, which is the whole cache view, so each hop copied the full cache on every token, and each reading layer's own view of a shared cache added one more full copy.
+DeepSeek-V4.1 layers after a source layer read the source layer's caches, and on ten MI50 at `-tps 2` the stage 3 hop moved about 244 MB per token, which is where tensor decode lost to layer mode and why the prefill pipeline never filled.
+The meta backend now keeps a host copy of the small integer inputs it is handed (the KV cell indices) and transfers a set_rows boundary as the dense cell range those indices name, a row block of each lane's own cache, exact bytes.
+A pure view of a persistent cache is served by the cache's writer once instead of one full copy per reading layer.
+Sparse or unknown indices fall back to the full copy, and `GGML_META_XFER_ROWS=0` restores the previous transfers.
+Measured on ten MI50 with a 16965-token prompt at temperature 0, Engram off, `-sm tensor -tps 2`, with the greedy top-5 records bit-identical across three requests and two boots:
+
+```
+prefill  214 -> 601 t/s     decode  7.2 -> 21.5 t/s     (-sm layer on the same prompt: 600 to 650 and 14.1)
+```
+
+Only multi-stage tensor splits go through this path, layer mode and single-stage splits do not run it, and a model whose layers read only their own caches moves nothing new.
+
+## Stage-local mirrored weights
+
+A multi-stage `-sm tensor` split used to place a full copy of every mirrored weight (norms, routers, unsplit projections) on every card, including cards of stages that never read it.
+llama now names the lanes that read a mirrored layer weight, which are the lanes of its own stage plus the neighbouring stage for the first and last layer of a stage, because the stage seam falls between the last AllReduce of one layer and the first split weight of the next.
+The meta backend allocates, writes and reads the copy only on those lanes, deciding presence through the view root, and a partition-time check aborts if a node would ever run on a lane without a copy.
+Compute placement does not change, and `LLAMA_STAGE_LOCAL_MIRROR=0` restores a copy on every lane.
+Largest card VRAM, on ten MI50 unless noted, greedy outputs with top-5 records bit-identical with the copies on and off, prefill and decode unchanged:
+
+```
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack on   out of memory at load -> serves with 1.2 GiB free per card
+DeepSeek-V4.1-Flash MXFP4   -tps 2, 32k, ub 512, repack off  31374 -> 30496 MiB
+DeepSeek-V4-Flash MXFP4     -tps 2                            18876 -> 17936 MiB
+DeepSeek-V4-Flash MXFP4     -tps 4, 8 GPUs                    21780 -> 21178 MiB
+Qwen3.8-Flash-Next Q8_0     -tps 2                            17230 -> 16504 MiB
+MiniMax-M2.1 Q8_0           -tps 2                            26501 -> 26357 MiB
+gpt-oss-120b MXFP4          -tps 2, 4 GPUs                    16297 -> 16273 MiB  (guardrail)
+```
+
+The saving is the mirrored mass, so models whose large matrices are all split (gpt-oss, Gemma 4, dense Qwen) change by a few MiB, and layer mode and single-stage splits are untouched.
+
 ## gfx906 kernel tuning
 
 Hardware-specific tuning for gfx906 / VEGA20 (MI50, MI60, Radeon VII, Radeon Pro
@@ -248,14 +352,15 @@ The quantized copy is now kept and handed to the later matmuls, which is
 bit-exact. Worth +2.2-2.6% on prefill and decode. On by default;
 `GGML_CUDA_Q8_1_CACHE=0` restores the old behavior. Backend-generic.
 
-## Q8_0, MXFP4 and K-quant weight repack (gfx906)
+## Q8_0, MXFP4, K-quant and Q5_1 weight repack (gfx906)
 
 Weights of the types below upload into a repacked layout (quants and scales
 in separate planes, rows de-aliased) that the gfx906 MMQ and mat-vec kernels
 read directly, so prefill stops paying for per-block scale gathers. The Q8_0
-path was contributed by DENEB1312; MXFP4 and the K-quant types follow it
-through per-type kernel traits. On by default on gfx906, carried by the extra
-buffer types like upstream's CPU weight repack, so `--no-repack` disables it
+path was contributed by DENEB1312; MXFP4, the K-quant types and the legacy
+Q5_1 follow it through per-type kernel traits. On by default on gfx906,
+carried by the extra buffer types like upstream's CPU weight repack, so
+`--no-repack` disables it
 (`-nr 1` in llama-bench); a draft model always loads canonical weights. Model
 load stages canonical bytes and repacks on the device, so `-sm layer` loads
 at vanilla-loader parity and tensor-parallel loads within about 1.4x of it.
@@ -270,10 +375,14 @@ lane slice repacks. VRAM use stays at the canonical size for every type.
 | Q6_K | de-aliased lows, highs plane, per-16 scale pairs, f16 d plane | +69% (1 GPU), +59% (2 GPU tensor) | +6% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.3822 vs 7.3823 |
 | Q5_K_M | Q4_K planes plus a fifth-bit word per sub-block | +55% (1 GPU), +50% (2 GPU tensor) | +1% (1 GPU), -5% (2 GPU tensor) | byte-identical boots, PPL 7.4895 vs 7.4929 |
 | Q4_K_M | de-aliased nibbles, scale/min record, half2 d and dmin | +2% (1 GPU), +5% (2 GPU tensor) | +7% (1 GPU), -2% (2 GPU tensor) | byte-identical boots, PPL 7.4319 vs 7.4267 |
+| Q5_1 | nibble plane, fifth-bit word, half2 d and m | +84% (1 GPU), +74% (2 GPU tensor) | flat (1 GPU and 2 GPU tensor) | byte-identical output on 1 GPU, PPL 6.6031 vs 6.6351 |
 
 The K-quant rows are Qwen3-14B on MI50, pp512, tg128, one card in layer
 mode and two cards with `-sm tensor -tps 2`; Q4_K and Q5_K carry the affine
 scale and min pair and fold the activation sum through the q8_1 block sums.
+The Q5_1 row is a Qwen3.6-27B requantized to Q5_1, as no released Q5_1 build
+of it exists; on a Qwen3.8-Flash-Next MoE carrying 43 Q5_1 tensors the same
+repack is +11% prefill on four cards with `-sm tensor`.
 Greedy generation can differ from the canonical kernels within
 floating-point reassociation on every type.
 

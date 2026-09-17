@@ -38,6 +38,20 @@
 // GGML_CUDA_REPACK_MOE_FUSION_STATS=1 prints the non-zero cells every 8192 launches and at process exit.
 static std::atomic<uint64_t> g_repack_moe_fusion_hist[GGML_TYPE_COUNT][65];
 
+// The repack fused epilogue implements SWIGLU, GEGLU, and SWIGLU_OAI at its fixed alpha 1.702 and limit 7.0.
+// Anything else keeps its own GLU node.
+static bool ggml_cuda_repack_fusion_glu_ok(const ggml_tensor * glu) {
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+            return true;
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_get_op_params_f32(glu, 2) == 1.702f && ggml_get_op_params_f32(glu, 3) == 7.0f;
+        default:
+            return false;
+    }
+}
+
 static void ggml_cuda_repack_moe_fusion_dump() {
     for (int t = 0; t < GGML_TYPE_COUNT; t++) {
         for (int c = 0; c <= 64; c++) {
@@ -978,6 +992,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation && ggml_cuda_repack_try_release_scratch(buft_ctx->device)) {
+        // The repack upload scratch outlives the load until the first compute, so a compute reserve can find it still resident.
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+        if (err == cudaSuccess) {
+            GGML_LOG_DEBUG("%s: allocation of %.2f MiB on device %d fit after releasing the repack upload scratch\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -1082,7 +1104,8 @@ struct ggml_backend_cuda_comm_context {
 #endif // GGML_USE_NCCL
 
     // Custom PCIe-friendly AllReduce (GPU-barrier kernel, no NCCL proxy threads).
-    // Opt-in via GGML_ENABLE_CUSTOM_AR=1. Off by default; NCCL is the default path.
+    // On by default and GGML_ENABLE_CUSTOM_AR=0 turns it off.
+    // Without a peer-write coherent fabric it stays on the NCCL path by itself.
     ggml_cuda_tp::CustomARContext custom_ar;
     bool use_custom_ar = false;
 
@@ -1581,9 +1604,9 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     }
 
     // Custom AR can coexist with NCCL/internal. The top-level dispatch tries it
-    // first for eligible F32 tensors when GGML_ENABLE_CUSTOM_AR=1 is set.
+    // first for eligible F32 tensors unless GGML_ENABLE_CUSTOM_AR=0 is set.
     const char * env_custom_ar = getenv("GGML_ENABLE_CUSTOM_AR");
-    const bool enabled_via_env = env_custom_ar && env_custom_ar[0] != '\0' && env_custom_ar[0] != '0';
+    const bool enabled_via_env = env_custom_ar == nullptr || env_custom_ar[0] == '\0' || env_custom_ar[0] != '0';
     const bool supported_nranks = (n_backends >= 2 && n_backends <= ggml_cuda_tp::kMaxRanks);
     if (enabled_via_env && supported_nranks) {
         ggml_cuda_tp::tp_custom_ar_init(&ret->custom_ar, (int)n_backends, ret->dev_ids.data());
@@ -2069,8 +2092,22 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     bool is_src0_cont_2 = ggml_is_contiguous_2(src0);
     bool is_src1_cont_2 = ggml_is_contiguous_2(src1);
 
+    // A large 2D weight (a BF16 output head is 2.5 GiB as F32) is converted and multiplied in row blocks, so the workspace stays bounded.
+    // Each output row is the product of one weight row, so the blocks give the same rows as one call.
+    static const size_t chunk_budget = [] {
+        const char * e = getenv("GGML_CUDA_CUBLAS_CHUNK_MIB");
+        const size_t mib = e ? size_t(std::max(0, atoi(e))) : 256;
+        return mib ? mib << 20 : SIZE_MAX; // 0 keeps the whole weight in one conversion
+    }();
+    const bool    chunk_src0   = compute_type == GGML_TYPE_F32 && src0->type != compute_type && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+                                 ggml_is_contiguously_allocated(src0) && ggml_nelements(src0)*sizeof(cuda_t) > chunk_budget;
+    const int64_t chunk_rows   = chunk_src0 ? std::max<int64_t>(1, chunk_budget/(ne00*sizeof(cuda_t))) : ne01;
+
     if (src0->type == compute_type) {
         src0_ptr = (const cuda_t *) src0->data;
+    } else if (chunk_src0) {
+        alloc_with_cache_recovery(src0_alloc, std::min(chunk_rows, ne01)*ne00, "source-0 conversion");
+        s01 = ne00;
     } else {
         alloc_with_cache_recovery(src0_alloc, ggml_nelements(src0), "source-0 conversion");
 
@@ -2166,7 +2203,25 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     // Theoretically cublasGemmStridedBatchedEx would always work, even for a single matrix.
     // However, for some old NVIDIA and AMD GPUs the strided/Ex GEMM is much slower,
     //     probably because the internal kernel selection logic is suboptimal.
-    if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
+    if (chunk_src0) {
+        const auto convert_func = traits::convert(src0->type);
+        GGML_ASSERT(convert_func != nullptr);
+        if (!ctx.cublas_chunk_logged) {
+            GGML_LOG_DEBUG("CUDA cuBLAS[%d]: converting %s in blocks of %" PRId64 " rows (%" PRId64 " rows of %" PRId64 " elements)\n",
+                           ctx.device, ggml_type_name(src0->type), chunk_rows, ne01, ne00);
+            ctx.cublas_chunk_logged = true;
+        }
+        for (int64_t r0 = 0; r0 < ne01; r0 += chunk_rows) {
+            const int64_t nr = std::min(chunk_rows, ne01 - r0);
+            convert_func((const char *) src0->data + r0*nb01, src0_alloc.get(), nr*ne00, main_stream);
+            CUBLAS_CHECK(
+                cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nr, ne11, ne10,
+                        (const float *) alpha, (const float *) src0_alloc.get(), s01,
+                                               (const float *) src1_ptr, s11,
+                        (const float *) beta,  (float       *) dst_ptr + r0, ne0));
+        }
+    } else if (compute_type == GGML_TYPE_F32 && ne12 == 1 && ne13 == 1) {
         CUBLAS_CHECK(
             cublasSgemm(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
@@ -3935,7 +3990,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            if (node_idx < n_nodes && nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -3944,14 +3999,14 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
@@ -3959,7 +4014,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -4043,10 +4098,13 @@ struct ggml_cuda_moe_weighted_reduction_match {
     int                 node_count   = 0;
 };
 
+// The last layer of a prefill micro-batch has no output rows, so its weighted reduction is empty.
+// Dropping the dependency node there alternates the node count and costs the cached allocation layout.
 static bool ggml_cuda_match_moe_weighted_reduction(
         const ggml_cgraph * cgraph,
         int node_idx,
-        ggml_cuda_moe_weighted_reduction_match & match) {
+        ggml_cuda_moe_weighted_reduction_match & match,
+        bool for_alloc_deps = false) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL || first->type != GGML_TYPE_F32 || !ggml_is_contiguous(first)) {
         return false;
@@ -4107,7 +4165,10 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
     const int     n_expert_used = (int) weighted->ne[1];
     const int64_t n_tokens      = weighted->ne[2] * weighted->ne[3];
-    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens <= 0) {
+    if (n_expert_used < 2 || n_expert_used > MOE_WEIGHTED_REDUCTION_MAX_EXPERTS || n_tokens < 0) {
+        return false;
+    }
+    if (n_tokens == 0 && !for_alloc_deps) {
         return false;
     }
 
@@ -4427,6 +4488,16 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The fusion and its allocation dependencies are switched together, they are not sound apart.
+// GGML_CUDA_MOE_WEIGHTED_REDUCTION=0 selects the unfused MUL and ADD chain.
+static bool ggml_cuda_moe_weighted_reduction_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4437,7 +4508,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL) {
+    if (node->op == GGML_OP_MUL && ggml_cuda_moe_weighted_reduction_enabled()) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
@@ -4964,6 +5035,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_repack_mul_mat_should_fire(src0) &&
                 ggml_cuda_repack_mul_mat_should_fire(gate->src[0]) &&
                 fusion_types_ok &&
+                ggml_cuda_repack_fusion_glu_ok(glu) &&
                 ggml_cuda_repack_mmv_fusion_width_ok(
                     ids == nullptr ? glu->ne[1] : glu->ne[2], ids != nullptr, src0->type)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -5627,14 +5699,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-    if (!disable_fusion) {
+    if (!disable_fusion && ggml_cuda_moe_weighted_reduction_enabled()) {
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;
             }
 
             ggml_cuda_moe_weighted_reduction_match match;
-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, match, /* for_alloc_deps = */ true)) {
                 continue;
             }
 
