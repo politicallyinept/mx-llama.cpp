@@ -475,6 +475,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q6_K;
             }
         }
+    } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4) {
+        // Dense MXFP4: 2D weights -> MXFP4 (full gfx906 fast-path set:
+        // fused mat-vec + repack + tuned MMQ), everything else stays default.
+        if (ggml_n_dims(tensor) == 2 && tensor->ne[0] % 32 == 0) {
+            new_type = GGML_TYPE_MXFP4;
+        }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_MXFP4_MOE) {
         // MoE   tensors -> MXFP4
         // other tensors -> Q8_0
@@ -847,6 +853,7 @@ static bool tensor_requires_imatrix(const char * tensor_name, const ggml_type ds
 ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: return GGML_TYPE_Q4_0;
+        case LLAMA_FTYPE_MOSTLY_MXFP4: return GGML_TYPE_MXFP4;
         case LLAMA_FTYPE_MOSTLY_Q4_1: return GGML_TYPE_Q4_1;
         case LLAMA_FTYPE_MOSTLY_Q5_0: return GGML_TYPE_Q5_0;
         case LLAMA_FTYPE_MOSTLY_Q5_1: return GGML_TYPE_Q5_1;
