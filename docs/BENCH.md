@@ -491,3 +491,14 @@ never validates output; the PPL gate is what makes a wire-format change safe.
 
 NOT deployed — production stays f32 until Brad opts in. To enable: set
 GGML_TP_AR_WIRE=bf16 in the llama-swap env for Mistral-Large fine-tune.
+
+### 29b. bf16-wire stacked on full production (repack ON) — 2026-09-18
+
+Interleaved 4-leg (r=3 each): f32 19.62/19.63 | bf16 20.23/19.90.
+Stacked gain +2.2% (vs +3.3% measured on the no-repack baseline) — matches
+the multiplicative model: faster mat-vec shrinks AR's share of the critical
+path. Deploy expectation: Mistral-Large fine-tune ~20.1 t/s, PPL unchanged (+0.0015;
+repack and AR-wire are independent, both individually PPL-validated).
+Note: the MXFP4-table "Q4_0+repack 19.4-19.6" vs this experiment's f32
+control 16.4-16.6 difference = the repack flag itself (+17.5%, measured
+Sep 17: 16.49->19.38). Different baselines, no contradiction.
