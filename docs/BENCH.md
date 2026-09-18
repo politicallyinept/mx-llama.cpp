@@ -453,3 +453,41 @@ MXFP4 stays experimental; revisit only with an imatrix-aware quantizer.
 Ops notes: imatrix file is 36MB (not ~1GB as expected) — verified correct via
 repo tree API + sha256. Q8_0 source shards deleted after all gates passed
 (/mnt/old back to ~264G free); both MXFP4 ggufs + imatrix retained.
+
+## 29. BF16-on-wire AllReduce — deploy-worthy (2026-09-18)
+
+Env-gated twoshot AR with BF16 wire format: GGML_TP_AR_WIRE=bf16s (scatter only)
+or bf16 (scatter+allgather). Unset/f32 = stock byte-identical. Halves peer bytes
+per hop (8 bf16 per 16B store). Accumulation stays F32, same r-loop order.
+Branch perf/ar-bf16-wire-gfx906 (7dbc60505).
+
+Interleaved bench (Mistral-Large fine-tune 3rk, tg128, r=5, same-day):
+| leg | config | tg128 |
+|---|---|---|
+| A | f32 control | 16.55 |
+| B | bf16s | 15.08 (-8.9%) |
+| C | bf16 | 16.97 (+2.5%) |
+| D | f32 drift ctrl | 16.56 (+0.06%) |
+
+PPL (Dickens 12ck, after addressing fix):
+| config | PPL | vs f32 |
+|---|---|---|
+| f32 | 1.0573 | — |
+| bf16s | 1.1011 | +0.044 |
+| bf16 | 1.0588 | +0.0015 |
+
+Gate: bf16 greedy primes exact (2..29). PASS.
+
+Verdict: bf16 (scatter+allgather) clears both bars — +3.3% tg128 (confirmed
+16.97/16.99 across two runs) AND PPL +0.0015 (inside +0.010 tol). bf16s is a
+net loss: converting the scatter (non-barrier-gating phase) costs ALU with no
+wire benefit where it matters; the win comes from halving the ALLGATHER wire.
+gfx906 has no native bf16 (emulated conversion), which is why wasted
+conversion in bf16s hurts.
+
+Bug caught by PPL gate: initial patch had 2x slot-stride error (readers used
+slice*1 instead of slice*4) -> PPL 13671. Fixed in 7dbc60505. Lesson: bench
+never validates output; the PPL gate is what makes a wire-format change safe.
+
+NOT deployed — production stays f32 until Brad opts in. To enable: set
+GGML_TP_AR_WIRE=bf16 in the llama-swap env for Mistral-Large fine-tune.
