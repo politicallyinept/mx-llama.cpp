@@ -401,3 +401,55 @@ still skips prime 23 (lossless violation). Upstream's spec fixes did not
 address it; root cause still open (draft backend offload under -sm tensor).
 MTP stays closed. Reference-build trick retained: /root/mx-premerge (b6fa30224)
 for future interleaved controls.
+
+## 28. MXFP4 Mistral-Large fine-tune experiment — first leg complete (2026-09-18)
+
+Setup: quantized dense-MXFP4 from bartowski Q8_0 source (no imatrix) using our patched
+quantizer (perf/mxfp4-quant @ f6d96e052: FTYPE 42, 2D weights -> MXFP4). 65.4GB out.
+
+| Metric | Q4_0+repack (ref) | MXFP4 no-imat | Delta |
+|---|---|---|---|
+| tg128 | 19.4-19.6 | 20.10 ± 0.05 | +3% |
+| pp2048 | 90.6 | 86.14 | -5% |
+| PPL (Dickens 12ck) | 1.0564 | 1.1184 (+5.9%) | quality cost |
+| Greedy gate | pass | pass (primes exact) | |
+
+Read: MXFP4's fast path delivers the expected decode win (+3% over Q4_0-repack,
+~+21% over stock Q4_0). PPL cost is real but modest; imatrix leg running to see
+how much recovers. NOTE: overnight-run lessons logged — (1) quantizer needs
+--allow-requantize for Q8_0 sources, (2) script idempotency must size-check
+outputs (409MB partial poisoned the first auto-resume).
+
+## 28b. MXFP4 imatrix leg (2026-09-18): imatrix is a NO-OP — zero recovery
+
+Ran the second leg with the official importance matrix
+(MarsupialAI/Mistral-Large-123B fine-tune_iMat_GGUF/Mistral-Large fine-tune-imatrix.dat, 36MB, sha256
+8d94fc64… verified against repo LFS oid; quant log confirms: "loaded 616
+importance matrix entries … computed on 105 chunks"). Quantized with
+--allow-requantize --leave-output-tensor --imatrix on the same Q8_0 source
+(perf/mxfp4-quant @ f6d96e052). Output 65,358,845,472 B (4.26 BPW), 3.2 min.
+
+| Metric | Q4_0+repack (ref) | MXFP4 no-imat | MXFP4 + imatrix |
+|---|---|---|---|
+| tg128 | 19.4-19.6 | 20.10 ± 0.05 | 20.10 ± 0.04 |
+| pp2048 | 90.6 | 86.14 | 86.23 ± 0.04 |
+| PPL (Dickens 12ck) | 1.0564 | 1.1184 | 1.1184 ± 0.0058 |
+| Greedy gate | pass | pass | pass (primes exact) |
+
+ROOT CAUSE of zero delta: `quantize_row_mxfp4_ref` (ggml/src/ggml-quants.c)
+computes per-block E8M0 scales from amax only — the function signature takes no
+importance-matrix argument, so the .dat is loaded, validated, and then never
+consulted on the dense MXFP4 path. The imat file is bit-equivalent in behavior
+to no-imat. This is NOT a "imatrix didn't help MXFP4" result; it's "our MXFP4
+quantizer ignores imatrix."
+
+Decision: imatrix cannot close the +5.9% PPL gap until the quantizer is patched
+to consume per-column importances (e.g. importance-weighted scale selection /
+rounding like the k-quant paths). Until then MXFP4-imat == MXFP4-noimat; no
+reason to prefer the imat artifact. Trade vs Q4_0-repack unchanged:
++3% decode / -5% prefill / +5.9% PPL. KEEP Q4_0-repack in production.
+MXFP4 stays experimental; revisit only with an imatrix-aware quantizer.
+
+Ops notes: imatrix file is 36MB (not ~1GB as expected) — verified correct via
+repo tree API + sha256. Q8_0 source shards deleted after all gates passed
+(/mnt/old back to ~264G free); both MXFP4 ggufs + imatrix retained.
