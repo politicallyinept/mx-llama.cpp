@@ -530,3 +530,39 @@ Notes:
   -n 512 gates.
 - Deployment: flag currently on Mistral-Large fine-tune only. Mistral-Large fine-tune 3rk is the best next
   candidate (+3.5%, same topology as Mistral-Large fine-tune). Config untouched per request.
+
+## 31. Upstream sync 2026-09-19 (11 commits) merged + validated
+
+Merge: perf/upstream-20260919 @ e721412ab (our line 7dbc60505 + upstream
+5542318e7). Auto-merge CLEAN, zero conflicts.
+
+FEATURES.md review (new since 62d4be47d):
+- DFlash/DFlash2 drafters under -sm tensor: axis-0 gather so a drafter reading
+  the target's split lm head sees whole vocab rows. Upstream: Qwen3.8-27B-Q8 +
+  DFlash2 on 2xMI50 43.8 -> 52.1 t/s decode. UNLOCKS spec-decode under TP for
+  our Qwen fleet. -tpsd runs drafter on fewer lanes.
+- Tied output head split (gemma-4 family): head no longer falls to mirrored
+  default; +9-11% decode. We run Gemma 4 models.
+- Verify-batch twoshot crossover: nranks>=4 crosses at 8192 elements
+  (GGML_TP_AR_TWOSHOT_MIN_NE tunable). AUDITED: only nranks>=4 semantics
+  change; our 3-rank Mistral-Large fine-tune + 2-rank Qwen/Ornith gates unchanged.
+- Token-graph stage-seam capture (multi-stage pipelines), lane graph-cache off
+  under token graph, fused 384-expert MoE router, DSV4 hc-gate fusion,
+  full-device report at load.
+
+Validation (merged build, full prod stack, vs same-day Sep-18 baselines):
+| Model | merged f32 | baseline | delta |
+|---|---:|---:|---:|
+| Mistral-Large-123B fine-tune Q4_0 3rk | 18.83 | 18.82 | +0.05% |
+| Qwen3.8-27B Q4_0 2rk | 44.43 | 43.41 | +2.35% |
+| Qwen3.8-27B Q8_0 2rk | 35.03 | 34.72 | +0.89% |
+| Ornith-35B Q4_K_M 2rk | 101.14 | 100.74 | +0.40% |
+| Ornith-35B Q8_0 2rk | 104.77 | 103.34 | +1.38% |
+PPL: Qwen 4.8277 (bit-identical to baseline), Ornith 1.9212 (bit-identical).
+Gate: 5/5 PASS.
+bf16-wire spot-check post-merge: Mistral-Large fine-tune 19.48 (baseline 19.47). Qwen bf16
+interleaved A/B: 44.54/44.53 vs f32 43.05/43.49 — bf16 wins both pairs with
+10x tighter variance. bf16 path intact and healthy post-merge.
+
+VERDICT: clean merge, no regressions, all features intact. Deploy-ready.
+Production still on prior binary pending go-ahead.
