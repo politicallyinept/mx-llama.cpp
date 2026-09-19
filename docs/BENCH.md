@@ -502,3 +502,31 @@ repack and AR-wire are independent, both individually PPL-validated).
 Note: the MXFP4-table "Q4_0+repack 19.4-19.6" vs this experiment's f32
 control 16.4-16.6 difference = the repack flag itself (+17.5%, measured
 Sep 17: 16.49->19.38). Different baselines, no contradiction.
+
+## 30. bf16-wire full regression suite (2026-09-18/19) — NO REGRESSIONS
+
+Full production stack in every leg (repack+xbar+custom-AR+FA+tensor); only
+GGML_TP_AR_WIRE toggled. Interleaved f32/bf16/f32 same-day per model.
+
+| Model | f32 | bf16 | delta | PPL f32->bf16 | Gate |
+|---|---:|---:|---:|---|---|
+| Mistral-Large-123B fine-tune Q4_0 3rk | 18.82 | 19.47 | +3.5% | — | PASS |
+| Qwen3.8-27B Q4_0 2rk | 43.41 | 44.41 | +2.4% | 4.8277 -> 4.8378 (+0.010, inside SE) | PASS |
+| Qwen3.8-27B Q8_0 2rk | 34.72* | 35.00 | +0.8% | — | PASS |
+| Ornith-35B Q4_K_M 2rk | 100.74 | 100.68 | ~0% | 1.9212 -> 1.9190 (-0.002) | PASS** |
+| Ornith-35B Q8_0 2rk | 103.34 | 103.82 | +0.4% | — | PASS** |
+
+* first f32 Q8_0 leg contaminated (GPU not idle); clean repeat used.
+** Ornith is a thinking model: -n 100 burns out in the reasoning preamble
+   (reasoning itself was correct). -n 512 required for the gate to reach the answer.
+
+Notes:
+- 2-rank models DO ride k_twoshot_f32<2> (large tensors exceed legacy min),
+  so the bf16 patch reaches them; MoE models are AR-amortized -> neutral.
+- Both models read slightly better than Sep-14 PPL baselines on BOTH legs
+  (upstream merge drift, not bf16).
+- Harness lessons: parse PPL with 'sed s/.*PPL = //' (regex-first-number grabs
+  log timestamps); strip build banner before gate parsing; thinking models need
+  -n 512 gates.
+- Deployment: flag currently on Mistral-Large fine-tune only. Mistral-Large fine-tune 3rk is the best next
+  candidate (+3.5%, same topology as Mistral-Large fine-tune). Config untouched per request.
