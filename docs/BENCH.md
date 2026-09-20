@@ -566,3 +566,42 @@ interleaved A/B: 44.54/44.53 vs f32 43.05/43.49 — bf16 wins both pairs with
 
 VERDICT: clean merge, no regressions, all features intact. Deploy-ready.
 Production still on prior binary pending go-ahead.
+
+## 32. DFlash vs MTP speculative-decode shootout (2026-09-19)
+
+Same-tool interleaved legs via llama-cli (temp 0, greedy, -n 256, realistic
+RP creative-writing prompt), full prod env + LLAMA_ENABLE_MTP_OPT=1.
+DFlash drafter: z-lab/Anbeeld Q8_0. MTP: native blk.64.nextn head.
+
+### A: Qwen3.8-27B Q4_0 (actual prod target — no MTP head)
+| leg | gen t/s | vs baseline |
+|---|---:|---:|
+| baseline (no spec) | 42.2 / 44.4 (mean 43.3) | — |
+| DFlash2 (n-max 5) | 36.9 | **−14.8%** |
+DFlash acceptance: 51.5% (183/355), mean len 3.54.
+
+### B: Qwen3.6-27B-Native-MTP Q8_0 (same target, engine isolated)
+| leg | gen t/s | vs baseline |
+|---|---:|---:|
+| baseline (no spec) | 35.5 / 35.5 | — |
+| MTP (native head) | 41.4 | **+16.6%** |
+| DFlash (drafter) | 37.1 | +4.5% |
+MTP acceptance: 51.4% (183/356), mean len 3.54.
+
+### Findings
+- Acceptance is ~51% for BOTH engines — acceptance is NOT the differentiator.
+- The differentiator is DRAFT COST. MTP head is embedded in the target and
+  drafts off already-computed activations (near-free, shares KV). DFlash runs
+  a separate 5-block transformer with its own KV cache every step.
+- On the FAST Q4_0 target (3.8, 43 t/s), DFlash's separate draft pass can't
+  pay for itself -> net −14.8%. On the slower Q8 target (3.6, 35 t/s) the
+  draft overhead is a smaller fraction -> DFlash still nets +4.5%.
+- Same-target (B): MTP (+16.6%) clearly beats DFlash (+4.5%). MTP is the
+  better engine when the target has a native head.
+
+### Verdict
+- Prod Qwen3.8-27B Q4_0: neither spec method helps (DFlash net loss, MTP
+  unavailable). Keep no-spec. Fast Q4_0 targets don't amortize draft overhead.
+- If a Qwen3.8 MTP-head build is ever made, MTP is the path to try (+16% class).
+- DFlash is only worth it on SLOW targets where draft cost is amortized; not
+  on our fast Q4_0 fleet.
