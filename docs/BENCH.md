@@ -605,3 +605,44 @@ MTP acceptance: 51.4% (183/356), mean len 3.54.
 - If a Qwen3.8 MTP-head build is ever made, MTP is the path to try (+16% class).
 - DFlash is only worth it on SLOW targets where draft cost is amortized; not
   on our fast Q4_0 fleet.
+
+## 34. Post-PLX link upgrade: baselines + bf16-wire REVERSAL (2026-09-21)
+
+Hardware change: inter-GPU links moved to a PLX switch card. All 6 models
+re-baselined on ALL 3 CARDS, full prod stack (repack + xbar + custom AR + FA), r=3.
+
+| Model | pp2048 | tg128 | prior tg128 | note |
+|---|---:|---:|---:|---|
+| Mistral-Large-123B fine-tune Q4_0 (3rk) | 176.4 | 21.39 | 19.63 | +8.9% (clean link effect, already 3rk) |
+| Mistral-Large-123B fine-tune Q4_0 (3rk) | 173.1 | 20.49 | 18.82 | +8.9% (clean link effect) |
+| Qwen3.8-27B Q4_0 (3rk) | 567.0 | 54.83 | 43.41 (2rk) | conflates link + rank change |
+| Qwen3.8-27B Q8_0 (3rk) | 657.5 | 45.53 | 34.72 (2rk) | conflates link + rank change |
+| Ornith-35B Q4_K_M (3rk) | 1543.8 | 103.92 | 100.74 (2rk) | +3.2% |
+| Ornith-35B Q8_0 (3rk) | 1900.7 | 109.14 | 103.34 (2rk) | +5.6% |
+
+PPL (improved or flat): Mistral-Large fine-tune 1.0564, Qwen3.8-27B 4.8235, Ornith 1.9021.
+Gates: 3/3 PASS.
+
+### bf16-wire is now a LOSS — the mechanism reversed
+
+| Mistral-Large fine-tune tg128 | pre-PLX | post-PLX |
+|---|---:|---:|
+| f32 | 19.63 | 20.86 |
+| bf16 (deployed) | 20.07 (+2.2%) | 20.62 (-1.2%) |
+
+Interleaved 4-leg (f32 / bf16 / bf16 / f32), variance +/-0.05: both bf16 legs
+below both f32 legs. Qwen shows the same trend (+2.4% pre -> -0.3% post).
+
+Mechanism: bf16-wire's entire value was halving bytes across a SLOW PCIe link.
+The PLX card removed that bottleneck, so the byte savings no longer cover the
+gfx906 bf16 conversion cost. Same effect that made bf16s (scatter only) a loss
+before: conversion cost is fixed, wire savings are conditional on link speed.
+
+ACTION: remove GGML_TP_AR_WIRE=bf16 from the Mistral-Large fine-tune llama-swap profile.
+f32 is the correct setting on the upgraded links.
+
+### Link-width observation (unresolved)
+sysfs reports all 3 GPUs at x16 @ 16 GT/s (Gen4); each GPU's upstream bridge is
+also x16 Gen4, and no PLX device (vendor 10b5) is visible in the container's PCI
+namespace. The +8.9% is real and reproducible, but does not match an "x4" report
+— the x4 reading was likely the PLX-to-CPU uplink rather than the GPU-side links.
