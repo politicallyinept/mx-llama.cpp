@@ -185,6 +185,21 @@ static_assert(sizeof(block_q8_1_mmq_ds_h) == sizeof(block_q8_1_mmq),
               "Unexpected block_q8_1_mmq_ds_h size");
 static_assert(offsetof(block_q8_1_mmq_ds_h, qs) == offsetof(block_q8_1_mmq, qs),
               "block_q8_1_mmq_ds_h qs offset mismatch");
+// Per-32 asymmetric uint4 activation block (scheme B, docs/w4a4-activation-study.md):
+// d4 = (max - min) / 15, value = qs_nibble * d4 + m (m = min). 32 nibbles pack
+// into 16 bytes in the same little-endian nibble-pair order as ggml_cuda_dp8a
+// operands (byte k = {2k, 2k+1}), so a block feeds 4 dp8a instrs directly.
+struct block_q8_1_u4 {
+    uint8_t   qs[16];  // 32 unsigned 4-bit values, little-endian nibble order
+    ggml_half d4;      // scale: (max - min) / 15
+    ggml_half m;       // offset: min
+};
+static_assert(sizeof(block_q8_1_u4) == 20, "block_q8_1_u4 must be 20 bytes");
+
+// Host reference quantizer (fp32 -> block_q8_1_u4), defined in repack-common.cu.
+// NOT wired into any dispatch yet - milestone 2 hooks it into the repacked paths.
+void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+
 
 struct sXq_row_q8 {
     uint4 q[MMQ_RP_Q8_BK][2];

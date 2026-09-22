@@ -444,3 +444,40 @@ void repack_view_cache_purge(int device, const void * base, size_t size) {
         }
     }
 }
+
+
+// Host reference quantizer: fp32 -> block_q8_1_u4 (scheme B, per-32 asymmetric
+// uint4). Vectorized reference impl: one pass for min/max, one pass to pack the
+// nibble pairs. k must be a multiple of 32. NOT dispatched anywhere yet
+// (milestone 2 wires it into mul_mat_vec_repacked_nc / the GEMM path).
+void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    GGML_ASSERT(k % 32 == 0);
+
+    block_q8_1_u4 * GGML_RESTRICT y = (block_q8_1_u4 *) vy;
+    const int nb = (int) (k / 32);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * GGML_RESTRICT xb = x + ib * 32;
+
+        float mn = xb[0], mx = xb[0];
+        for (int i = 1; i < 32; ++i) {
+            mn = mn < xb[i] ? mn : xb[i];
+            mx = mx > xb[i] ? mx : xb[i];
+        }
+
+        const float d  = (mx - mn) / 15.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        uint8_t * GGML_RESTRICT q = y[ib].qs;
+        for (int i = 0; i < 16; ++i) {
+            int q0 = (int) roundf((xb[2*i]     - mn) * id);
+            int q1 = (int) roundf((xb[2*i + 1] - mn) * id);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            q[i] = (uint8_t) (q0 | (q1 << 4));   // byte k = {2k, 2k+1} LE
+        }
+
+        y[ib].d4 = (ggml_half) d;
+        y[ib].m  = (ggml_half) mn;
+    }
+}
