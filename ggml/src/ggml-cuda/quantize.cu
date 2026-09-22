@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "q8_repack/repack-common.cuh"   // block_q8_1_u4 (milestone 1)
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -556,6 +557,93 @@ static __global__ void quantize_mmq_q8_1(
     GGML_UNUSED(n_expert_used);
 }
 
+// W4A4 milestone 2a: fp32 -> block_q8_1_u4 (per-32 asymmetric uint4, scheme B).
+// Same rounding / clamps / scales as the host reference quantize_row_q8_1_u4
+// (q8_repack/repack-common.cu:449): d4 = (mx-mn)/15, id = 1/d4 (0 if d4 == 0),
+// roundf (round-half-away-from-zero), clamp to [0, 15], fp16 round-to-nearest-even
+// for d4 and m. DELTA vs the host reference (intentional, per the milestone spec):
+// the device kernel stores the SIGNED nibble (q-8)&0xF — the dp8a operand
+// convention the milestone-2 dot loop needs (sdot8 + 8*SUMW bookkeeping) — while
+// the host reference stores the raw unsigned code q. Parallelism only otherwise:
+// one thread handles 4 values, min/max reduce across the 8 threads of each
+// 32-value group via shuffles (min/max are exact under any fold order).
+// Grid/block/stream structure mirrors quantize_mmq_q8_1 above. Out-of-range
+// threads (i0 in [ne00, ne0)) still write the zero-input pattern (nibble 8,
+// d4 = m = 0) into the row padding, exactly like the q8_1 MMQ quantizer writes
+// zeros there; the padding blocks are never read. NOT wired into any dispatch yet.
+static __global__ void quantize_mmq_q8_1_u4(
+        const float * __restrict__ x, void * __restrict__ vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+
+    const int64_t i0 = ((int64_t) blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i2  = blockIdx.z % ne2;
+    const int64_t i3  = blockIdx.z / ne2;
+    const int64_t i01 = blockIdx.x;
+    const int64_t base_idx = i3*s03 + i2*s02 + i01*s01;
+
+    const float4 * x4 = (const float4 *) x;
+    block_q8_1_u4 * y = (block_q8_1_u4 *) vy;
+
+    const int64_t k_block = i0 / 32; // 32-value block index in the channel
+    const int64_t iqs     = i0 % 32; // value index in the block (0, 4, 8, ... 28)
+
+    const float4 xi = i0 < ne00 ? x4[(base_idx + i0)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // min/max across the 8 threads covering one 32-value block
+    // (same fold order-invariant result as the host's sequential scan).
+    // Mask style matches quantize_mmq_q8_1 above: vendors/hip.h maps
+    // __shfl_xor_sync to the raw __shfl_xor (HIP_DISABLE_WARP_SYNC_BUILTINS),
+    // and width=32 partitions the wave64 shuffle into 32-lane groups.
+    float mn = fminf(fminf(xi.x, xi.y), fminf(xi.z, xi.w));
+    float mx = fmaxf(fmaxf(xi.x, xi.y), fmaxf(xi.z, xi.w));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        mn = fminf(mn, __shfl_xor_sync(0xFFFFFFFF, mn, offset, WARP_SIZE));
+        mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFF, mx, offset, WARP_SIZE));
+    }
+
+    const float d4  = (mx - mn) / 15.0f;
+    const float id  = d4 != 0.0f ? 1.0f / d4 : 0.0f;
+
+    // q = clamp(rint((x - mn)/d4), 0, 15); host uses roundf on (x-mn)*id.
+    int q0 = (int) roundf((xi.x - mn) * id);
+    int q1 = (int) roundf((xi.y - mn) * id);
+    int q2 = (int) roundf((xi.z - mn) * id);
+    int q3 = (int) roundf((xi.w - mn) * id);
+    q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+    q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+    q2 = q2 < 0 ? 0 : (q2 > 15 ? 15 : q2);
+    q3 = q3 < 0 ? 0 : (q3 > 15 ? 15 : q3);
+
+    // Store the SIGNED nibble (q - 8) & 0xF, packed 2/byte low-first
+    // (byte k = {2k, 2k+1} little-endian — the dp8a operand order).
+    // 4 values/thread = 4 nibbles = 2 bytes: one uint16 store per thread at
+    // qs + iqs/2 (offsets 0,2,...,14 — 8 threads fill the 16-byte qs exactly).
+    const uint32_t packed = ((uint32_t) ((q0 - 8) & 0xF))
+                        | ((uint32_t) ((q1 - 8) & 0xF) <<  4)
+                        | ((uint32_t) ((q2 - 8) & 0xF) <<  8)
+                        | ((uint32_t) ((q3 - 8) & 0xF) << 12);
+
+    // d4 and m as fp16 in the two halves of the 4-byte field right after qs[16]
+    // (offsetof d4 == 16, m == 18 — see block_q8_1_u4, repack-common.cuh:192).
+    const uint32_t dm = ((uint32_t) __half_as_ushort((ggml_half) d4))
+                      | ((uint32_t) __half_as_ushort((ggml_half) mn) << 16);
+
+    const int64_t ib = blockIdx.z*((int64_t) gridDim.x*gridDim.y*blockDim.x*4/32) + k_block*ne1 + blockIdx.x;
+
+    // one 16-bit store for the nibble quad, one 32-bit store for the {d4, m} pair
+    *(uint16_t *) (y[ib].qs + iqs/2) = (uint16_t) packed;
+    if (iqs == 0) {
+        *(uint32_t *) ((char *) y + ib*sizeof(block_q8_1_u4) + 16) = dm;
+    }
+}
+
 void quantize_row_q8_1_cuda(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -612,6 +700,25 @@ void quantize_mmq_q8_1_cuda(
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+// W4A4 milestone 2a launcher: fp32 -> block_q8_1_u4 blocks. Mirrors
+// quantize_mmq_q8_1_cuda's grid/block/stream structure (ne1 as grid.x so the
+// widest dim maps to the grid's fastest-varying axis). NOT called from any
+// dispatch yet — milestone 2b switches the repacked mat-vec path onto it under
+// the GGML_CUDA_W4A4_DOT8 gate.
+void quantize_mmq_q8_1_u4_cuda(
+        const float * x, void * vy,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % 32 == 0);
+
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_q8_1_u4<<<num_blocks, block_size, 0, stream>>>(
+        x, vy, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
 }
 
 // scatter=true reuses the quant kernel: grid over tokens, ids = inverse map (token slot -> compact row)
