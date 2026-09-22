@@ -668,3 +668,29 @@ Empirical crossover sits inside the current threshold's routing except pp16 (+1.
 Not worth a code change. Threshold 131072 (3rk) confirmed optimal-enough; retune closed.
 Raw: /root/phase1-raw/leg1-10 on mi50. Threshold is compile-time (ggml-cuda.cu:1382,
 per-rank-count constants); NO_GATE=1 is the only runtime knob.
+
+## 31. W4A4 dot8 gauntlet: perf passes, correctness FAILS — DO NOT ADOPT (2026-09-22)
+
+Full program (commits a4643ebc8 -> cd96ad6475 -> f5325c1e6 -> 1ec20cd54 on perf/w4a4-dot8-gfx906)
+wired behind GGML_CUDA_W4A4_DOT8, gauntleted on Mistral-Large fine-tune 3rk, interleaved, flock-serialized:
+
+| Leg | Gate | pp2048 | tg128 | PPL |
+|---|---|---|---|---|
+| anchor | off | 163.97 | 20.62 ± 0.04 | — |
+| gate-on | on | 163.85 | **21.33 (+3.44%)** | — |
+| drift ctrl | off | 163.84 | 20.58 (0.19% drift) | — |
+| PPL | off/on | — | — | 1.0564 / 1.0564 (Δ=0.0000) |
+| greedy primes | on | — | 21.0 t/s | **FAIL: 100x token id 0, empty** |
+
+Verdict: perf passes (+3.44%/+3.65% vs both controls, ΔPPL=0.0000) but greedy gate FAILS —
+gate-on decode emits garbage (token id 0 x100). The +3.4% is speed on a broken path.
+
+Root-cause localization (bonus harness): u4_quant_check FAILS on ALL multi-channel cases
+(ne>1: 1024x8x2, 5120x16x2, 4100x3; 97,054 mismatches) and PASSES single-channel ->
+broken multi-channel index mapping in the u4 path (quantize kernel interleaved-vs-deinterleaved
+or the xs stride math in dispatch). PPL structurally blind (pp-only; bug is decode-only).
+
+Program value: dp8a codegen verified (32x v_dot8_i32_i4), +3.4% tg achievable IF the
+multi-channel mapping is fixed. The fix is localized and the harness gives exact
+reproduction cases. Deferred pending decision: fix-forward (targeted debug dispatch)
+or park as documented negative with the fix path recorded.
