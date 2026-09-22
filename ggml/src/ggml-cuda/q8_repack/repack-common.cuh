@@ -430,6 +430,10 @@ template <> struct rp_traits<GGML_TYPE_Q4_0> {
     using slot_t = uint16_t;   // f16 scale
     static constexpr bool split_scales = false;
     static constexpr bool affine       = true;
+    // W4A4: this type supports the u4-activation (dp8a) decode variant. Only
+    // consumed when the U4ACT template variant is selected by the env gate
+    // (GGML_CUDA_W4A4_DOT8); the default q8_1-activation path ignores it.
+    static constexpr bool u4_act      = true;
     struct geom {
         uint32_t rs, rs_u4, n_sub;
         size_t   dplane_off;
@@ -448,6 +452,15 @@ template <> struct rp_traits<GGML_TYPE_Q4_0> {
         hi = make_uint4((pk.x >> 4) & 0x0F0F0F0Fu, (pk.y >> 4) & 0x0F0F0F0Fu,
                         (pk.z >> 4) & 0x0F0F0F0Fu, (pk.w >> 4) & 0x0F0F0F0Fu);
         d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    // W4A4 milestone 2b: raw (unmasked) packed nibble pair for the dp8a path.
+    // One uint4 = 16 B = one 32-value block, byte-identical to the canonical
+    // Q4_0 qs bytes (excess-8 codes, interleaved pairs).
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
     }
     static __device__ __forceinline__ float scale(const uint16_t s) {
         return __half2float(*reinterpret_cast<const __half *>(&s));

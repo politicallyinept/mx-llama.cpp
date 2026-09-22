@@ -54,6 +54,39 @@ static __device__ __forceinline__ int mmvq_dp4a_u4(
 #endif
 }
 
+// W4A4 milestone 2b: dp8a sibling of mmvq_dp4a_u4. ONE uint4 = 16 B = 32 nibbles
+// = one 32-value block; each 32-bit word carries 8 nibbles (byte k = {2k, 2k+1}
+// little-endian) and dot8 consumes 8 signed-nibble MACs per call: w.x vs a.x,
+// w.y vs a.y, w.z vs a.z, w.w vs a.w. Both operands must be TWO'S-COMPLEMENT
+// nibbles (weights XOR-8'd from the excess-8 canonical codes, activations stored
+// signed by the milestone-2a quantizer). No 0x0F masks anywhere in this path.
+static __device__ __forceinline__ int mmvq_dp8a_u4(const uint4 w, const uint4 a) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    int r = ggml_cuda_dp8a((int) w.x, (int) a.x, 0);
+    r = ggml_cuda_dp8a((int) w.y, (int) a.y, r);
+    r = ggml_cuda_dp8a((int) w.z, (int) a.z, r);
+    r = ggml_cuda_dp8a((int) w.w, (int) a.w, r);
+    return r;
+#else
+    GGML_UNUSED_VARS(w, a);
+    return 0;
+#endif
+}
+
+// Sum of the 32 raw excess-8 nibble codes in a uint4 (8 nibbles per 32-bit word).
+// SUMW (two's-complement weight sum) = nib_sum_u4(pk) - 256.
+static __device__ __forceinline__ uint32_t nib_sum_u4(const uint4 v) {
+    uint32_t s = 0;
+    const uint32_t ws[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t x = ws[i];
+        s += (x & 0xFu) + ((x >> 4) & 0xFu) + ((x >> 8) & 0xFu) + ((x >> 12) & 0xFu)
+           + ((x >> 16) & 0xFu) + ((x >> 20) & 0xFu) + ((x >> 24) & 0xFu) + ((x >> 28) & 0xFu);
+    }
+    return s;
+}
+
 // Fused-FFN epilogue shared by the dense and MoE MMV paths: up result + x_bias,
 // gate result + gate_bias, then the GLU op.
 static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
@@ -970,7 +1003,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
 // traffic the same way, on the repacked layout. Dense only: the single-token
 // path and the MoE ids path keep their existing kernels.
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
-          int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+          int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false>
 static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -979,6 +1012,8 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         const float * __restrict__ gate_bias, const ggml_glu_op glu_op,
         const uint32_t bias_row_base) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static_assert(!U4ACT || WT == GGML_TYPE_Q4_0, "U4ACT (dp8a) is only defined for Q4_0 weights");
+    static_assert(!U4ACT || !HAS_FUSION, "U4ACT (dp8a) does not support the fused-FFN variant");
     // LANES is the number of lanes cooperating on ONE row. It is the geometry
     // knob that matters here: the strided loop runs n_blocks/LANES iterations
     // and is then followed by a log2(LANES)-step DPP reduction, so a wide lane
@@ -1028,6 +1063,51 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
     // both twice, and at sharded row counts the loop is a handful of
     // iterations, so per-step overhead is most of the kernel.
     for (uint32_t sb = (uint32_t) lane; sb < n_blocks; sb += (uint32_t) LANES) {
+        if constexpr (U4ACT) {
+            // W4A4 milestone 2b: dp8a decode, replacing the whole stock body.
+            // Weight block = the RAW packed uint4 (canonical Q4_0 bytes:
+            // excess-8 codes, interleaved pairs). XOR 0x88888888 per word
+            // turns the excess-8 codes into two's-complement nibbles
+            // (cw ^ 8 == cw - 8 as 4-bit signed). Activations are
+            // block_q8_1_u4 (20 B: qs[16] + fp16 d4/m); read qs as four
+            // u32s — the 20 B stride keeps every block 4-byte aligned, so
+            // no misaligned uint4 load. xs keeps its "blocks per token
+            // column" meaning; only the element size changes with the type.
+            //
+            // Epilogue (numeric seal: /tmp/dp8a_dot_test.cc, 1000 random
+            // blocks, exact match):
+            //   dot = d * ( d4 * (idot + 8*SUMW) + m * SUMW )
+            // with idot = sdot8(w_tc, a_tc) over the block, SUMW =
+            // sum(cw - 8) = nib_sum_u4(raw) - 256. The shorter
+            // d*(d4*idot + m*SUMW) form is NOT exact (fails the seal) —
+            // the activation value is q*d4 + m with q = a_tc + 8, and the
+            // +8*d4*SUMW term is real.
+            //
+            // Dead rows: zero the scale slot (rp_slot_keep) exactly like the
+            // stock path — d == 0 zeroes the whole term.
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                uint4 pk;
+                typename rp_traits<WT>::slot_t db;
+                rp_traits<WT>::load_w_raw(wbase, wg, wrows[r], sb, pk, db);
+                const uint4 w_tc = make_uint4(pk.x ^ 0x88888888u, pk.y ^ 0x88888888u,
+                                            pk.z ^ 0x88888888u, pk.w ^ 0x88888888u);
+                const float d  = rp_traits<WT>::scale(rp_slot_keep(db, rvalid[r]));
+                const float sw = (float) (nib_sum_u4(pk) - 256u);
+#pragma unroll
+                for (int c = 0; c < NCOLS; ++c) {
+                    const block_q8_1_u4 * xb4 =
+                        reinterpret_cast<const block_q8_1_u4 *>(xq) + (size_t) c * xs + sb;
+                    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(xb4->qs);
+                    const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+                    const int idot = mmvq_dp8a_u4(w_tc, a);
+                    const float d4 = __half2float(xb4->d4);
+                    const float m  = __half2float(xb4->m);
+                    acc[r][c] += d * (d4 * ((float) idot + 8.0f * sw) + m * sw);
+                }
+            }
+            continue;
+        }
         // Weights for the lane's rows stay in registers; the activation block is
         // re-read per row from L1, which is cheaper than the register pressure
         // of holding NCOLS x 8 ints alongside the accumulators.
@@ -1132,12 +1212,13 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
 #endif
 }
 
-template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0>
+template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0,
+          bool U4ACT = false>
 static __global__ void mul_mat_vec_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT, U4ACT>(
         wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
         GGML_GLU_OP_REGLU, 0);
 }
