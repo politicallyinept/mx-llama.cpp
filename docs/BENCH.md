@@ -609,7 +609,7 @@ MTP acceptance: 51.4% (183/356), mean len 3.54.
 ## 34. Post-PLX link upgrade: baselines + bf16-wire REVERSAL (2026-09-21)
 
 Hardware change: inter-GPU links moved to a PLX switch card. All 6 models
-re-baselined on ALL 3 CARDS, full prod stack (repack + xbar + custom AR + FA), r=3.
+re-baselined on ALL 3 CARDS, full prod stack (repack+xbar+custom AR+FA), r=3.
 
 | Model | pp2048 | tg128 | prior tg128 | note |
 |---|---:|---:|---:|---|
@@ -630,19 +630,41 @@ Gates: 3/3 PASS.
 | f32 | 19.63 | 20.86 |
 | bf16 (deployed) | 20.07 (+2.2%) | 20.62 (-1.2%) |
 
-Interleaved 4-leg (f32 / bf16 / bf16 / f32), variance +/-0.05: both bf16 legs
-below both f32 legs. Qwen shows the same trend (+2.4% pre -> -0.3% post).
+Interleaved 4-leg (f32/bf16/bf16/f32), variance +/-0.05: both bf16 legs below
+both f32 legs. Qwen shows the same trend (+2.4% pre -> -0.3% post).
 
 Mechanism: bf16-wire's entire value was halving bytes across a SLOW PCIe link.
-The PLX card removed that bottleneck, so the byte savings no longer cover the
-gfx906 bf16 conversion cost. Same effect that made bf16s (scatter only) a loss
-before: conversion cost is fixed, wire savings are conditional on link speed.
+The PLX card removed the bottleneck, so the byte savings no longer cover the
+gfx906 bf16 conversion cost. This is the same effect that made bf16s (scatter
+only) a loss before — conversion cost is fixed, wire savings are conditional.
 
 ACTION: remove GGML_TP_AR_WIRE=bf16 from the Mistral-Large fine-tune llama-swap profile.
 f32 is the correct setting on the upgraded links.
 
 ### Link-width observation (unresolved)
-sysfs reports all 3 GPUs at x16 @ 16 GT/s (Gen4); each GPU's upstream bridge is
-also x16 Gen4, and no PLX device (vendor 10b5) is visible in the container's PCI
-namespace. The +8.9% is real and reproducible, but does not match an "x4" report
-— the x4 reading was likely the PLX-to-CPU uplink rather than the GPU-side links.
+sysfs reports all 3 GPUs at x16 @ 16 GT/s (Gen4), each upstream bridge also
+x16 Gen4; no PLX device (vendor 10b5) visible in the container's PCI
+namespace. The +8.9% is real and reproducible, but does not match an "x4"
+report — possibly the x4 reading was the PLX->CPU uplink rather than GPU-side.
+
+## 30. Phase 0a + Phase 1 of the kernel/compute plan (2026-09-22)
+
+### 0a. Perf-level pin (high vs auto): WASH — closed
+Host pinned all 3 GPUs high (sysfs; LXC sysfs read-only, host-owned). Clock log PROVED
+auto was already ramping to the pin's clocks (1850/1850/1725 sclk) pre-pin; same-build
+controls match pinned legs within noise (17.36 vs 17.26 tg128, 149.5 vs 148.9 pp2048).
+tg32 17.41 / tg64 17.25 / tg128 17.26 — no bursty-request ramp signature. No host A/B needed.
+NOTE: legs ran on build/ (non-RCCL branch build) so absolute levels are lower than §6 —
+the §6 anchors (176.4/21.39 post-PLX) live in BENCH.md §34 with the build-rccl binary.
+Perf pin stays (harmless, already host-persistent).
+
+### 1. Gate-threshold retune: KEEP 131072 — closed
+Sweep on build-rccl (hybrid / no-gate / RCCL-only, Mistral-Large fine-tune 3rk, pp8..pp2048 + tg32/64):
+- pp8 (ne=98K, routed custom AR): 49.92 / 49.90 / 47.94 — gate correct, custom AR +4% over RCCL
+- pp16 (ne=197K, routed RCCL): 66.12 / 66.90 / 66.21 — ONLY misrouted size; custom AR +1.2%
+- pp32+: hybrid wins (86.89 vs 85.95 at pp32; 143.35 vs 136.89 at pp256)
+- tg32/tg64: hybrid = no-gate (17.40 flat); RCCL-only -11% (15.55) — decode stays custom
+Empirical crossover sits inside the current threshold's routing except pp16 (+1.2%).
+Not worth a code change. Threshold 131072 (3rk) confirmed optimal-enough; retune closed.
+Raw: /root/phase1-raw/leg1-10 on mi50. Threshold is compile-time (ggml-cuda.cu:1382,
+per-rank-count constants); NO_GATE=1 is the only runtime knob.
