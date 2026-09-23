@@ -9,7 +9,7 @@
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
-        cudaStream_t stream);
+        cudaStream_t stream, bool u4act = false, uint32_t dst_s1 = 0);
 template <ggml_type WT, bool U4ACT = false>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
@@ -151,13 +151,29 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     }
 
     // Multi-token: grouped MMQ Q8_1 layout for the tiled GEMM.
+    // G3 (W4A4 GEMM): under the u4act gate the activation pool is the
+    // token-major block_q8_1_u4 layout instead. ALLOC MATH: the stock pool
+    // holds 4*QK8_1 values per group at 144 B/group = 36 B per 32-value
+    // block-equivalent; block_q8_1_u4 holds one 32-value block at 20 B.
+    // Block COUNT per token is identical, only the element size differs --
+    // same mirror as the dense m3 narrow path above. NOTE the stride
+    // difference vs the narrow path: the GEMM kernel derives the per-token
+    // stride internally as n_sub = ne00/32 (it never receives xs), so the
+    // u4 quantizer is invoked with ne0 = ne00, NOT ne10_padded. Q4_0
+    // weights guarantee ne00 % 32 == 0. The stock k-major layout hides
+    // this because its padding sits at the tail of k and the kernel stops
+    // at n_sub slabs; the token-major u4 layout bakes the stride in.
     const uint64_t n_groups   = (uint64_t) ne10_padded / (4 * QK8_1);
+    const uint64_t nkb_u4     = (uint64_t) ne00 / 32;
 
     int64_t chunk_ne11 = ctx.repack_workspace_cols_cap > 0 ?
         std::min(ne11, ctx.repack_workspace_cols_cap) : ne11;
     ggml_cuda_pool_alloc<block_q8_1_mmq_h> src1_q8_1(ctx.pool());
+    ggml_cuda_pool_alloc<block_q8_1_u4>    src1_u4(ctx.pool());
     auto try_workspace = [&]() {
-        return src1_q8_1.try_alloc(ne13 * ne12 * chunk_ne11 * n_groups) != nullptr;
+        return u4act
+            ? (void *) src1_u4.try_alloc(ne13 * ne12 * chunk_ne11 * nkb_u4)
+            : (void *) src1_q8_1.try_alloc(ne13 * ne12 * chunk_ne11 * n_groups);
     };
 
     if (!try_workspace()) {
@@ -198,18 +214,30 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
     for (int64_t col = 0; col < ne11; col += chunk_ne11) {
         const int64_t iter_ne11 = std::min(chunk_ne11, ne11 - col);
-        quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
-            src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
+        if (u4act) {
+            // G3: token-major u4 quantizer (same launcher args as the narrow
+            // path; the chunk offset rides s11 exactly like the stock call).
+            quantize_mmq_q8_1_u4_cuda((const float *) src1->data + col*s11, src1_u4.get(),
+                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream);
+        } else {
+            quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
+                src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
+        }
 
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
-            const block_q8_1_mmq_h * slice_base = src1_q8_1.get()
-                                  + (i3 * ne12 + i2) * iter_ne11 * n_groups;
-            const block_q8_1 * xq = reinterpret_cast<const block_q8_1 *>(slice_base);
+            // Slice offset in BLOCK units: identical count under either layout
+            // (nkb per token row vs n_groups*4 per token row), so the token
+            // stride is iter_ne11 * (blocks per token) either way.
+            const block_q8_1 * xq = (u4act
+                    ? reinterpret_cast<const block_q8_1 *>(src1_u4.get())
+                              + (i3 * ne12 + i2) * iter_ne11 * nkb_u4
+                    : reinterpret_cast<const block_q8_1 *>(
+                        src1_q8_1.get() + (i3 * ne12 + i2) * iter_ne11 * n_groups));
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
                            + col*dst_s1;
             ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-                ne00, ne01, iter_ne11, stream);
+                ne00, ne01, iter_ne11, stream, u4act, dst_s1);
         }
         }
     }
@@ -321,11 +349,28 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 }
 
 // Dispatch one 2D slice: mat-vec vs tiled GEMM.
+// G3: `u4act` selects the block_q8_1_u4 activation layout (token-major,
+// 20 B/block). Only the Q4_0 GEMM arms consume it; the ne11==1 arm under
+// u4act routes to the single-token u4 nc kernel (same shape as the narrow
+// path) because the stock single-token kernels expect the q8_1 layout.
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
-        cudaStream_t stream) {
+        cudaStream_t stream, bool u4act, uint32_t dst_s1) {
     if (ne11 == 1) {
+        if (u4act) {
+            // xs = blocks per token row. The u4 quantizer for this path was
+            // invoked with ne0 = ne00 (see GEMM alloc-math note above), so
+            // the pool stride is ne00/32 -- NOT the padded x_stride the
+            // narrow path uses. Q4_0 guarantees ne00 % 32 == 0.
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_0, true>
+                <<<grid, 64, 0, stream>>>(w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01,
+                    (uint32_t) (ne00 / 32),
+                    dst_s1);
+            return;
+        }
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
@@ -414,9 +459,16 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
-                mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                // G3: under the u4act gate, the dot8 u4-activation GEMM.
+                if (u4act) {
+                    mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0, true><<<grid, dim3(64, nrl), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                } else {
+                    mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                }
                 break;
             case GGML_TYPE_Q5_1:
                 mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q5_1><<<grid, dim3(64, nrl), 0, stream>>>(
@@ -461,9 +513,16 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
-                mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                // G3: under the u4act gate, the dot8 u4-activation GEMM (w32).
+                if (u4act) {
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, true><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                } else {
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                }
                 break;
             case GGML_TYPE_Q5_1:
                 mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q5_1><<<grid, dim3(32, nrl*2), 0, stream>>>(
