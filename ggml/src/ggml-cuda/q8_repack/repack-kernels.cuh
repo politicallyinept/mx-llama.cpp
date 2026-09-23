@@ -592,7 +592,11 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #endif
 }
 
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
+// G1 (W4A4 GEMM): U4ACT selects the u4-activation (dp8a) variant of the dense
+// GEMM. Skeleton only: template param + asserts + LDS/register plumbing with
+// TODO(G2) markers; no dispatch passes U4ACT=true until G3. Plan:
+// docs/w4a4-gemm-u4-plan.md (workspace w4a4-g1).
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool U4ACT = false>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -601,6 +605,12 @@ static __device__ void mmq_gemm_repacked_impl(
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+    // G1 asserts: the u4/dp8a GEMM variant is defined only for Q4_0 weights
+    // (raw excess-8 codes XOR-8'd to two's complement) and only for the dense
+    // path. MoE (HAS_IDS) keeps the q8_1-activation GEMM until the decode-side
+    // id-path is revisited; fused variants are nc-only anyway.
+    static_assert(!U4ACT || WT == GGML_TYPE_Q4_0, "U4ACT (dp8a) is only defined for Q4_0 weights");
+    static_assert(!U4ACT || !HAS_IDS, "U4ACT (dp8a) GEMM is dense-only in G1-G3 scope");
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
@@ -648,6 +658,11 @@ static __device__ void mmq_gemm_repacked_impl(
     __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];
     // Activation sums, affine types only (the [1] alternative keeps the LDS footprint of every other type unchanged).
     __shared__ float    sXs[rp_traits<WT>::affine ? BN : 1][MMQ_RP_Q8_BK + 1];
+    // G1 (W4A4 GEMM): per-weight-block two's-complement nibble sum
+    // (sw = (int)nib_sum_u4(raw) - 256), computed at prefetch so compute_stage
+    // stays dot-bound (see plan §2). 4 B when U4ACT is off (1x1 float, unused);
+    // BK x BM floats (1 KB) on.
+    __shared__ float    sWs[U4ACT ? MMQ_RP_Q8_BK : 1][U4ACT ? MMQ_RP_Q8_BM : 1];
     __shared__ uint32_t sCol[BN];
 
     constexpr int NROW = MMQ_RP_Q8_BM / NRL;
@@ -664,6 +679,9 @@ static __device__ void mmq_gemm_repacked_impl(
     uint4    pw_lo[W_EPT];
     uint4    pw_hi[W_EPT];
     slot_t   pw_d [W_EPT];
+    // G1 (W4A4 GEMM): two's-complement weight sum per prefetched weight block
+    // (sw), filled by the U4ACT prefetch branch in G2. Unused when U4ACT is off.
+    [[maybe_unused]] float pw_s[W_EPT];
     rp_x_sub px   [X_EPT];
     [[maybe_unused]] float px_s[X_EPT];
     if constexpr (HAS_IDS) {
@@ -701,7 +719,18 @@ static __device__ void mmq_gemm_repacked_impl(
             const uint32_t sb   = sb0 + lk;
             const uint32_t wrow = row0 + lr;
             if (wrow < ne1 && sb < n_sub) {
-                if constexpr (RAW_REG) {
+                if constexpr (U4ACT) {
+                    // G1 skeleton (W4A4 GEMM): raw canonical Q4_0 block,
+                    // XOR-8'd to two's-complement nibbles, with the signed
+                    // nibble-sum (sw) computed here at prefetch so compute_stage
+                    // stays dot-bound. SIGNED cast before the float cast —
+                    // milestone 3b bug 3 (unsigned wrap on sums < 256).
+                    uint4 raw;
+                    rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, raw, pw_d[i]);
+                    pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
+                                         raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
+                    pw_s[i]  = (float) ((int) nib_sum_u4(raw) - 256);
+                } else if constexpr (RAW_REG) {
                     rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
                 } else {
                     rp_traits<WT>::load_w(wbase, wg, wrow, sb, pw_lo[i], pw_hi[i], pw_d[i]);
@@ -713,11 +742,34 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(0, 0, 0, 0);
                 pw_hi[i] = make_uint4(0, 0, 0, 0);
                 pw_d [i] = {};
+                if constexpr (U4ACT) {
+                    pw_s[i] = 0.0f;
+                }
             }
         }
     };
 
     auto prefetch_x_checked = [&](const uint32_t sb0, const block_q8_1_mmq_h * x_grp) {
+        if constexpr (U4ACT) {
+            // G1 skeleton (W4A4 GEMM): TODO(G2) — replace with the u4 activation
+            // fetch: read block_q8_1_u4 straight from global, token-major
+            // xq_u4[(tok*nkb + sb)], via a new rp_x_sub_u4_from_blocks helper:
+            //   q0 = the 4 u32 words of qs assembled as uint4 (20 B stride is
+            //        NOT 16 B aligned — never reinterpret_cast<uint4*> here),
+            //   d  = d4,  px_s = m.
+            // The block_q8_1_mmq_h 4-block grouping (x_group advance) is
+            // bypassed entirely; the quantizer output is already one block per
+            // (token, 32-values). Zeroed here so the skeleton never reads garbage.
+            GGML_UNUSED_VARS(sb0, x_grp);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                px[i] = {};
+                if constexpr (rp_traits<WT>::affine) {
+                    px_s[i] = 0.0f;
+                }
+            }
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < X_EPT; i++) {
             const int e = t + i * NTHREADS;
@@ -773,6 +825,20 @@ static __device__ void mmq_gemm_repacked_impl(
     };
 
     auto prefetch_x_full = [&](const uint32_t sb0, const block_q8_1_mmq_h * x_grp) {
+        if constexpr (U4ACT) {
+            // G1 skeleton (W4A4 GEMM): TODO(G2) — same u4 activation fetch as
+            // prefetch_x_checked (rp_x_sub_u4_from_blocks, token-major
+            // xq_u4[tok*nkb + sb], no MMQ grouping). Zeroed in the skeleton.
+            GGML_UNUSED_VARS(sb0, x_grp);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                px[i] = {};
+                if constexpr (rp_traits<WT>::affine) {
+                    px_s[i] = 0.0f;
+                }
+            }
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < X_EPT; i++) {
             const int e = t + i * NTHREADS;
@@ -806,7 +872,14 @@ static __device__ void mmq_gemm_repacked_impl(
             }
             const int lr = e / MMQ_RP_Q8_BK;
             const int lk = e % MMQ_RP_Q8_BK;
-            if constexpr (RAW_REG) {
+            if constexpr (U4ACT) {
+                // G1 (W4A4 GEMM): weight side is the raw block XOR-8'd at
+                // prefetch (two's-complement nibbles) — one uint4, no lo/hi
+                // split, sW_hi stays unused. sw rides sWs for the epilogue.
+                sW_lo[lr][lk] = pw_lo[i];
+                sWdh [lk][lr] = pw_d[i];
+                sWs  [lk][lr] = pw_s[i];
+            } else if constexpr (RAW_REG) {
                 uint4 lo, hi;
                 rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
                 sW_lo[lr][lk] = lo;
@@ -829,6 +902,9 @@ static __device__ void mmq_gemm_repacked_impl(
             const int lk  = e % MMQ_RP_Q8_BK;
             const int sXr = sX_swizzle<CW>(lr);
 
+            // G1 (W4A4 GEMM): under U4ACT the activation payload is one uint4
+            // (the raw u4 qs) in q[lk][0]; q[lk][1] is unused (zeroed by the
+            // G2 fetch), sXd carries d4 and sXs carries m.
             sXq[sXr].q[lk][0] = px[i].q0;
             sXq[sXr].q[lk][1] = px[i].q1;
             sXd[sXr][lk]    = px[i].d;
