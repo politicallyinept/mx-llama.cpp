@@ -297,6 +297,28 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group_ds(
     return out;
 }
 
+// W4A4 G2: fetch one 32-value u4 activation sub-block straight from the
+// token-major block_q8_1_u4 pool (quantize_mmq_q8_1_u4_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block). The block_q8_1_mmq 4-block grouping is
+// bypassed entirely: one block per (token, 32 values), so the caller indexes
+// blocks[tok * nkb + sb] with nkb = ne0_padded/32. The 20 B stride keeps
+// every block 4-byte aligned but is NOT 16-byte aligned, so qs is assembled
+// as four u32 words -- never reinterpret_cast<uint4*> on a 20 B-strided
+// pointer (misaligned; the decode kernel reads u32s for the same reason).
+// out.d carries d4 and s carries m; q1 is zero (unused under U4ACT -- the
+// dot8 path consumes one uint4 per 32-value block, no lo/hi half split).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4_from_blocks(
+        const block_q8_1_u4 * __restrict__ blocks, const uint32_t idx, float & s) {
+    const block_q8_1_u4 & b = blocks[idx];
+    const uint32_t      * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+    rp_x_sub out;
+    out.q0 = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+    out.q1 = make_uint4(0, 0, 0, 0);
+    out.d  = __half2float(b.d4);
+    s      = __half2float(b.m);
+    return out;
+}
+
 // Zero a raw scale slot for a dead row (the nc kernels clamp the row index and kill the term through the slot).
 // Integral slots and the uint2 affine slot.
 template <typename T>

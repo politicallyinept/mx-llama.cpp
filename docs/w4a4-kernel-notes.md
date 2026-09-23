@@ -297,3 +297,85 @@ Full log: `mi50:/root/orn-w4a4-gauntlet.txt`.
 - `mmq_gemm_repacked` tile loop: dp8a across the K dimension, same epilogue correction.
 - Full bench+PPL gauntlet per plan: llama-bench pp/tg arms vs q8_1-activation baseline, greedy quality gate, PPL A/B (the real go/no-go from the 2b study: est. ΔPPL 0.10–0.53 for scheme B).
 - Coordinate GPU queue via `/root/gpu.lock` (Slot A owns bench windows; milestone 1 compile-only used flock for compile protection only).
+
+## Milestone G1 — GEMM u4 skeleton (DONE, commit `8473f62c3`)
+
+Template param `U4ACT` + asserts (`WT==Q4_0`, dense-only) threaded through
+`mmq_gemm_repacked_impl`; LDS/register plumbing (`sWs` sw-sums array, `pw_s`
+prefetch regs, U4ACT weight-prefetch branch: `load_w_raw` -> XOR 0x88888888 +
+signed `nib_sum_u4` sw, store_stage branch). Activation fetch + compute dot
+loop were TODO stubs. Plan: `w4a4-gemm-u4-plan.md` (workspace `w4a4-g1`).
+Note: the G1 commit message claimed the launch wrappers were already threaded;
+they were not — corrected in G2.
+
+## Milestone G2 — GEMM u4 dot loop functional (DONE, unwired)
+
+The sealed form-B dot loop in `mmq_gemm_repacked_impl` compute_stage, GEMM
+twin of the decode U4ACT branch (worked example: `mul_mat_vec_repacked_nc_impl`
+at `88bbc3572`). Per 32-value sub-block:
+`acc[r][n] += d * (d4 * ((float)idot + 8.0f*sw) + mu*sw)` with
+`idot = mmvq_dp8a_u4(w_tc, a)` — 4 dot8 per block per (r,n) vs the stock
+8 dp4a.
+
+### Changes (repack-kernels.cuh + repack-common.cuh)
+
+1. `rp_x_sub_u4_from_blocks(blocks, idx, s)` (repack-common.cuh): fetch one
+   u4 sub-block from the token-major `block_q8_1_u4` pool —
+   `blocks[tok*nkb + sb]`, nkb = ne0/32. qs assembled as 4x u32 (20 B
+   stride is NOT 16 B aligned — never `reinterpret_cast<uint4*>` on it).
+   `out.d` = d4, `s` = m, q1 zeroed (unused under U4ACT).
+2. `prefetch_x_checked` / `prefetch_x_full` U4ACT branches: real fetch via
+   the helper (was zeroed stubs). Dead token/slab -> d4=0 AND m=0 so the
+   sealed epilogue collapses to 0 regardless of the weight term.
+3. `prefetch_w_full` U4ACT branch added (G1 only covered the checked path;
+   the full-tile path would have staged the expanded lo/hi pair).
+4. `compute_stage` U4ACT branch: the sealed dot loop. Activation operands
+   read straight from LDS inside the n loop — the hoisted `a[]/d4[]/mu[]`
+   form spilled 178 VGPRs at launch_bounds(256,2); the LDS-direct form
+   spills 4.
+5. LDS budget: `sWs` shares storage with `sW_hi` via a named union
+   (`rp_w_planes` + reference aliases — an anonymous block-scope union
+   cannot be lambda-captured). The dot8 path never touches the hi plane,
+   the stock path never touches sWs. Keeps the static LDS total at the
+   stock 32768 B in BOTH gate states; the G1 `sWs[1][1]` addition had
+   pushed the affine 64-wide GEMM to 32772 B and dropped
+   launch_bounds(256,2) occupancy to 1 (-Wpass-failed on the Q4_0/Q5_K/
+   Q6_K U4ACT=false variants).
+6. Launch wrappers `mmq_gemm_repacked` / `mmq_gemm_repacked_w32`: `U4ACT`
+   template param threaded to the impl (default false = byte-identical
+   stock).
+
+### Build + instantiation verification
+
+- `flock /root/gpu.lock -c 'cmake --build /root/build-w4a4 -j24'` — clean,
+  exit 0. The 5 pre-existing occupancy warnings (Q4_0/Q5_K/Q6_K 64-wide,
+  present at `cd3be9981` before G1) are unchanged — the union fix restored
+  parity; no new warnings introduced by G1/G2.
+- Force-instantiation check (kept `#if 0` at end of repack-kernels.cuh):
+  standalone compile of `mmq_gemm_repacked<false,2,4,Q4_0,true>` and
+  `mmq_gemm_repacked_w32<false,1,8,Q4_0,true>` with the exact build flags
+  (clang++ ROCm 7.2.3, --offload-arch=gfx906, -x hip, -O3). Device asm:
+  256 `v_dot8_i32_i4` in the 64-wide body, 128 in the w32 body, zero
+  `v_dot4_i32_i8` in the u4 path — real codegen, not a stub. VGPR spills:
+  4 (64-wide, LDS-direct form) / 40 (w32) vs stock 20 / 0.
+- Gate states: the gate is runtime (`GGML_CUDA_W4A4_DOT8`); the single
+  build carries both variants. U4ACT=false is exercised by the full build;
+  U4ACT=true by the force-instantiation check. No dispatch selects
+  U4ACT=true yet — G3 wires it.
+
+### G3 wiring (NOT in G2)
+
+1. mul-mat.cu GEMM quantize block (~:153-215): under `u4act`, swap
+   `quantize_mmq_q8_1_cuda` for `quantize_mmq_q8_1_u4_cuda` into a
+   `ggml_cuda_pool_alloc<block_q8_1_u4>` sized
+   `ne13*ne12*chunk_ne11*nkb` (nkb = ne10_padded/32; 20 B/block vs the
+   q8_1_mmq 144 B/group = 36 B/block-equivalent — workspace shrinks).
+   Post-3b quantizer is token-major `ib = (z*ne1 + x)*nkb + k_block` —
+   matches the kernel's `[tok*nkb + sb]` read directly.
+2. Launch switches (~:400-439 64-wide, ~:443-486 32-wide): Q4_0 case
+   branches `u4act ? <...,true> : stock`, mirroring the nc-path pattern.
+3. Reuse the existing `w4a4_dot8` gate (mul-mat.cu:52-53). Gate-off stays
+   byte-identical stock.
+4. Gauntlet (Slot A, /root/gpu.lock): pp2048 >= +2% vs q8_1-activation
+   baseline, dPPL <= +0.05. pp2048 hits the 64-wide arm (ne11=2048);
+   32-wide covers 9..127.
