@@ -593,15 +593,28 @@ static __global__ void quantize_mmq_q8_1_u4(
     const int64_t k_block = i0 / 32; // 32-value block index in the channel
     const int64_t iqs     = i0 % 32; // value index in the block (0, 4, 8, ... 28)
 
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i0)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    // De-interleaved value mapping mirroring the canonical Q4_0 WEIGHT layout
+    // (ggml-quants.c:137-141: weight byte j = {val j low, val j+16 high}).
+    // Thread t of the 8 covering one 32-value block owns output bytes 2t,2t+1:
+    //   low nibbles  = values 2t,   2t+1
+    //   high nibbles = values 2t+16, 2t+17
+    // The old pair-interleaved {2k, 2k+1} order mismatched the weight nibble
+    // order, so sdot8 paired permuted values and the decode emitted garbage.
+    const int64_t blk = i0 - iqs;          // global start of this 32-value block
+    const int     t   = (int) (iqs / 4);   // 0..7 slot within the block
+
+    const float2 vlo = (blk + 2*t + 1  < ne00)
+        ? *(const float2 *) (x + base_idx + blk + 2*t)       : make_float2(0.0f, 0.0f);
+    const float2 vhi = (blk + 2*t + 17 < ne00)
+        ? *(const float2 *) (x + base_idx + blk + 2*t + 16)  : make_float2(0.0f, 0.0f);
 
     // min/max across the 8 threads covering one 32-value block
     // (same fold order-invariant result as the host's sequential scan).
     // Mask style matches quantize_mmq_q8_1 above: vendors/hip.h maps
     // __shfl_xor_sync to the raw __shfl_xor (HIP_DISABLE_WARP_SYNC_BUILTINS),
     // and width=32 partitions the wave64 shuffle into 32-lane groups.
-    float mn = fminf(fminf(xi.x, xi.y), fminf(xi.z, xi.w));
-    float mx = fmaxf(fmaxf(xi.x, xi.y), fmaxf(xi.z, xi.w));
+    float mn = fminf(fminf(vlo.x, vlo.y), fminf(vhi.x, vhi.y));
+    float mx = fmaxf(fmaxf(vlo.x, vlo.y), fmaxf(vhi.x, vhi.y));
 #pragma unroll
     for (int offset = 4; offset > 0; offset >>= 1) {
         mn = fminf(mn, __shfl_xor_sync(0xFFFFFFFF, mn, offset, WARP_SIZE));
@@ -612,33 +625,42 @@ static __global__ void quantize_mmq_q8_1_u4(
     const float id  = d4 != 0.0f ? 1.0f / d4 : 0.0f;
 
     // q = clamp(rint((x - mn)/d4), 0, 15); host uses roundf on (x-mn)*id.
-    int q0 = (int) roundf((xi.x - mn) * id);
-    int q1 = (int) roundf((xi.y - mn) * id);
-    int q2 = (int) roundf((xi.z - mn) * id);
-    int q3 = (int) roundf((xi.w - mn) * id);
-    q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
-    q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
-    q2 = q2 < 0 ? 0 : (q2 > 15 ? 15 : q2);
-    q3 = q3 < 0 ? 0 : (q3 > 15 ? 15 : q3);
+    int q_l0 = (int) roundf((vlo.x - mn) * id);
+    int q_l1 = (int) roundf((vlo.y - mn) * id);
+    int q_h0 = (int) roundf((vhi.x - mn) * id);
+    int q_h1 = (int) roundf((vhi.y - mn) * id);
+    q_l0 = q_l0 < 0 ? 0 : (q_l0 > 15 ? 15 : q_l0);
+    q_l1 = q_l1 < 0 ? 0 : (q_l1 > 15 ? 15 : q_l1);
+    q_h0 = q_h0 < 0 ? 0 : (q_h0 > 15 ? 15 : q_h0);
+    q_h1 = q_h1 < 0 ? 0 : (q_h1 > 15 ? 15 : q_h1);
 
-    // Store the SIGNED nibble (q - 8) & 0xF, packed 2/byte low-first
-    // (byte k = {2k, 2k+1} little-endian — the dp8a operand order).
+    // Store the SIGNED nibbles (q - 8) & 0xF in the de-interleaved order:
+    //   byte 2t   = {val 2t   low,  val 2t+16 high}
+    //   byte 2t+1 = {val 2t+1 low,  val 2t+17 high}
     // 4 values/thread = 4 nibbles = 2 bytes: one uint16 store per thread at
-    // qs + iqs/2 (offsets 0,2,...,14 — 8 threads fill the 16-byte qs exactly).
-    const uint32_t packed = ((uint32_t) ((q0 - 8) & 0xF))
-                        | ((uint32_t) ((q1 - 8) & 0xF) <<  4)
-                        | ((uint32_t) ((q2 - 8) & 0xF) <<  8)
-                        | ((uint32_t) ((q3 - 8) & 0xF) << 12);
+    // qs + 2t (offsets 0,2,...,14 — 8 threads fill the 16-byte qs exactly).
+    const uint32_t packed = ((uint32_t) ((q_l0 - 8) & 0xF))
+                        | ((uint32_t) ((q_h0 - 8) & 0xF) <<  4)
+                        | ((uint32_t) ((q_l1 - 8) & 0xF) <<  8)
+                        | ((uint32_t) ((q_h1 - 8) & 0xF) << 12);
 
     // d4 and m as fp16 in the two halves of the 4-byte field right after qs[16]
     // (offsetof d4 == 16, m == 18 — see block_q8_1_u4, repack-common.cuh:192).
     const uint32_t dm = ((uint32_t) __half_as_ushort((ggml_half) d4))
                       | ((uint32_t) __half_as_ushort((ggml_half) mn) << 16);
 
-    const int64_t ib = blockIdx.z*((int64_t) gridDim.x*gridDim.y*blockDim.x*4/32) + k_block*ne1 + blockIdx.x;
+    // Token-major layout: all 32-value blocks of one token/channel column are
+    // adjacent (ib = channel*nkb + k_block), matching the U4ACT decode kernel
+    // read `xq_u4 + c*xs + sb` (xs = ne10_padded/32 = nkb) and the host
+    // reference quantize_row_q8_1_u4 per-channel contiguous blocks. The old
+    // MMQ-style k-major formula (k_block*ne1 + blockIdx.x) transposed the
+    // layout for ne1 > 1 (single-token coincidentally matched), and its
+    // gridDim-derived ib0 left gaps when ne0 % 512 != 0.
+    const int64_t nkb = ne0 / 32; // 32-value blocks per channel column
+    const int64_t ib  = ((int64_t) blockIdx.z * ne1 + blockIdx.x) * nkb + k_block;
 
     // one 16-bit store for the nibble quad, one 32-bit store for the {d4, m} pair
-    *(uint16_t *) (y[ib].qs + iqs/2) = (uint16_t) packed;
+    *(uint16_t *) (y[ib].qs + 2*t) = (uint16_t) packed;
     if (iqs == 0) {
         *(uint32_t *) ((char *) y + ib*sizeof(block_q8_1_u4) + 16) = dm;
     }

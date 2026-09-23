@@ -1093,7 +1093,12 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
                 const uint4 w_tc = make_uint4(pk.x ^ 0x88888888u, pk.y ^ 0x88888888u,
                                             pk.z ^ 0x88888888u, pk.w ^ 0x88888888u);
                 const float d  = rp_traits<WT>::scale(rp_slot_keep(db, rvalid[r]));
-                const float sw = (float) (nib_sum_u4(pk) - 256u);
+                // SUMW must be computed SIGNED: the 32 raw excess-8 nibble codes
+                // average ~7.5 each (sum ~240), so nib_sum_u4(pk) < 256 for
+                // roughly half of all blocks. The unsigned subtraction wrapped to
+                // ~2^32 there, injecting ~1e9-magnitude garbage into the dot
+                // (gate-on decode emitted token 0). Cast to int before subtracting.
+                const float sw = (float) ((int) nib_sum_u4(pk) - 256);
 #pragma unroll
                 for (int c = 0; c < NCOLS; ++c) {
                     const block_q8_1_u4 * xb4 =

@@ -469,12 +469,15 @@ void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy
         const float id = d != 0.0f ? 1.0f / d : 0.0f;
 
         uint8_t * GGML_RESTRICT q = y[ib].qs;
+        // De-interleaved byte order mirroring canonical Q4_0 weights
+        // (ggml-quants.c:137-141): byte j = {value j low, value j+16 high},
+        // so sdot8 against the repacked weight pairs value i with value i.
         for (int i = 0; i < 16; ++i) {
-            int q0 = (int) roundf((xb[2*i]     - mn) * id);
-            int q1 = (int) roundf((xb[2*i + 1] - mn) * id);
+            int q0 = (int) roundf((xb[i]     - mn) * id);
+            int q1 = (int) roundf((xb[i + 16] - mn) * id);
             q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
             q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
-            q[i] = (uint8_t) (q0 | (q1 << 4));   // byte k = {2k, 2k+1} LE
+            q[i] = (uint8_t) (q0 | (q1 << 4));   // byte j = {j low, j+16 high}
         }
 
         y[ib].d4 = (ggml_half) d;
