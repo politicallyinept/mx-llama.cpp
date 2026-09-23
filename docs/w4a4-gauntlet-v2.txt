@@ -1,0 +1,69 @@
+W4A4 GAUNTLET v2 — POST-FIX RE-RUN — Mistral-Large-123B fine-tune-v2 Q4_0, 3x MI50 TP (tensor)
+Build: 88bbc3572 (fix commit on perf/w4a4-dot8-gfx906) / repo base 1ec20cd54 (10952)
+Date: 2026-09-22 (PDT). Gate: GGML_CUDA_W4A4_DOT8.
+All legs: flock /root/gpu.lock, vram check, perflevel=high, bench-logged.sh wrapper,
+-ngl 999 -fa 1 -sm tensor -lm dio. Env per /root/w4a4-env.sh (therock venv,
+ROCm 7.2.3 nightly-first LD_LIBRARY_PATH, HSA_XNACK=0, CUSTOM_AR=1,
+FINE_GRAIN_PCIE=1, GPU_MAX_HW_QUEUES=8, TP_AR_SKIP_XBAR=1, REPACK_Q4_0=1).
+
+FIX UNDER TEST (commit 88bbc3572, 3 files, +55/-25):
+  1. quantize.cu: token-major ib layout (ib = (z*ne1 + row)*nkb + k_block) —
+     old k-major formula transposed multi-token activation blocks.
+  2. quantize.cu + repack-common.cu: de-interleaved nibble order matching
+     canonical Q4_0 weight bytes (byte j = {val j low, val j+16 high}).
+  3. repack-kernels.cuh: SUMW computed SIGNED: (int)nib_sum_u4(pk) - 256 — unsigned
+     subtraction wrapped ~half the time, injecting ~1e9 garbage (token-0 decode).
+
+LEG (a) gate-OFF anchor bench (-p 2048 -n 128 -r 5):
+  pp2048: 163.88 ± 0.39 t/s
+  tg128:   20.62 ± 0.04 t/s
+
+LEG (b) gate-ON bench:
+  pp2048: 163.85 ± 0.37 t/s
+  tg128:   21.20 ± 0.05 t/s   (+2.81% vs leg a)
+
+LEG (c) gate-OFF drift control:
+  pp2048: 163.44 ± 0.30 t/s
+  tg128:   20.58 ± 0.04 t/s
+  Drift a vs c: 0.19% tg — tight.
+
+LEG (d) PPL gate-OFF (-c 2048 -b 2048 -ub 2048 --chunks 12, /root/ppl-test.txt):
+  Final estimate: PPL = 1.0564 +/- 0.00352
+
+LEG (e) PPL gate-ON (same cmd):
+  Final estimate: PPL = 1.0564 +/- 0.00352
+  PPL delta (on - off) = 0.0000
+
+LEG (f) GREEDY gate-ON (--temp 0 --top-k 1 -n 100 -c 32768 -st, -o output):
+  PASS — exact expected primes:
+  "The first ten prime numbers are: 2, 3, 5, 7, 11, 13, 17, 19, 23, and 29.
+   Tides are the rise and fall of sea levels caused by the combined effects of
+   the gravitational forces exerted by the Moon and the Sun, and the rotation
+   of the Earth."
+  (Prior run emitted 100x token 0; now correct. /root/leg7-fixed-answer.txt)
+
+LEG (g) /tmp/u4qc harness re-run post-fix:
+  ne00=4096,1,1,1: 128 blocks 0 mismatches OK
+  ne00=1024,8,2,1: 512 blocks 0 mismatches OK
+  ne00=5120,16,1,2: 5120 blocks 0 mismatches OK
+  ne00=32,1,1,1: 1 block 0 mismatches OK
+  ne00=4100,3,1,1: 387 blocks 0 mismatches OK   (was the failing case: 6472 mismatches)
+  OVERALL: OK
+
+DECISION RULE: adopt-candidate iff gate-on tg128 >= +2% over BOTH gate-off legs
+  AND PPL delta <= +0.05 AND primes exact.
+  tg128: 21.20 vs 20.62 -> +2.81%  PASS
+  tg128: 21.20 vs 20.58 -> +3.01%  PASS
+  PPL delta: 0.0000 <= 0.05          PASS
+  Primes exact                       PASS
+  VERDICT: ADOPT-CANDIDATE. All criteria met on the fixed decode path.
+
+ANOMALIES:
+  - First driver pass aborted legs b-e on an over-tight vram check fired during
+    driver teardown of leg a (~67 GB not yet released); re-run with poll-until-
+    released check inside the flock, all legs clean rc=0.
+  - llama-cli in this build emits generated text only via -o/--output-file.
+  - pp2048 gate-on within noise of gate-off (163.85 vs 163.88/163.44): the
+    per-op u4 quant cost is invisible at pp2048.
+RAW ARTIFACTS (mi50): /root/gauntlet-v2-logs/{a..g}_*.out, /root/leg-f.log,
+  /root/leg7-fixed-answer.txt, /root/clocklog.txt, drivers /root/gauntlet-v2*.sh.

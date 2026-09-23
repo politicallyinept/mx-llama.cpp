@@ -694,3 +694,30 @@ Program value: dp8a codegen verified (32x v_dot8_i32_i4), +3.4% tg achievable IF
 multi-channel mapping is fixed. The fix is localized and the harness gives exact
 reproduction cases. Deferred pending decision: fix-forward (targeted debug dispatch)
 or park as documented negative with the fix path recorded.
+
+## 32. W4A4 fix-forward: all gates PASS — ADOPT-CANDIDATE (2026-09-22)
+
+Root cause was THREE interacting bugs (fix commit 88bbc3572, +55/-25, 3 files):
+1. quantize.cu ib formula transposed activation blocks for ne1>1 (token-major fix);
+   gridDim-derived ib0 also gapped on ne0%512.
+2. pair-interleaved nibble packing mismatched canonical Q4_0 bytes -> sdot8 paired
+   permuted values. Device kernel + host reference both de-interleaved now.
+3. nib_sum_u4(pk)-256 computed UNSIGNED: raw excess-8 sums (~240 avg) wrapped to ~2^32,
+   injecting garbage -> the token-0 decode. Fixed: signed cast.
+Plus the dp8a operand-convention correction (MISMATCH hardware probe: hw pairing differs
+from doc assumption; probe-verified before the fix).
+
+Gauntlet v2 (build 88bbc3572, Mistral-Large fine-tune 3rk, flock+perflevel-high+bench-logged, r=5):
+| Leg | pp2048 | tg128 |
+|---|---|---|
+| gate-off | 163.88 | 20.62 ± 0.04 |
+| gate-ON | 163.85 | **21.20 ± 0.05 (+2.81%/+3.01%)** |
+| drift ctrl | 163.44 | 20.58 (0.19%) |
+PPL: 1.0564 both (Δ=0.0000). Greedy gate-ON: primes 2..29 EXACT + coherent tides.
+Harness: OVERALL OK, 0 mismatches all shapes (4100x3 was 6472).
+
+DECISION RULE: PASS all three gates -> ADOPT-CANDIDATE.
+Deploy path (not done): merge perf/w4a4-dot8-gfx906 into the production build
+(build-rccl) + set GGML_CUDA_W4A4_DOT8=1 (global or per-Mistral-Large fine-tune entry). PP cost
+of uncached u4 quant: not visible (pp2048 within noise). GEMM (mmq_gemm_repacked)
+extension = future work, decode win banked first.
