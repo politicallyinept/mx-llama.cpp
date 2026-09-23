@@ -721,3 +721,24 @@ Deploy path (not done): merge perf/w4a4-dot8-gfx906 into the production build
 (build-rccl) + set GGML_CUDA_W4A4_DOT8=1 (global or per-Mistral-Large fine-tune entry). PP cost
 of uncached u4 quant: not visible (pp2048 within noise). GEMM (mmq_gemm_repacked)
 extension = future work, decode win banked first.
+
+## 33. W4A4 MoE extension: correct but -5.3% tg — REJECT for MoE (2026-09-23)
+
+Milestone 4 (commit ad123ecdc): wired u4 path into MoE narrow-batch dispatch
+(mul_mat_vec_repacked_id1 + mul_mat_vec_rp, single-token) — Q4_0 MoE never reaches the
+fused epilogue (Q4_0 absent from both fusion admission sets), so unfused wiring = stock routing.
+Caught a unit bug pre-deploy: MoE column offsets ids_src1[a]*xs must be in 20B u4 units.
+
+Ornith-1.5-35B-A3B Huihui-Q4_0 gauntlet (2rk, interleaved off/on/off, r=5):
+| arm | pp2048 | tg128 |
+|---|---:|---:|
+| off-1 | 1835.97 | 110.17 |
+| ON | 1829.67 | **104.28 (-5.3%)** |
+| off-2 | 1827.94 | 109.78 |
+PPL 2.0643 both (d=0.0000); greedy primes exact (n=400 for thinking model).
+
+Verdict: tg fails >=+2% -> REJECT for MoE. Why: single-token MoE rides mul_mat_vec_rp
+at LANES=16/NCOLS=1 — the per-block nib_sum_u4 SUMW recompute is consumed once per block
+(no RPL=2 amortization like the dense winner). Fix paths if revisited: precompute SUMW
+at repack (+2B fp16/block) or u4-ize the fused gate epilogue. Dense m3 remains the
+adopt-candidate; MoE env flag should stay OFF in any deploy.
