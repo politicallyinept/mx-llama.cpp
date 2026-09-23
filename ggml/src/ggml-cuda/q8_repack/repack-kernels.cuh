@@ -430,7 +430,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 // machinery. Q8_0 keeps its tuned bespoke kernel; every other type gets this
 // one for free, including the fused up/gate variant.
 template <ggml_type WT, int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64,
-          bool HAS_FUSION = false>
+          bool HAS_FUSION = false, bool U4ACT = false>
 static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -445,6 +445,11 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     constexpr int NWARPS = (NWAVES * 64) / LANES;
     constexpr int WPR    = NWARPS / ROWS;
     static_assert(WPR == 1, "generic repack mat-vec assumes one lane-group per row");
+    // W4A4 milestone 4: same guards as mul_mat_vec_repacked_nc_impl -- the dp8a
+    // u4-activation variant is defined only for Q4_0 weights and only without
+    // the fused up/gate epilogue (the gate accumulator was never u4-ized).
+    static_assert(!U4ACT || WT == GGML_TYPE_Q4_0, "U4ACT (dp8a) is only defined for Q4_0 weights");
+    static_assert(!U4ACT || !HAS_FUSION, "U4ACT (dp8a) does not support the fused-FFN variant");
 
     if constexpr (!HAS_FUSION) {
         GGML_UNUSED_VARS(wbase_gate, x_bias, gate_bias, glu_op);
@@ -462,7 +467,9 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
                 wbase_gate += e * expert_stride;
             }
         }
-        xq    += (size_t)(a % nchannels_y) * xs_id;
+        if constexpr (!U4ACT) {
+            xq    += (size_t)(a % nchannels_y) * xs_id;
+        }
         y     += (size_t) a * dst_s1;
     } else {
         GGML_UNUSED_VARS(ids_src1, nchannels_y, expert_stride, xs_id, dst_s1);
@@ -477,9 +484,45 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     // Clamped rows read a valid row's data and discard the result at the write.
     const uint32_t wrow = min((uint32_t) row, ne1 - 1);
 
+    // W4A4 milestone 4: u4 column base in u4 units (the stock 32-byte-unit
+    // offset above is skipped under U4ACT; see the HAS_IDS block).
+    [[maybe_unused]] const block_q8_1_u4 * xq4 =
+        reinterpret_cast<const block_q8_1_u4 *>(xq);
+    if constexpr (U4ACT && HAS_IDS) {
+        xq4 += (size_t)(blockIdx.y % nchannels_y) * xs_id;
+    }
     float acc = 0.0f;
     [[maybe_unused]] float acc_gate = 0.0f;
     for (uint32_t sb = (uint32_t) lane; sb < n_sub; sb += LANES) {
+        if constexpr (U4ACT) {
+            // W4A4 milestone 4: dp8a u4-activation decode in the generic repack
+            // mat-vec (MoE single-token). Identical algebra to the nc_impl
+            // U4ACT branch (numeric seal: /tmp/dp8a_dot_test.cc): raw Q4_0
+            // uint4 XOR 0x88888888 -> two's-complement weight nibbles;
+            // activations are block_q8_1_u4 (qs[16] signed nibbles + fp16
+            // d4/m, 20 B stride keeps 4-byte alignment); dot =
+            // d * (d4 * (idot + 8*SUMW) + m * SUMW) with SUMW =
+            // (int)nib_sum_u4(raw) - 256 computed SIGNED (unsigned wrap on
+            // sums < 256 was the milestone-3b corruption).
+            // Dead rows: this kernel clamps wrow and guards the write, so the
+            // clamped-row terms are finite and discarded -- same as the stock
+            // body here, which does not slot-mask either.
+            uint4 pk;
+            typename rp_traits<WT>::slot_t db;
+            rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pk, db);
+            const uint4 w_tc = make_uint4(pk.x ^ 0x88888888u, pk.y ^ 0x88888888u,
+                                        pk.z ^ 0x88888888u, pk.w ^ 0x88888888u);
+            const float d  = rp_traits<WT>::scale(db);
+            const float sw = (float) ((int) nib_sum_u4(pk) - 256);
+            const block_q8_1_u4 * xb4 = xq4 + sb;
+            const uint32_t * q32 = reinterpret_cast<const uint32_t *>(xb4->qs);
+            const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+            const int idot = mmvq_dp8a_u4(w_tc, a);
+            const float d4 = __half2float(xb4->d4);
+            const float m  = __half2float(xb4->m);
+            acc += d * (d4 * ((float) idot + 8.0f * sw) + m * sw);
+            continue;
+        }
         uint4 lo, hi;
         typename rp_traits<WT>::slot_t ds;
         rp_traits<WT>::load_w(wbase, wg, wrow, sb, lo, hi, ds);
@@ -1251,7 +1294,8 @@ static __device__ __forceinline__ uint32_t expert_bounds_search(
     return lo;
 }
 
-template <int ROWS, int NWAVES, int RPL = 1, ggml_type WT = GGML_TYPE_Q8_0>
+template <int ROWS, int NWAVES, int RPL = 1, ggml_type WT = GGML_TYPE_Q8_0,
+          bool U4ACT = false>
 static __global__ void mul_mat_vec_repacked_id1(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1261,9 +1305,19 @@ static __global__ void mul_mat_vec_repacked_id1(
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const uint32_t a = blockIdx.y;
     const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
-    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false, 64, WT>(
+    // W4A4 milestone 4: under U4ACT the activation pool holds 20-byte
+    // block_q8_1_u4 blocks, so the per-assignment column offset must be
+    // applied in u4 units (cast first, THEN add) -- the stock block_q8_1*
+    // pointer arithmetic would stride 32 B per block past the data. The
+    // impl's U4ACT branch reinterprets the already-offset base back to
+    // block_q8_1_u4* and adds only c*xs (NCOLS=1 here, c=0).
+    const block_q8_1 * xq_a = U4ACT
+        ? reinterpret_cast<const block_q8_1 *>(
+              reinterpret_cast<const block_q8_1_u4 *>(xq) + (size_t) ids_src1[a] * xs)
+        : xq + (size_t) ids_src1[a] * xs;
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, 1, RPL, false, 64, WT, U4ACT>(
         wbase + (size_t) e * expert_stride,
-        xq + (size_t) ids_src1[a] * xs,
+        xq_a,
         y  + (size_t) ids_dst[a]  * ys,
         ne0, ne1, xs, ys, nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU, 0);
 #else

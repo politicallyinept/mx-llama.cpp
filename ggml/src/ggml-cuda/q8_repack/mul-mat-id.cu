@@ -41,6 +41,16 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const size_t expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
+    // W4A4 milestone 4: MoE decode through the dp8a u4-activation kernels.
+    // Same gate as the dense milestone-3 wiring (function-local static, fork
+    // pattern). Q4_0 is NOT in the MoE fusion admission set
+    // (ggml_cuda_repack_mmv_id_fusion_supported: base Q8_0/MXFP4 + kq
+    // Q4_K/Q5_K/Q6_K/IQ4_NL), so a Q4_0 MoE model takes the UNFUSED paths
+    // at every decode width -- the fused id1_fused / *_fused epilogues are
+    // never reached for Q4_0 and stay untouched. Unset gate = stock q8_1.
+    static const bool w4a4_dot8 = getenv("GGML_CUDA_W4A4_DOT8") != nullptr;
+    const bool u4act = w4a4_dot8 && src0->type == GGML_TYPE_Q4_0;
+
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
@@ -68,10 +78,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // 32-wide tile per active expert. Weight loads go through rp_traits, so
     // every repacked type takes this path.
     if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
-        block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
-            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
-            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        ggml_cuda_pool_alloc<block_q8_1>    src1_q8_1_own;
+        ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
+        block_q8_1 * src1_q8_1_d = nullptr;
+        if (u4act) {
+            // ALLOC MATH mirrors the dense milestone-3 wiring: block_q8_1_u4
+            // is 20 B vs block_q8_1's 32 B but the BLOCK COUNT is identical
+            // (ne10_padded/32 per token column = x_stride), so xs keeps its
+            // "blocks per token column" meaning and the kernels'
+            // `ids_src1[a] * xs` / `c*xs + sb` indexing is unchanged.
+            // Bypasses the q8_1 activation cache (variant 0 is the q8_1
+            // layout; u4 blocks must not share those entries).
+            src1_u4_own.alloc(ctx.pool(), (size_t) (n_cols * x_stride));
+            quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
+                ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded, n_cols, 1, 1, stream);
+            src1_q8_1_d = reinterpret_cast<block_q8_1 *>(src1_u4_own.get());
+        } else {
+            src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+                ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+                (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        }
 
         // Four rows per block, two waves. Five geometries were measured at
         // the verify widths and all landed within five percent; this was best.
@@ -96,10 +122,17 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     expert_stride, (uint32_t) x_stride, dst_s1);
                 break;
             case GGML_TYPE_Q4_0:
-                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0><<<grid, 128, 0, stream>>>(
-                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-                    expert_stride, (uint32_t) x_stride, dst_s1);
+                if (u4act) {
+                    mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0, true><<<grid, 128, 0, stream>>>(
+                        w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                        expert_stride, (uint32_t) x_stride, dst_s1);
+                } else {
+                    mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0><<<grid, 128, 0, stream>>>(
+                        w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                        expert_stride, (uint32_t) x_stride, dst_s1);
+                }
                 break;
             case GGML_TYPE_Q5_1:
                 mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q5_1><<<grid, 128, 0, stream>>>(
@@ -131,10 +164,22 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     }
 
     if (n_tokens == 1) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
-        const block_q8_1 * xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
-            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
-            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        ggml_cuda_pool_alloc<block_q8_1>    src1_q8_1_own;
+        ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
+        const block_q8_1 * xq = nullptr;
+        if (u4act) {
+            // Same token-major u4 layout as the narrow-batch arm above; the
+            // kernel reads `xq + (a % nchannels_y) * xs_id` which indexes
+            // the same per-column block runs.
+            src1_u4_own.alloc(ctx.pool(), (size_t) (n_cols * x_stride));
+            quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
+                ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded, n_cols, 1, 1, stream);
+            xq = reinterpret_cast<const block_q8_1 *>(src1_u4_own.get());
+        } else {
+            xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+                ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+                (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        }
         const uint32_t nchannels_y = (uint32_t) src1->ne[1];
         const uint32_t xs_id       = (uint32_t) x_stride;
         switch (src0->type) {
@@ -170,10 +215,17 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             } break;
             case GGML_TYPE_Q4_0: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
-                mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    (const int32_t *) ids->data, nchannels_y, expert_stride,
-                    xs_id, dst_s1);
+                if (u4act) {
+                    mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16, false, true><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        (const int32_t *) ids->data, nchannels_y, expert_stride,
+                        xs_id, dst_s1);
+                } else {
+                    mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        (const int32_t *) ids->data, nchannels_y, expert_stride,
+                        xs_id, dst_s1);
+                }
             } break;
             case GGML_TYPE_Q5_1: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
