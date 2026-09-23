@@ -742,3 +742,20 @@ at LANES=16/NCOLS=1 — the per-block nib_sum_u4 SUMW recompute is consumed once
 (no RPL=2 amortization like the dense winner). Fix paths if revisited: precompute SUMW
 at repack (+2B fp16/block) or u4-ize the fused gate epilogue. Dense m3 remains the
 adopt-candidate; MoE env flag should stay OFF in any deploy.
+
+## 34. W4A4 GEMM gauntlet: +32% pp2048, ADOPT-CANDIDATE (2026-09-23, post-reboot rerun)
+
+G3 fix verified committed (05bae03af: wiring + u4 quantizer stride fix) before the host restart; only the gauntlet was missing. Rerun complete (build-w4a4, Mistral-Large fine-tune 3rk, flock, perflevel high survived reboot):
+
+| Leg | pp2048 | PPL |
+|---|---|---|
+| gate-off (a) | 157.40 ± 0.28 | 1.0564 ± 0.00352 |
+| gate-ON (b) | **207.92 ± 0.30 (+32.1%)** | 1.1035 ± 0.00525 |
+| gate-off (c) | 157.20 ± 0.27 | — |
+| greedy primes gate-on | EXACT 2..29 + tides | |
+
+DECISION: pp +32.10%/+32.26% (>= +2% x2) PASS; dPPL +0.0471 <= +0.05 PASS but within 6% of the limit (activation 4-bit cost is real at prefill scale - the 2-chunk smoke 1.0185 flattered it); primes PASS. -> ADOPT-CANDIDATE.
+
+Caveats: (1) dPPL is the binding constraint - do not stack further u4-path changes without re-gauntlet; (2) binaries report G2 SHA (build-metadata lag) but gate toggles +32% pp AND the PPL delta, wiring demonstrably live; (3) GEMM covers prefill only - MoE stays REJECTED (§33).
+
+Full program: W4A4 = dense decode +2.8-3% tg + prefill +32% pp (both PPL-gated), MoE reject. Deploy = merge perf/w4a4-dot8-gfx906 into build-rccl + per-model GGML_CUDA_W4A4_DOT8=1 on Q4_0 dense entries (NOT MoE).
