@@ -10,7 +10,7 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
         cudaStream_t stream, bool u4act = false, uint32_t dst_s1 = 0);
-template <ggml_type WT, bool U4ACT = false>
+template <ggml_type WT, bool U4ACT = false, bool U4P8 = false>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
@@ -49,20 +49,45 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // kernels. Function-local static, fork pattern (mirrors GGML_RP_GENERIC_MMV
     // in the slice dispatch below). Unset gate = stock q8_1-activation path:
     // every u4 branch is inside `if (u4act)`, so gate-off behavior is unchanged.
-    static const bool w4a4_dot8 = getenv("GGML_CUDA_W4A4_DOT8") != nullptr;
-    const bool u4act = w4a4_dot8 && src0->type == GGML_TYPE_Q4_0;
+    // C1/B8 M3: the gate is now THREE-valued (read with atoi):
+    //   unset/0 = stock q8_1 activations
+    //   1       = per-32 asymmetric u4  (shipped; byte-identical to before)
+    //   2       = per-8 asymmetric u4p  (scheme B8; narrow-batch nc path ONLY)
+    // Value 2 selects the u4p pool + U4P8 template at the narrow-batch nc call
+    // sites. The tiled GEMM path (ne11 > MMQ_RP_Q8_MMV_MAX_TOKENS) keeps the
+    // per-32 semantics (u4act == gate 1 only) — the u4p GEMM variant is M4 and
+    // does not exist yet, so gate 2 must NOT route wide batches through the
+    // per-32 GEMM. Unparseable values atoi to 0 (stock).
+    static const int w4a4_dot8 = [] {
+        const char * e = getenv("GGML_CUDA_W4A4_DOT8");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    const bool u4act = w4a4_dot8 == 1 && src0->type == GGML_TYPE_Q4_0;
+    const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
         // tiled path below computes a full 32-wide tile whatever the batch is.
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
         ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
+        ggml_cuda_pool_alloc<block_q8_1_u4p> src1_u4p_own(ctx.pool());
         block_q8_1 * src1_q8_1_d = nullptr;
         {
             const int64_t s11 = src1->nb[1] / sizeof(float);
             const int64_t s12 = src1->nb[2] / sizeof(float);
             const int64_t s13 = src1->nb[3] / sizeof(float);
-            if (u4act) {
+            if (u4p) {
+                // C1/B8 M3 ALLOC MATH: block_q8_1_u4p is 32 B — the SAME size
+                // as block_q8_1 — and the BLOCK COUNT is identical too
+                // (ne10_padded/32 per token row = x_stride), so xs keeps its
+                // "blocks per token column" meaning and the kernel's
+                // `c*xs + sb` indexing is unchanged. Bypasses the q8_1
+                // activation cache for the same reason the u4 path does:
+                // different layout, must not share cache entries.
+                src1_u4p_own.alloc((size_t) (ne13 * ne12 * ne11 * x_stride));
+                quantize_mmq_q8_1_u4p_cuda((const float *) src1->data, src1_u4p_own.get(),
+                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            } else if (u4act) {
                 // ALLOC MATH: block_q8_1_u4 is 20 B vs block_q8_1's 32 B, but
                 // the BLOCK COUNT is identical (ne10_padded/32 per token row =
                 // x_stride), so xs keeps its "blocks per token column" meaning
@@ -85,13 +110,22 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             // Same block count under either layout, so the slice offset is in
             // identical block units; the U4ACT kernel reinterprets the base
             // back to block_q8_1_u4 (pool memory, no aliasing hazard).
-            const block_q8_1 * xq = (u4act
+            const block_q8_1 * xq = (u4p
+                    ? reinterpret_cast<const block_q8_1 *>(src1_u4p_own.get())
+                    : u4act
                     ? reinterpret_cast<const block_q8_1 *>(src1_u4_own.get())
                     : src1_q8_1_d)
                               + (i3 * ne12 + i2) * ne11 * x_stride;
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
             if (ne11 == 1) {
-                if (u4act) {
+                if (u4p) {
+                    // C1/B8 M3 single-token decode: u4p nc kernel at NCOLS=1,
+                    // same 2-row / RPL=2 / 64-lane shape as the per-32 twin.
+                    const dim3 grid((ne01 + 1) / 2, 1, 1);
+                    mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_0, false, true>
+                        <<<grid, 64, 0, stream>>>(w, xq, dst_d,
+                            (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride, dst_s1);
+                } else if (u4act) {
                     // Single-token decode: the nc kernel at NCOLS=1, same
                     // 2-row / RPL=2 / 64-lane shape as widths 4-8. Stock
                     // single-token kernels stay for every other weight type.
@@ -118,7 +152,10 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                             ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         break;
                     case GGML_TYPE_Q4_0:
-                        if (u4act) {
+                        if (u4p) {
+                            ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0, false, true>(w, xq, dst_d,
+                                ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        } else if (u4act) {
                             ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0, true>(w, xq, dst_d,
                                 ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         } else {
@@ -244,7 +281,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
 }
 
 // Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
-template <ggml_type WT, bool U4ACT>
+template <ggml_type WT, bool U4ACT, bool U4P8>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
@@ -299,11 +336,11 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             if (lanes16_ok) {
                 // 16 lanes to a row, 32 rows per block, one row per lane.
                 const dim3 grid((ne01 + 31) / 32, 1, 1);
-                mul_mat_vec_repacked_nc<32, 8, 2, 1, 16, WT, U4ACT><<<grid, 512, 0, stream>>>(
+                mul_mat_vec_repacked_nc<32, 8, 2, 1, 16, WT, U4ACT, U4P8><<<grid, 512, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
-                mul_mat_vec_repacked_nc<2, 2, 2, 1, 64, WT, U4ACT><<<grid, 128, 0, stream>>>(
+                mul_mat_vec_repacked_nc<2, 2, 2, 1, 64, WT, U4ACT, U4P8><<<grid, 128, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             }
         } break;
@@ -311,37 +348,37 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             if (lanes32_ok) {
                 // 32 lanes to a row, 8 rows per block, one row per lane.
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT, U4ACT><<<grid, 256, 0, stream>>>(
+                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT, U4ACT, U4P8><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
-                mul_mat_vec_repacked_nc<2, 1, 3, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+                mul_mat_vec_repacked_nc<2, 1, 3, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             }
         } break;
         case 4: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 5: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 6: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 7: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 8: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT, U4ACT><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         default: GGML_ABORT("nc mat-vec: unsupported batch width");
