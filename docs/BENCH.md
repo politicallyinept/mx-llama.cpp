@@ -797,3 +797,31 @@ greedy@131k: primes 2..23 listed (29 truncated by -n 100 budget on thinking mode
 4. Qwen Q8_0 control: pp2048 594 vs Q4_0+W4A4 630 — Q4_0+full-stack now BEATS Q8_0 prefill
    on this rig (was: Q8 won prefill per findings §3).
 5. Greedy-at-depth: correct on all models tested (primes listed correctly at 32k-64k depth).
+
+## 36. C1/B8 milestone M3: per-8 u4p decode — REJECT on perf; depth-PPL lens corrected (2026-09-24)
+
+Commit 59eefc51f wired GGML_CUDA_W4A4_DOT8=2 (per-8 u4p) into dense decode dispatch.
+Gauntlet (Mistral-Large fine-tune 3rk, 175W, interleave gate 0/1/2, r=3):
+
+| Leg | gate-0 stock | gate-1 per-32 | gate-2 per-8 |
+|---|---:|---:|---:|
+| pp2048 | 157.70 | 203.25 (+29%) | 157.65 (0%) |
+| pp8192 | 144.97 | 185.95 (+28%) | 144.70 (0%) |
+| pp16384 | 130.87 | 163.53 (+25%) | 130.62 (0%) |
+| tg64@8k | 20.47 | 21.20 (+3.6%) | **18.58 (-9.2%)** |
+| PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.0751 (0.0000) |
+| PPL@2k | 1.0564 | — | 1.0564 (0.0000) |
+
+VERDICT: REJECT for decode (tg -9.2% blows the <=1% cost rule; the 27-VGPR spill +
+4x epilogue of the per-8 kernel is real cost, matching design §8's risk register).
+
+CRITICAL LENS CORRECTION: gate-2's PPL deltas of 0.0000 are STRUCTURAL BLINDNESS,
+not quality proof — perplexity is prefill/GEMM-dominated, and u4p was wired
+decode-only (pp identical to stock confirms it never touched GEMM). The +0.082
+depth-PPL cost we set out to fix lives in the GEMM path (gate-1: GEMM u4 wired,
+PPL moves; gate-2: decode only, PPL frozen). Same lesson as §31, re-confirmed.
+
+C1 REFRAME: per-8 recovery, if wanted, belongs in M4 = GEMM u4p (prefill side),
+where the depth-PPL cost is actually created. Decode stays per-32 (its +3.6% tg
+and PPL-neutrality at 2k stand). Greedy@64k gate-2: output-file capture truncated
+(empty after 'Assistant:') - noted, not re-run given the perf verdict.
