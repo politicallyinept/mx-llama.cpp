@@ -759,3 +759,41 @@ DECISION: pp +32.10%/+32.26% (>= +2% x2) PASS; dPPL +0.0471 <= +0.05 PASS but wi
 Caveats: (1) dPPL is the binding constraint - do not stack further u4-path changes without re-gauntlet; (2) binaries report G2 SHA (build-metadata lag) but gate toggles +32% pp AND the PPL delta, wiring demonstrably live; (3) GEMM covers prefill only - MoE stays REJECTED (§33).
 
 Full program: W4A4 = dense decode +2.8-3% tg + prefill +32% pp (both PPL-gated), MoE reject. Deploy = merge perf/w4a4-dot8-gfx906 into build-rccl + per-model GGML_CUDA_W4A4_DOT8=1 on Q4_0 dense entries (NOT MoE).
+
+## 35. 175W re-baseline + long-context matrix — COMPLETE (2026-09-24)
+
+Envelope: 175W/card (upp, persists), ALL models 3-rank -sm tensor (topology standardized),
+binary build-w4a4 (full stack). Prior §30-34 numbers INVALID (power + topology changed).
+Matrices: Mistral-Large fine-tune@64k, Mistral-Large fine-tune@32k, Qwen-Q4_0/Q8_0+Ornith@131k.
+
+### Mistral-Large fine-tune 123B (3rk, 175W) — gate off / on
+pp2048: 157.70 / 207.72 (+31.8%) | pp8192: 125.98 / 186.14 (+47.7%) | pp16384: 94.67 / 163.75 (+72.9%!)
+tg@8k: 20.47 / 21.17 (+3.4%) | PPL@8k: 1.0723 / 1.1504 (d=+0.078, OVER the +0.05 gate at depth!)
+greedy@64k-depth: primes exact 2-29.
+
+### Mistral-Large fine-tune 128B (3rk, ctx 32768)
+pp2048: 154.87 / 199.62 (+28.9%) | pp8192: 142.67 / 179.69 (+25.9%) | tg@8k: 19.69 / 20.22 (+2.7%)
+PPL@8k: 1.5436 / 1.7339 (d=+0.190 — OVER the +0.05 gate!)
+
+### Qwen3.8-27B (3rk, ctx 131072)
+Q4_0: pp2048 529.77 / 630.72 (+19.0%) | pp8192 511.56 / 606.32 (+18.5%) | pp16384 486.65 / 571.91 (+17.5%)
+tg@131k-depth: 52.18 / 52.53 (+0.7% — flat) | PPL@8k: 5.0055 / 5.7254 (d=+0.72!! OVER gate)
+Q8_0 control: pp2048 594.27, pp16384 540.39, tg@131k 44.26, PPL@8k 4.3910
+NOTE: Q8_0 is FASTER at pp than Q4_0+W4A4 (594 vs 630 close, but 571 vs 606 at 16k) — dequant tax analysis revisited.
+
+### Ornith 35B MoE (3rk, ctx 131072)
+pp2048: 1808.46 / 1929.73 (+6.7%) | pp8192: 1736.56 / 1848.04 (+6.4%) | tg@131k: 103.99 / 98.27 (-5.5%, regression persists)
+PPL@8k: 1.9113 / 2.2150 (d=+0.30 — OVER gate)
+greedy@131k: primes 2..23 listed (29 truncated by -n 100 budget on thinking model)
+
+### KEY FINDINGS
+1. W4A4 pp win GROWS with depth on Mistral-Large fine-tune: +32%/+48%/+73% at 2k/8k/16k. The 642-instr
+   GEMM loop's dequant tax dominates harder as KV grows.
+2. BUT: PPL-at-depth delta BLOWS the +0.05 gate on all models (Mon +0.078@8k, Beh +0.190,
+   Qwen +0.72). c=2048 audits (d=0.0000/+0.0471) were measured at shallow context; at
+   8k+ context the activation-4bit cost is REAL and grows with depth.
+3. Ornith@3rk: decode regression persists (-5.5%), pp gains +6.4-6.7% — still net reject
+   for tg, but pp win is real for MoE prefill.
+4. Qwen Q8_0 control: pp2048 594 vs Q4_0+W4A4 630 — Q4_0+full-stack now BEATS Q8_0 prefill
+   on this rig (was: Q8 won prefill per findings §3).
+5. Greedy-at-depth: correct on all models tested (primes listed correctly at 32k-64k depth).
