@@ -334,6 +334,25 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_u4_from_blocks(
     return out;
 }
 
+// C1/B8 M4: fetch one 32-value u4p activation sub-block straight from the
+// token-major block_q8_1_u4p pool (quantize_mmq_q8_1_u4p_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block, nkb = ne0/32). The 32 B stride keeps every
+// block 16 B aligned, so BOTH the qs nibbles and the d4[4]/m[4] fp16 quad load
+// as full uint4s (unlike the 20 B per-32 u4, which needed 4x u32 for qs).
+// q0 = the 32 signed two's-complement nibbles (4 words, one per-8 sub-block
+// each); q1 = the 8 fp16 scales packed as {d4_0,d4_1},{d4_2,d4_3},{m_0,m_1},
+// {m_2,m_3} — the d4[4]+m[4] array is 16 B contiguous at offset 16. out.d is
+// unused under U4P8 (the per-8 scales ride q1, not the per-32 sXd/sXs tiles).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4p_from_blocks(
+        const block_q8_1_u4p * __restrict__ blocks, const uint32_t idx) {
+    const block_q8_1_u4p & b = blocks[idx];
+    rp_x_sub out;
+    out.q0 = *reinterpret_cast<const uint4 *>(b.qs);
+    out.q1 = *reinterpret_cast<const uint4 *>(b.d4);
+    out.d  = 0.0f;
+    return out;
+}
+
 // Zero a raw scale slot for a dead row (the nc kernels clamp the row index and kill the term through the slot).
 // Integral slots and the uint2 affine slot.
 template <typename T>

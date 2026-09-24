@@ -635,7 +635,10 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 // GEMM. Skeleton only: template param + asserts + LDS/register plumbing with
 // TODO(G2) markers; no dispatch passes U4ACT=true until G3. Plan:
 // docs/w4a4-gemm-u4-plan.md (workspace w4a4-g1).
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool U4ACT = false>
+// C1/B8 M4: U4P8 selects the per-8 u4p activation variant of the dense GEMM
+// (same pattern as the decode M2 U4P8 branch; per-8 moves the epilogue
+// granularity only — the dot8 count per 32-value block is unchanged).
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool U4ACT = false, bool U4P8 = false>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -650,6 +653,11 @@ static __device__ void mmq_gemm_repacked_impl(
     // id-path is revisited; fused variants are nc-only anyway.
     static_assert(!U4ACT || WT == GGML_TYPE_Q4_0, "U4ACT (dp8a) is only defined for Q4_0 weights");
     static_assert(!U4ACT || !HAS_IDS, "U4ACT (dp8a) GEMM is dense-only in G1-G3 scope");
+    // C1/B8 M4: the per-8 u4p GEMM carries the same guards as U4ACT and is
+    // mutually exclusive with it — the two activation layouts cannot mix.
+    static_assert(!U4P8 || WT == GGML_TYPE_Q4_0, "U4P8 (dp8a per-8) is only defined for Q4_0 weights");
+    static_assert(!U4P8 || !HAS_IDS, "U4P8 (dp8a per-8) GEMM is dense-only");
+    static_assert(!(U4ACT && U4P8), "U4ACT (per-32) and U4P8 (per-8) are mutually exclusive");
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
@@ -701,18 +709,29 @@ static __device__ void mmq_gemm_repacked_impl(
     union rp_w_planes {
         uint4 sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
         float sWs[U4ACT ? MMQ_RP_Q8_BK : 1][U4ACT ? MMQ_RP_Q8_BM : 1];
+        // C1/B8 M4: per-8 weight sums — FOUR SW_k per (row, slab), SW_k =
+        // nib_sum_word(raw_k) - 64 (signed, exact in fp32, range [-64, 64]).
+        // 4*4 B * BK * BM = 4096 B = exactly the sW_hi footprint, so the union
+        // total stays at the stock 32768 B (64-wide) / 20736 B (w32) and the
+        // launch_bounds occupancy is unchanged. U4P8 never touches sW_hi.
+        float sWs8[U4P8 ? MMQ_RP_Q8_BK : 1][U4P8 ? MMQ_RP_Q8_BM : 1][4];
     };
     __shared__ rp_w_planes rp_wplane;
     auto & sW_hi = rp_wplane.sW_hi;
     auto & sWs   = rp_wplane.sWs;
+    auto & sWs8  = rp_wplane.sWs8;
     using slot_t = typename rp_traits<WT>::slot_t;
     static_assert(16 % sizeof(slot_t) == 0, "slot must divide a uint4 fetch");
     constexpr int SPW = (int) (16 / sizeof(slot_t));   // slots per uint4 LDS fetch
     __shared__ slot_t   sWdh[MMQ_RP_Q8_BK][MMQ_RP_Q8_BM];
     __shared__ sXq_row_q8 sXq[BN];
-    __shared__ float    sXd[BN][MMQ_RP_Q8_BK + 1];
+    // M4: under U4P8 the per-8 d4/m ride the activation q[lk][1] plane as
+    // packed fp16, so the per-32 sXd tile is unused — shrink it to [1] to
+    // hand the LDS back (keeps the 64-wide block under the 32 KiB budget
+    // with room to spare).
+    __shared__ float    sXd[U4P8 ? 1 : BN][MMQ_RP_Q8_BK + 1];
     // Activation sums, affine types only (the [1] alternative keeps the LDS footprint of every other type unchanged).
-    __shared__ float    sXs[rp_traits<WT>::affine ? BN : 1][MMQ_RP_Q8_BK + 1];
+    __shared__ float    sXs[(rp_traits<WT>::affine && !U4P8) ? BN : 1][MMQ_RP_Q8_BK + 1];
     // G1 (W4A4 GEMM): per-weight-block two's-complement nibble sum
     // (sw = (int)nib_sum_u4(raw) - 256), computed at prefetch so compute_stage
     // stays dot-bound (see plan §2). Lives in the sW_hi/sWs union above (G2)
@@ -736,6 +755,10 @@ static __device__ void mmq_gemm_repacked_impl(
     // G1 (W4A4 GEMM): two's-complement weight sum per prefetched weight block
     // (sw), filled by the U4ACT prefetch branch in G2. Unused when U4ACT is off.
     [[maybe_unused]] float pw_s[W_EPT];
+    // C1/B8 M4: per-8 weight sums per prefetched block (SW_k =
+    // nib_sum_word(raw_k) - 64, signed before the float cast — the 3b
+    // root-cause class). Filled by the U4P8 prefetch branches; unused otherwise.
+    [[maybe_unused]] float pw_s8[W_EPT][4];
     rp_x_sub px   [X_EPT];
     [[maybe_unused]] float px_s[X_EPT];
     if constexpr (HAS_IDS) {
@@ -784,6 +807,19 @@ static __device__ void mmq_gemm_repacked_impl(
                     pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                          raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                     pw_s[i]  = (float) ((int) nib_sum_u4(raw) - 256);
+                } else if constexpr (U4P8) {
+                    // C1/B8 M4: same raw XOR-8 staging as U4ACT, but the
+                    // per-8 sums: SW_k = nib_sum_word(raw_k) - 64 per word
+                    // (8 codes, signed before the float cast — the 3b class).
+                    uint4 raw;
+                    rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, raw, pw_d[i]);
+                    pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
+                                         raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
+                    const uint32_t rw[4] = { raw.x, raw.y, raw.z, raw.w };
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        pw_s8[i][k] = (float) ((int) nib_sum_word(rw[k]) - 64);
+                    }
                 } else if constexpr (RAW_REG) {
                     rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
                 } else {
@@ -798,6 +834,10 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_d [i] = {};
                 if constexpr (U4ACT) {
                     pw_s[i] = 0.0f;
+                }
+                if constexpr (U4P8) {
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) pw_s8[i][k] = 0.0f;
                 }
             }
         }
@@ -835,6 +875,41 @@ static __device__ void mmq_gemm_repacked_impl(
                     // affine dead-column zeroing).
                     px[i] = {};
                     px_s[i] = 0.0f;
+                }
+            }
+            return;
+        }
+        if constexpr (U4P8) {
+            // C1/B8 M4: u4p activation fetch from the token-major
+            // block_q8_1_u4p pool: xq_u4p[xcol * n_sub + sb] (nkb = ne0/32 —
+            // the u4p quantizer emits one 32 B block per (token, 32 values),
+            // same token-major ib as the per-32 u4 quantizer). The 32 B stride
+            // keeps every block 16 B aligned: qs AND the d4[4]/m[4] quad both
+            // load as full uint4s (no 4xu32 workaround like the 20 B u4).
+            // q1 carries the packed fp16 scales; the per-32 sXd/sXs tiles are
+            // not used. HAS_IDS is asserted false, so xcol is the plain token col.
+            GGML_UNUSED(x_grp);
+            const block_q8_1_u4p * __restrict__ xq_u4p =
+                reinterpret_cast<const block_q8_1_u4p *>(xq);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                const int e = t + i * NTHREADS;
+                if constexpr (X_EPT * NTHREADS != X_ELM) {
+                    if (e >= X_ELM) {
+                        break;
+                    }
+                }
+                const int      lr = e / MMQ_RP_Q8_BK;
+                const int      lk = e % MMQ_RP_Q8_BK;
+                const uint32_t sb = sb0 + lk;
+                const uint32_t xcol = tok0 + lr;
+                if (xcol < n_tok && sb < n_sub) {
+                    px[i] = rp_x_sub_u4p_from_blocks(xq_u4p, xcol * n_sub + sb);
+                } else {
+                    // Out-of-range token/slab: zero the nibbles AND the packed
+                    // d4/m quad so the sealed per-8 epilogue collapses to 0
+                    // regardless of the weight term (dead-column trick).
+                    px[i] = {};
                 }
             }
             return;
@@ -894,6 +969,17 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                      raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                 pw_s[i]  = (float) ((int) nib_sum_u4(raw) - 256);
+            } else if constexpr (U4P8) {
+                // C1/B8 M4: same raw XOR-8 + per-8 SW_k as the checked path.
+                uint4 raw;
+                rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, raw, pw_d[i]);
+                pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
+                                     raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
+                const uint32_t rw[4] = { raw.x, raw.y, raw.z, raw.w };
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    pw_s8[i][k] = (float) ((int) nib_sum_word(rw[k]) - 64);
+                }
             } else if constexpr (RAW_REG) {
                 rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
             } else {
@@ -919,6 +1005,24 @@ static __device__ void mmq_gemm_repacked_impl(
                 const int      lk = e % MMQ_RP_Q8_BK;
                 const uint32_t sb = sb0 + lk;
                 px[i] = rp_x_sub_u4_from_blocks(xq_u4, (tok0 + lr) * n_sub + sb, px_s[i]);
+            }
+            return;
+        }
+        if constexpr (U4P8) {
+            // C1/B8 M4: same u4p fetch as prefetch_x_checked, unchecked.
+            GGML_UNUSED(x_grp);
+            const block_q8_1_u4p * __restrict__ xq_u4p =
+                reinterpret_cast<const block_q8_1_u4p *>(xq);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                const int e = t + i * NTHREADS;
+                if constexpr (X_EPT * NTHREADS != X_ELM) {
+                    if (e >= X_ELM) break;
+                }
+                const int      lr = e / MMQ_RP_Q8_BK;
+                const int      lk = e % MMQ_RP_Q8_BK;
+                const uint32_t sb = sb0 + lk;
+                px[i] = rp_x_sub_u4p_from_blocks(xq_u4p, (tok0 + lr) * n_sub + sb);
             }
             return;
         }
@@ -962,6 +1066,13 @@ static __device__ void mmq_gemm_repacked_impl(
                 sW_lo[lr][lk] = pw_lo[i];
                 sWdh [lk][lr] = pw_d[i];
                 sWs  [lk][lr] = pw_s[i];
+            } else if constexpr (U4P8) {
+                // C1/B8 M4: weight side identical to U4ACT (raw XOR-8 uint4);
+                // the per-8 SW_k ride sWs8 (union with sW_hi).
+                sW_lo[lr][lk] = pw_lo[i];
+                sWdh [lk][lr] = pw_d[i];
+#pragma unroll
+                for (int k = 0; k < 4; ++k) sWs8[lk][lr][k] = pw_s8[i][k];
             } else if constexpr (RAW_REG) {
                 uint4 lo, hi;
                 rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
@@ -988,11 +1099,20 @@ static __device__ void mmq_gemm_repacked_impl(
             // G1 (W4A4 GEMM): under U4ACT the activation payload is one uint4
             // (the raw u4 qs) in q[lk][0]; q[lk][1] is unused (zeroed by the
             // G2 fetch), sXd carries d4 and sXs carries m.
-            sXq[sXr].q[lk][0] = px[i].q0;
-            sXq[sXr].q[lk][1] = px[i].q1;
-            sXd[sXr][lk]    = px[i].d;
-            if constexpr (rp_traits<WT>::affine) {
-                sXs[sXr][lk] = px_s[i];
+            if constexpr (U4P8) {
+                // C1/B8 M4: q[lk][0] = the 32 signed nibbles; q[lk][1] = the
+                // packed fp16 d4[4]/m[4] quad (rp_x_sub_u4p_from_blocks).
+                // The per-32 sXd/sXs tiles are shrunk to [1] under U4P8 and
+                // are NOT written here (the per-8 scales ride the q plane).
+                sXq[sXr].q[lk][0] = px[i].q0;
+                sXq[sXr].q[lk][1] = px[i].q1;
+            } else {
+                sXq[sXr].q[lk][0] = px[i].q0;
+                sXq[sXr].q[lk][1] = px[i].q1;
+                sXd[sXr][lk]    = px[i].d;
+                if constexpr (rp_traits<WT>::affine) {
+                    sXs[sXr][lk] = px_s[i];
+                }
             }
         }
     };
@@ -1044,6 +1164,77 @@ static __device__ void mmq_gemm_repacked_impl(
                             const float mu = sXs[xcol][kk];
                             const int idot = mmvq_dp8a_u4(w_c, a);
                             acc[r][n] += d * (d4 * ((float) idot + 8.0f * sw) + mu * sw);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if constexpr (U4P8) {
+            // C1/B8 M4: the sealed per-8 form-1 dot loop, GEMM twin of the
+            // decode U4P8 branch (mul_mat_vec_repacked_nc_impl, M2) and of
+            // the U4ACT loop above. Per 32-value sub-block kk, per weight row
+            // r, per token col n, summed over the four per-8 sub-blocks k:
+            //     acc[r][n] += d * ( d4_k * ((float) idot_k + 8.0f*SW_k) + m_k * SW_k )
+            // with idot_k = dp8a(w_word_k, a_word_k) UNCHAINED per sub-block
+            // (the algebra needs them separate — no per-32 chaining),
+            // w_word = sW_lo (raw Q4_0 XOR-8'd two's-complement nibbles),
+            // SW_k = sWs8 (SIGNED nib_sum_word-64, the 3b class),
+            // a_word = sXq q[kk][0] words (quantizer stores signed nibbles),
+            // d4_k/m_k = sXq q[kk][1] packed fp16 quad {d4_0,d4_1},{d4_2,
+            // d4_3},{m_0,m_1},{m_2,m_3} (rp_x_sub_u4p_from_blocks),
+            // d = Q4_0 f16 scale from sWdh (zeroed for dead rows at prefetch).
+            // Dot count per block per (r,n) = 4 dot8 — SAME as the per-32
+            // U4ACT GEMM (per-8 moves the epilogue granularity only).
+            // Activation operands read straight from LDS inside the n loop
+            // (the U4ACT spill lesson: hoisting spilled 178 VGPRs).
+            // M4: forced unroll of the slab loop so the w32 variant emits the
+            // full 128 static dot8s like the per-32 U4ACT w32 (the rolled
+            // form emitted 32 static x 4 dynamic; same dynamic total, the
+            // unroll restores the per-32 static shape the brief asks to
+            // verify — spill-checked, see kernel-notes M4).
+#pragma unroll
+            for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
+                const int row_base = ty * NROW;
+                uint4 w = sW_lo[row_base][kk];
+                const uint4 * dp16 = reinterpret_cast<const uint4 *>(&sWdh[kk][row_base]);
+#pragma unroll
+                for (int g = 0; g < NROW; g += SPW) {
+                    const uint4 dh4 = dp16[g / SPW];
+                    const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
+#pragma unroll
+                    for (int rr = 0; rr < SPW; rr++) {
+                        const int r = g + rr;
+                        const uint4 w_c = w;
+                        if (r + 1 < NROW) {
+                            w = sW_lo[row_base + r + 1][kk];
+                        }
+                        const float d  = rp_traits<WT>::scale(dh[rr]);
+                        // Four SW_k for this (slab, row): 16 B aligned in the
+                        // union (float[4] rows), load as one float4.
+                        const float4 sw4 = *reinterpret_cast<const float4 *>(
+                            &sWs8[kk][row_base + r][0]);
+#pragma unroll
+                        for (int n = 0; n < TN_; n++) {
+                            const int xcol = sxc0 + n * CW;
+                            const uint4 a = sXq[xcol].q[kk][0];
+                            const uint4 s = sXq[xcol].q[kk][1];
+                            // k-pair fold (M4 anti-stuck): consume k=0,1 into
+                            // acc, then k=2,3 — halves the live epilogue
+                            // temporaries (4 idot + 8 scale floats -> 2 + 4)
+                            // to claw back VGPRs at launch_bounds(256, 2).
+                            const float2 p0 = __half22float2(*reinterpret_cast<const half2 *>(&s.x));
+                            const float2 q0 = __half22float2(*reinterpret_cast<const half2 *>(&s.z));
+                            const int i0 = ggml_cuda_dp8a((int) w_c.x, (int) a.x, 0);
+                            const int i1 = ggml_cuda_dp8a((int) w_c.y, (int) a.y, 0);
+                            acc[r][n] += d * (p0.x * ((float) i0 + 8.0f * sw4.x) + q0.x * sw4.x);
+                            acc[r][n] += d * (p0.y * ((float) i1 + 8.0f * sw4.y) + q0.y * sw4.y);
+                            const float2 p1 = __half22float2(*reinterpret_cast<const half2 *>(&s.y));
+                            const float2 q1 = __half22float2(*reinterpret_cast<const half2 *>(&s.w));
+                            const int i2 = ggml_cuda_dp8a((int) w_c.z, (int) a.z, 0);
+                            const int i3 = ggml_cuda_dp8a((int) w_c.w, (int) a.w, 0);
+                            acc[r][n] += d * (p1.x * ((float) i2 + 8.0f * sw4.z) + q1.x * sw4.z);
+                            acc[r][n] += d * (p1.y * ((float) i3 + 8.0f * sw4.w) + q1.y * sw4.w);
                         }
                     }
                 }
@@ -1232,7 +1423,8 @@ static __device__ void mmq_gemm_repacked_impl(
 // G2: U4ACT threaded to the impl (the G1 commit message claimed the wrappers
 // were already threaded; they were not -- done here). Default false keeps the
 // stock instantiation byte-identical.
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false>
+// M4: U4P8 threaded the same way (default false = byte-identical stock).
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false>
 static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1242,7 +1434,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT, U4P8>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
@@ -1620,7 +1812,7 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 #endif
 }
 
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false>
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1630,7 +1822,7 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT, U4P8>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
@@ -1643,12 +1835,25 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
 // (kept #if 0 as documentation; compiled standalone with the exact build flags
 // at G2 time -- see docs/w4a4-kernel-notes.md G2 section for the verified
 // codegen numbers). Uncomment to re-verify codegen without dispatch wiring.
+// M4: the U4P8=true variants are force-instantiated the same way (the dispatch
+// now emits them under gate=2; the explicit instantiations below pin the exact
+// template args for the save-temps dot8 count check — 256 (64-wide) / 128
+// (w32) v_dot8_i32_i4, same as the per-32 U4ACT GEMM: per-8 moves the
+// epilogue granularity only).
 #if 0
 template __global__ void mmq_gemm_repacked<false, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_0, true>(
     const uint8_t *, const block_q8_1 *, float *, const uint32_t, const uint32_t,
     const uint32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *,
     const repack_tile_meta *, const uint32_t, const size_t, const uint32_t);
 template __global__ void mmq_gemm_repacked_w32<false, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_0, true>(
+    const uint8_t *, const block_q8_1 *, float *, const uint32_t, const uint32_t,
+    const uint32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *,
+    const repack_tile_meta *, const uint32_t, const size_t, const uint32_t);
+template __global__ void mmq_gemm_repacked<false, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_0, false, true>(
+    const uint8_t *, const block_q8_1 *, float *, const uint32_t, const uint32_t,
+    const uint32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *,
+    const repack_tile_meta *, const uint32_t, const size_t, const uint32_t);
+template __global__ void mmq_gemm_repacked_w32<false, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_0, false, true>(
     const uint8_t *, const block_q8_1 *, float *, const uint32_t, const uint32_t,
     const uint32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *,
     const repack_tile_meta *, const uint32_t, const size_t, const uint32_t);

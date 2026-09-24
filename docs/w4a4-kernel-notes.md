@@ -444,3 +444,73 @@ At the mul-mat.cu nc call sites under the w4a4_dot8 gate, value 2 selects u4p:
 - Template arg: pass U4P8=true (U4ACT=false) at the mul_mat_vec_repacked_nc
   launch sites (dense nc path; id1/MoE wrappers unchanged — reject stands).
 - Gate-off (=0) and per-32 (=1) dispatch stay byte-identical to shipped.
+
+## Milestone M4 — GEMM per-8 u4p + best-of gate=2 (DONE)
+
+C1/B8 FINAL (docs/m4-dispatch-brief.md). Gate=2 redefined: DECODE per-32
+(same as gate=1) + GEMM per-8 u4p. The M3 per-8 u4p DECODE branch stays
+compiled but is PARKED (BENCH.md §36 reject, -9.2% tg) — the narrow-path
+u4p sites now key off a constant-false `u4p_decode` so the template
+instantiation survives while no gate reaches it.
+
+### Changes
+
+1. mul-mat.cu gate: `u4act = (gate==1 || gate==2) && Q4_0` (decode per-32
+   under both gates); `u4p = gate==2 && Q4_0` now routes ONLY the tiled GEMM
+   path. Gate 0/1 byte-identical to shipped.
+2. GEMM quantize block: under u4p, activations go through
+   quantize_mmq_q8_1_u4p_cuda into pool_alloc<block_q8_1_u4p> sized
+   ne13*ne12*chunk_ne11*nkb_u4 (32 B/block vs u4 20 B/block; block COUNT
+   identical — 32 B stride is SIMPLER than the 20 B per-32 staging: every
+   block 16 B aligned, qs AND d4[4]/m[4] load as full uint4s).
+3. repack-common.cuh: `rp_x_sub_u4p_from_blocks(blocks, idx)` — q0 = the 32
+   signed nibbles (uint4), q1 = the d4[4]+m[4] fp16 arrays as one uint4
+   (16 B contiguous at offset 16). out.d unused (per-8 scales ride q1).
+4. repack-kernels.cuh mmq_gemm_repacked_impl: new U4P8 template param
+   (asserts: WT==Q4_0, !HAS_IDS, !(U4ACT&&U4P8)).
+   - LDS: sWs8[BK][BM][4] (four SW_k per row/slab) joins the named union
+     with sW_hi — 4096 B = exactly the sW_hi footprint, union total
+     unchanged. sXd/sXs shrink to [1] under U4P8 (per-32 scale tiles
+     unused): 64-wide static LDS 27136 B (vs 32256 for U4ACT), w32 13312 B.
+   - prefetch_w (checked+full): raw XOR-8 staging identical to U4ACT;
+     SW_k = nib_sum_word(raw_k) - 64 SIGNED (3b class) into pw_s8.
+   - prefetch_x (checked+full): u4p blocks via the new helper; dead
+     token/slab zeroes q0 AND q1 (dead-column trick collapses the term).
+   - compute_stage U4P8: sealed FORM 1 per-8 loop (M1 seal, 1504 blocks,
+     0 fails): per slab kk, per (r,n): 4 UNCHAINED dp8a (one per sub-block
+     word) + k-pair fold (k=0,1 into acc, then k=2,3) to halve live
+     epilogue temporaries at launch_bounds(256,2).
+   - Wrappers: U4P8 threaded through mmq_gemm_repacked / _w32 (default
+     false = byte-identical stock).
+5. Slice dispatch: ne11==1 under u4p8 (workspace-pressure edge case: a
+   gate-2 GEMM chunk shrunk to 1 token) routes to the single-token u4p nc
+   kernel with xs = ne00/32 — the stock single-token kernel would
+   misread the u4p pool.
+6. 64-wide + w32 launch switches: Q4_0 case branches u4p8 ? <...,false,true>
+   : u4act ? <...,true> : stock.
+
+### Codegen verification (save-temps, exact build flags, gfx906)
+
+- 64-wide U4P8: 256 v_dot8_i32_i4 static — MATCHES the per-32 U4ACT GEMM
+  (256/128 per the G2 notes). w32 U4P8: 32 static x 4 dynamic slabs = 128
+  dynamic — same dynamic total as the per-32 128 static. The slab loop is
+  deliberately ROLLED: forcing #pragma unroll quadrupled the 64-wide static
+  count to 1024 and blew spills to 123 (w32 52), so the rolled form is
+  kept. VGPR spills: 21 (64-wide) / 5 (w32) vs per-32 U4ACT 4 / 40.
+  launch_bounds(256,2) holds for the 64-wide U4P8 (128 VGPRs, no
+  -Wpass-failed); w32 holds (256,3).
+- Full-build warning diff HEAD vs M4: identical 5 pre-existing occupancy
+  warnings (Q4_0/Q5_K/Q6_K U4ACT=false variants, present since before G1);
+  zero new warnings from M4.
+- NUMERIC SEAL (gemm_u4p8_test.cu, G3-harness twin with the u4p host
+  quantizer + form-1 CPU reference): PASS on 64-wide and w32 across
+  ne00={128,256,5120,12288} x ne01={64,128,129} x ntok={1,64,65,96,127,128}
+  (full-tile AND checked paths), maxrel <= 2.1e-4 (fp32 accumulation
+  noise; cancellation-safe denominator max(1.0,|want|)).
+
+### M4 dispatch note
+
+Gate=2 end state: decode = per-32 u4 (u4act), GEMM = per-8 u4p (u4p8).
+Gate=1 unchanged (per-32 both). Gate=0 stock. The parked decode-u4p
+instantiation is dead code kept for reference; do not re-select it without
+re-running the §36 tg gate.
