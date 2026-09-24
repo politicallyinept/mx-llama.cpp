@@ -379,3 +379,68 @@ at `88bbc3572`). Per 32-value sub-block:
 4. Gauntlet (Slot A, /root/gpu.lock): pp2048 >= +2% vs q8_1-activation
    baseline, dPPL <= +0.05. pp2048 hits the 64-wide arm (ne11=2048);
    32-wide covers 9..127.
+
+## Milestone M2 — per-8 u4p decode kernel (DONE, unwired)
+
+C1/B8 (docs/design-w4a4-per8.md §4, M1 seal docs/w4a4-per8-m1.md). Adds the
+per-8 asymmetric activation variant to the narrow-batch mat-vec, form-1 epilogue.
+No dispatch selects it yet (M3 wires the gate).
+
+### Changes
+
+1. repack-common.cuh: `block_q8_1_u4p` { qs[16]; ggml_half d4[4]; ggml_half m[4]; }
+   + static_assert(sizeof == 32) + layout comment (mirrors u4p_host.h M1: word k =
+   values 8k..8k+7, byte j = {val 8k+2j low, 8k+2j+1 high}, SIGNED (q-8)&0xF
+   nibbles matching the dp8a convention).
+2. repack-kernels.cuh after mmvq_dp8a_u4: `nib_sum_word` (8 raw codes per u32)
+   + `mmvq_dp8a_u4p(w_raw, a) -> mmvq_dp8a_u4p_result { int idot[4]; float sw[4]; }`
+   — 4 UNCHAINED dp8a accumulators (one per sub-block; the algebra needs them
+   separate, no per-32 chaining) + SW_k = nib_sum_word(raw_k) - 64 (signed before
+   the float cast — the 3b root-cause class).
+3. mul_mat_vec_repacked_nc_impl: new template param `U4P8 = false`, independent
+   of U4ACT (both selectable; static_asserts: U4P8 => WT==Q4_0, !HAS_FUSION,
+   !(U4ACT && U4P8) — the two activation layouts cannot mix). U4P8 branch in the
+   sb loop: load_w_raw (weights stay in the SAME 32-value-block repack layout —
+   one uint4 carries sub-blocks k=0..3), activations read as
+   const block_q8_1_u4p* (32 B blocks; the 32 B stride keeps every block 16 B
+   aligned so qs loads as a full uint4 — no 4xu32 workaround like the 20 B u4).
+   FORM 1 epilogue per sub-block, summed:
+   acc += d * ( d4_k * (idot_k + 8*SW_k) + m_k * SW_k ).
+   The fp16-stored m-fold variant is NOT exact (M1 seal: 29/1504 fail) — do not
+   substitute. Dead rows: zero the d slot via rp_slot_keep, as shipped.
+4. Wrapper threading: mul_mat_vec_repacked_nc gained U4P8 (default false =
+   byte-identical stock instantiation).
+
+### Verification
+
+- Force-instantiation save-temps check (clang++ ROCm 7.2.3, --offload-arch=gfx906,
+  -O3, exact build flags): `mul_mat_vec_repacked_nc<2,1,4,2,64,Q4_0,false,true>`
+  device asm: **32 v_dot8_i32_i4** = RPL(2) x NCOLS(4) x 4 sub-blocks — matches
+  the template geometry exactly (same count as the m2b per-32 check: the dot count
+  is per-32-value-block either way; per-8 only moves the epilogue granularity).
+  Zero v_dot4_i32_i8 in the u4p branch. NumVgprs 64,
+  vgpr_spill_count 27 (vs 19 for the shipped per-32 U4ACT twin at the same
+  geometry — the 4-accumulator/4-scale epilogue pressure flagged in design §8;
+  the nc kernel has no launch_bounds occupancy target, so spills add scratch
+  traffic only, no occupancy cliff. A sw-hoist experiment measured 28 spills
+  (worse) and was reverted; M3 gauntlet measures the real cost). Dummy removed
+  after the check (box clean).
+- Build both gate states clean: `flock /root/gpu.lock -c "cmake --build
+  /root/build-w4a4 -j24 --target llama-bench llama-cli llama-perplexity"` —
+  exit 0. Warnings: the 5 pre-existing mmq_gemm_repacked occupancy warnings
+  (U4ACT=false variants, present since before G1) unchanged; zero new warnings
+  from the M2 code. U4P8=false is exercised by the full build; U4P8=true by the
+  force-instantiation check. No dispatch selects U4P8=true yet.
+
+### M3 dispatch note (NOT in M2)
+
+At the mul-mat.cu nc call sites under the w4a4_dot8 gate, value 2 selects u4p:
+- Quantizer: quantize the activation pool with the u4p host/device quantizer
+  (per-8 d4/m; M1 reference: w4a4_study/u4p_host.h quantize_row_q8_1_u4p)
+  into ggml_cuda_pool_alloc<block_q8_1_u4p>.
+- Pool type + strides: xs stays "blocks per token column" (ne0/32) — the kernel
+  indexes (block_q8_1_u4p*)xq + c*xs + sb; only the element size changes
+  (32 B vs 20 B per-32 u4). Pool byte size = ne1 * (ne0/32) * 32.
+- Template arg: pass U4P8=true (U4ACT=false) at the mul_mat_vec_repacked_nc
+  launch sites (dense nc path; id1/MoE wrappers unchanged — reject stands).
+- Gate-off (=0) and per-32 (=1) dispatch stay byte-identical to shipped.

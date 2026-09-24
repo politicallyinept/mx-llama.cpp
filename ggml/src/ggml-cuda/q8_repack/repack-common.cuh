@@ -196,6 +196,21 @@ struct block_q8_1_u4 {
 };
 static_assert(sizeof(block_q8_1_u4) == 20, "block_q8_1_u4 must be 20 bytes");
 
+// C1/B8 milestone M1 port: per-8 asymmetric uint4 activation block (scheme B8,
+// docs/design-w4a4-per8.md §3, sealed in docs/w4a4-per8-m1.md). 32 bytes /
+// 32 values, uint4-alignable (2x16B) — simpler LDS/stride staging than the 20 B
+// per-32 u4 above.
+// Layout: uint4 word k (k=0..3) = values 8k..8k+7 (one per-8 sub-block per word).
+// Byte j of word k (little-endian) = { val 8k+2j (LOW nibble), val 8k+2j+1 (HIGH) }.
+// Nibbles are SIGNED two's-complement: a = (q - 8) & 0xF, matching the shipped
+// dp8a convention (block_q8_1_u4 stores the same signed nibble form).
+struct block_q8_1_u4p {
+    uint8_t   qs[16];  // 32 signed nibbles, 8 per word, word k = sub-block k
+    ggml_half d4[4];   // per-sub-block scale: (max_k - min_k) / 15
+    ggml_half m[4];    // per-sub-block min (q=0 maps to m; a_signed = -8)
+};
+static_assert(sizeof(block_q8_1_u4p) == 32, "block_q8_1_u4p must be 32 bytes");
+
 // Host reference quantizer (fp32 -> block_q8_1_u4), defined in repack-common.cu.
 // NOT wired into any dispatch yet - milestone 2 hooks it into the repacked paths.
 void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
