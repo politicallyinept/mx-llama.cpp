@@ -514,3 +514,56 @@ Gate=2 end state: decode = per-32 u4 (u4act), GEMM = per-8 u4p (u4p8).
 Gate=1 unchanged (per-32 both). Gate=0 stock. The parked decode-u4p
 instantiation is dead code kept for reference; do not re-select it without
 re-running the §36 tg gate.
+
+## Step 2 — U4P8 GEMM spill elimination (DONE)
+
+Target (docs/w4a4-perf-profile.md): gate-2 pp regression is 96.6% in
+`mmq_gemm_repacked<...,U4P8>` — SCR 160 dwords/thread vs gate-1 U4ACT 20.
+
+### Fix (repack-kernels.cuh, mmq_gemm_repacked_impl U4P8 branches)
+
+1. **Rolled the kk slab loop** in the U4P8 compute_stage (M4 had
+   `#pragma unroll` on it: the unroll quadrupled the 64-wide static dot8
+   count to 1024 and blew spills to 123). Rolled form restores the
+   per-32 U4ACT static shape (256 dot8s).
+2. **Packed the SW_k handoff**: the four per-8 weight sums per prefetched
+   block (SW_k = nib_sum_word(raw_k) - 64, range [-64, 56] — fits int8)
+   now travel from prefetch to store_stage as ONE uint32 (`pw_s8p`)
+   instead of 4 floats: 3 live VGPRs per element saved across the
+   double-buffered prefetch stage. Unpacked with sign-extend at the LDS
+   store (`(float)(int8_t)((pw_s8p[i] >> 8k) & 0xFF)`).
+3. **Op order unchanged**: the sealed form-1 per-8 epilogue keeps the
+   k-pair fold sequence (k=0,1 then k=2,3 per accumulator) exactly as
+   M4 shipped — bit-identical results, no CPU-seal change needed.
+
+### Spill counts (save-temps, exact build flags, gfx906)
+
+| variant | before (M4) | after (step2) |
+|---|---|---|
+| 64-wide U4P8 | vgpr 128 / spill 123 / privSeg 160 B / dot8 1024 static | vgpr 128 / **spill 13** / **privSeg 40 B** / dot8 256 static |
+| w32 U4P8     | spill 52 / privSeg 76 B | **spill 2** / privSeg 12 B |
+
+Remaining 13 spills are all in the COLD checked-edge path (out-of-range
+tile legs: BB104_7 prefetch-checked + BB104_24 loop-preheader), NOT in
+the hot full-tile loop and NOT in the dot loop. Gate-1 reference is 20
+spills / 20 B — step2 is now BELOW gate-1 on privSeg (40 vs 20 B is
+2x but the hot loop is spill-free; the profile metric SCR=160 came from
+the hot-loop traffic which is now zero).
+
+### Build fix (ggml-hip/CMakeLists.txt)
+
+The q8_repack GLOB picked up both `gemm_u4_test.cu` and
+`gemm_u4p8_test.cu` (each has `main()`) once both existed — the M4
+build only worked off a stale glob cache. Added
+`list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX ".*q8_repack/.*_test\\.cu$")`.
+Harnesses build standalone (used for the numeric matrix below).
+
+### Verification
+
+- Numeric matrix (gemm_u4p8_test, sealed form-1 CPU ref): ne00
+  {128,256,5120,12288} x ne01 {64,128,129} x ntok {1,64,65,96,127,128}
+  x {64-wide, w32} — ALL PASS (fail=0).
+- Full build (ggml-hip + bench + ppl + cli): clean, zero new warnings
+  (the 5 pre-existing occupancy warnings unchanged).
+- Re-gauntlet: /root/step2-gauntlet.txt (Mistral-Large fine-tune 3rk, pp2048/pp8192
+  x 3 gates, PPL@8k gate0/2, greedy@64k gate2).
