@@ -759,6 +759,9 @@ static __device__ void mmq_gemm_repacked_impl(
     // nib_sum_word(raw_k) - 64, signed before the float cast — the 3b
     // root-cause class). Filled by the U4P8 prefetch branches; unused otherwise.
     [[maybe_unused]] float pw_s8[W_EPT][4];
+    // STEP2 v3: packed form of pw_s8 — four SW_k (each in [-64,64], fits int8)
+    // in one uint32 so the prefetch->store handoff carries 1 VGPR instead of 4.
+    [[maybe_unused]] uint32_t pw_s8p[W_EPT];
     rp_x_sub px   [X_EPT];
     [[maybe_unused]] float px_s[X_EPT];
     if constexpr (HAS_IDS) {
@@ -816,9 +819,10 @@ static __device__ void mmq_gemm_repacked_impl(
                     pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                          raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                     const uint32_t rw[4] = { raw.x, raw.y, raw.z, raw.w };
+                    pw_s8p[i] = 0u;
 #pragma unroll
                     for (int k = 0; k < 4; ++k) {
-                        pw_s8[i][k] = (float) ((int) nib_sum_word(rw[k]) - 64);
+                        pw_s8p[i] |= (uint32_t) (((int) nib_sum_word(rw[k]) - 64) & 0xFF) << (8 * k);
                     }
                 } else if constexpr (RAW_REG) {
                     rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
@@ -836,8 +840,7 @@ static __device__ void mmq_gemm_repacked_impl(
                     pw_s[i] = 0.0f;
                 }
                 if constexpr (U4P8) {
-#pragma unroll
-                    for (int k = 0; k < 4; ++k) pw_s8[i][k] = 0.0f;
+                    pw_s8p[i] = 0u;
                 }
             }
         }
@@ -976,9 +979,10 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                      raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                 const uint32_t rw[4] = { raw.x, raw.y, raw.z, raw.w };
+                pw_s8p[i] = 0u;
 #pragma unroll
                 for (int k = 0; k < 4; ++k) {
-                    pw_s8[i][k] = (float) ((int) nib_sum_word(rw[k]) - 64);
+                    pw_s8p[i] |= (uint32_t) (((int) nib_sum_word(rw[k]) - 64) & 0xFF) << (8 * k);
                 }
             } else if constexpr (RAW_REG) {
                 rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
@@ -1072,7 +1076,9 @@ static __device__ void mmq_gemm_repacked_impl(
                 sW_lo[lr][lk] = pw_lo[i];
                 sWdh [lk][lr] = pw_d[i];
 #pragma unroll
-                for (int k = 0; k < 4; ++k) sWs8[lk][lr][k] = pw_s8[i][k];
+                for (int k = 0; k < 4; ++k) {
+                    sWs8[lk][lr][k] = (float) (int8_t) ((pw_s8p[i] >> (8 * k)) & 0xFF);
+                }
             } else if constexpr (RAW_REG) {
                 uint4 lo, hi;
                 rp_traits<WT>::expand_raw(pw_lo[i], lo, hi);
@@ -1193,7 +1199,6 @@ static __device__ void mmq_gemm_repacked_impl(
             // form emitted 32 static x 4 dynamic; same dynamic total, the
             // unroll restores the per-32 static shape the brief asks to
             // verify — spill-checked, see kernel-notes M4).
-#pragma unroll
             for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
                 const int row_base = ty * NROW;
                 uint4 w = sW_lo[row_base][kk];
