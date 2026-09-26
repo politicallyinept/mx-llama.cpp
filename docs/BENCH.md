@@ -825,3 +825,62 @@ C1 REFRAME: per-8 recovery, if wanted, belongs in M4 = GEMM u4p (prefill side),
 where the depth-PPL cost is actually created. Decode stays per-32 (its +3.6% tg
 and PPL-neutrality at 2k stand). Greedy@64k gate-2: output-file capture truncated
 (empty after 'Assistant:') - noted, not re-run given the perf verdict.
+
+## 37. C1/B8 milestone M4 complete: GEMM per-8 quality recovery CONFIRMED, perf cost REAL (2026-09-25)
+
+Fix commit 2e8499bb6 (GEMM u4p + best-of gate=2: decode per-32, GEMM per-8).
+Post-PSU completion run (2 crashes interrupted earlier attempts):
+
+| Model / leg | gate-0 stock | gate-1 per-32 | gate-2 per-8 GEMM |
+|---|---:|---:|---:|
+| Mistral-Large fine-tune PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.0943 (+0.019) - 75% recovery |
+| Qwen PPL@8k | 4.9847 | 5.7148 (+0.730) | 5.1380 (+0.153) - 79% recovery |
+| Ornith PPL@8k | 1.9525 | 2.2612 (+0.309) | 2.0157 (+0.063) - 80% recovery |
+| Mistral-Large fine-tune pp2048 | 154.79 | 205.96 (+33%) | 98.11 (-37%!!) |
+| Mistral-Large fine-tune pp8192 | 144.16 | 185.19 (+29%) | 93.09 (-35%) |
+| Qwen pp2048 | 530.07 | 629.54 (+19%) | 389.36 (-27%) |
+| Qwen tg@8k | 52.59 | 52.59 | 52.42 (flat, decode=per-32 as designed) |
+| Mistral-Large fine-tune tg@8k | 20.47 | 20.48 | 20.85 (identical class) |
+| Mistral-Large fine-tune greedy@64k gate2 | - | - | primes EXACT 2..29 + tides |
+
+KEY: 1) QUALITY THESIS CONFIRMED - per-8 recovers 75-80% of depth-PPL on ALL models.
+2) PERF: per-8 GEMM as implemented REGRESSES prefill hard (-27..-37% vs stock) -
+epilogue/LDS overhead costs more than dp8a saves on GEMM tile shapes.
+DEPLOY SHAPE: gate=1 for RP models at RP contexts; gate=2 = long-context-quality
+mode if Qwen/Ornith entries need it; stock for everything else; MoE decode stock.
+
+## 38. W4A4 step 2 (spill fix): hot-loop spills ELIMINATED, pp recovery partial (2026-09-25)
+
+Profile-guided fix (60c627733): U4P8 GEMM scale handling restructured -
+spills 160 -> 13 dwords (hot loop ZERO; remaining 13 cold checked-edge only),
+w32 52 -> 2. Root cause of M4 blowup: forced #pragma unroll on kk slab loop
+quadrupled static dot8s (1024) causing the spill storm; rolled form restores
+256. Plus SW packing: 4 per-8 SW_k fit int8 (-64..+56), packed 1 uint32,
+cuts 3 VGPRs. Re-gauntlet: pp2048 116.58 (was 98.4, +19% recovered), pp8192
+109.26, PPL@8k 1.0943 (+0.019 preserved EXACTLY), greedy@64k primes EXACT.
+Remaining -26% vs stock is STRUCTURAL: 4 unchained accumulators + 8 LDS scale
+reads per block = epilogue-FMA-bound, inherent to per-8. C1 closes: per-8
+GEMM = documented quality-mode trade, not deployable universal mode.
+NOTE: step2 commits 60c627733/2570c9a5a were on-box only; pushed separately.
+
+## 39. MTP x W4A4 on Qwen3.6 Native-MTP: lossless FAIL, root cause IDENTIFIED (2026-09-25)
+
+Model: Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q8_0 (29GB), 3rk.
+This was the documented-good MTP head (+16% pre-W4A4-era). Result: REJECT.
+
+| Arm | tg128 median | acceptance | lossless |
+|---|---:|---|---|
+| baseline | 45.64 | - | - |
+| strict MTP n6 | 49.07 (+7.5%) | 0.73-0.78 greedy | FAIL |
+| MTP+W4A4 gate1 | 43.89 (variance) | - | arm INVALID (Q8_0 target, gate needs Q4_0) |
+
+Lossless: greedy MTP output differs from no-MTP control (determinism control
+passed: no-MTP byte-identical x3; divergence MTP-induced in reasoning stream).
+ROOT CAUSE (same on BOTH MTP models): server logs "spec common_specu: backend
+offload failed for seq_id=0..3; using CPU sampler" x4 per MTP leg, 0 on
+baseline - draft sampler falls back to CPU under -sm tensor, verify is not
+strict-greedy-equivalent in this build. FORK BUG, not model-specific.
+Per-position acceptance n6: 0.75/0.53/0.30/0.21/0.18/0.15 - head drafts well,
+infrastructure breaks it. W4A4xMTP stacking test needs Q4_0 native-MTP model.
+CLOSED: fork-bug-blocked (draft sampler offload under tensor). Revisit if
+upstream fixes offload path.
