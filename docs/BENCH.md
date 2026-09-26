@@ -884,3 +884,22 @@ Per-position acceptance n6: 0.75/0.53/0.30/0.21/0.18/0.15 - head drafts well,
 infrastructure breaks it. W4A4xMTP stacking test needs Q4_0 native-MTP model.
 CLOSED: fork-bug-blocked (draft sampler offload under tensor). Revisit if
 upstream fixes offload path.
+
+## 40. W4A4 DEPLOYED to production: Mistral-Large fine-tune + Mistral-Large fine-tune (2026-09-26)
+
+Deploy sequence:
+1. build-rccl rebuilt on perf/w4a4-dot8-gfx906 (includes upstream merge + full W4A4
+   family + MTP guard). Verified: 231.6 pp2048 / 21.13 tg64 gate=1 pre-deploy.
+2. Per-entry env (llama-swap env: list format) added to Mistral-Large-123B fine-tune-v2 and
+   TheDrummer-Mistral-Large-123B fine-tune-v3: GGML_CUDA_W4A4_DOT8=1 (REPACK inherited from
+   start.sh global env but also set per-entry for belt-and-suspenders).
+3. Config format lesson: llama-swap env field is a LIST of KEY=VALUE strings,
+   not a map (map form: "cannot unmarshal !!map into []string" crash). Inline
+   env tokens in cmd: FAIL (llama-server sees "env" as unknown arg). The list
+   field is the correct mechanism.
+4. Live verified: server process /proc/PID/environ carries both vars; chat
+   completion primes exact (2..29) + coherent tides at 82 tok.
+
+All other entries (Qwen Q4_0, Q8_0, Ornith, MoE) remain stock — flag off.
+Rollback: config backup bak-w4a4deploy-20260926; binary revert = rebuild from
+pre-merge commit on build-rccl.
