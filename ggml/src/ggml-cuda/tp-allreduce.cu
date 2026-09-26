@@ -1085,4 +1085,34 @@ bool tp_custom_ar_allreduce(CustomARContext * ctx,
     return true;
 }
 
+bool tp_custom_ar_mtp_safe_transition(CustomARContext * ctx, int64_t n_elements) {
+    static const int s_mtp_safe = []{
+        const char * e = getenv("GGML_TP_AR_MTP_SAFE");
+        if (!e || !e[0] || e[0] == '0') return 0;
+        return (e[0] == '2') ? 2 : 1;
+    }();
+    if (!s_mtp_safe) return false;
+    if (ctx->mtp_safe_locked) return true;   // once a width change is seen, custom is off for good
+    const int64_t prev = ctx->last_ne;
+    ctx->last_ne = n_elements;
+    if (prev < 0 || prev == n_elements) return false;
+
+    // Width transition detected: speculative decoding alternates batch
+    // widths (draft batch vs verify batch). The custom kernels' staging
+    // layout, parity double-buffering and shared per-block signal counters
+    // are only proven safe for a single steady width per context;
+    // alternating widths across asynchronously-replayed captured graphs
+    // corrupt the reduction (violation repro 2026-09-25). Permanently
+    // route this context through the regular AllReduce path. We
+    // deliberately do NOT free the staging: graphs captured earlier still
+    // reference it, and as the sole remaining custom user (constant width)
+    // it stays safe.
+    ctx->mtp_safe_locked = true;
+    if (s_mtp_safe >= 2) {
+        fprintf(stderr, "TP custom AR [MTP_SAFE]: width transition %lld -> %lld; custom AR locked off for this context\n",
+                (long long) prev, (long long) n_elements);
+    }
+    return true;
+}
+
 } // namespace ggml_cuda_tp
