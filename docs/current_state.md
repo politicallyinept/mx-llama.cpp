@@ -4,12 +4,20 @@
 **Rig:** 3x MI50 (gfx906), PLX 88096 P2P, 175W/card power cap (upp, host-persistent), TheRock nightly 7.15.0a runtime
 **Authoritative data:** BENCH.md sections 30-39 on Gitea. All pre-175W numbers (§30-34 absolute values) are superseded; §35+ is the live baseline.
 
+## 0. STATUS UPDATE (2026-09-26 evening)
+
+- **D1 DEPLOYED**: prod binary rebuilt 12:04 from aa6b4c5cb (build-rccl), llama-swap restarted 13:03. W4A4 gate=1 is env-toggled per-model: GGML_CUDA_W4A4_DOT8=1 on Mistral-Large-123B fine-tune-v2 + TheDrummer-Mistral-Large-123B fine-tune-v3 entries ONLY (flag is getenv-gated, default off). Verified: gate symbols in shipped libggml-hip.so; llama-swap journal shows env delivered at model load. Branch: perf/w4a4-dot8-gfx906 merged into gfx906-w4a4 (2a8de9d9d) - prod branch now matches prod binary. Live-generation smoke test on the two models still pending (GPU wedge intervened).
+- **D2 DECLINED** (user call): not for RP use. Correction on record: gate=2 was +0.5% tg with dPPL +0.019@8k (better than gate=1); declined on the -37% prefill cost.
+- **D3 DEFERRED** (user call): upstreaming deferred until open paths are explored.
+- **D4 SOLVED**: second PSU installed 2026-09-26, no rail-brownout events since. NEW INCIDENT same day ~16:00: all-3-card SMC/powerplay wedge on an IDLE box (dmesg: message 0x2a/0x2b response 0xfc failures on every card, /dev/kfd open EINVAL, rocm-smi cannot initialize, reset attempts hung D-state). Recovery: host reboot (manual, user). Signature differs from the rail-brownout events (idle-time wedge, no load in flight, no log-stop-during-generation). Root cause unknown - watch for recurrence.
+- **DFlash retest v2**: 4/6 runs completed with real numbers (base x2 + dflash x2 on build-w4a4 @ aa6b4c5cb); greedy lossless gate FAILED to run - script bug: run() wrapper appends -p/-n/--temp that collide with the greedy runs' own flags. Numbers extraction + greedy-gate rerun pending post-reboot.
+
 ---
 
 ## 1. PRODUCTION STATE (what is running right now)
 
 - llama-swap: 26+ entries, serving from `/root/mx-Mistral-Large fine-tune/build-rccl/bin/llama-server` (RCCL-linked, hybrid AR gate ON)
-- Binary: built Sep 21 (pre-W4A4). **The W4A4 work is NOT in production.**
+- Binary: rebuilt 2026-09-26 12:04 from aa6b4c5cb (dense W4A4 code included, default-off). W4A4 active ONLY where the per-model env toggle is set (Mistral-Large fine-tune, Mistral-Large fine-tune).
 - Stack: nightly-first LD_LIBRARY_PATH, 175W/card, perf high, hybrid AR gate (prefill->RCCL, decode->custom AR, threshold ne<131072 @3rk confirmed optimal in Phase 1 sweep)
 - Per-model: `GGML_CUDA_REPACK_Q4_0=1` global; `GGML_TP_AR_NO_GATE=1` removed (Ornith now uses the Huihui imatrix Q4_0 quant, +28.6% vs old Q4_K_M)
 
@@ -40,7 +48,7 @@ Root cause (verified in source): `llama_context::set_sampler` (src/llama-context
 
 ### 2d. Other closed programs
 - Upstream sync: 32 commits merged, no regression (verified by interleaved same-day A/B — the apparent -4% was day drift)
-- Speculative: native MTP > DFlash (both blocked by the same fork bug); DFlash retest pending on the current binary (driver script `/root/dflash-retest.sh` was interrupted by the crash; needs re-launch)
+- Speculative: native MTP > DFlash (both blocked by the same fork bug). DFlash retest v2 ran 2026-09-26 on the current binary (build-w4a4 @ aa6b4c5cb): base x2 + dflash x2 valid, greedy gate blocked by script bug (run() flag collision); greedy rerun + numbers extraction pending
 - Perf pin: WASH (auto already ramps to those clocks)
 - Gate threshold: 131072 confirmed optimal-enough
 - Spec decode: native MTP > DFlash
@@ -77,7 +85,7 @@ Root cause (verified in source): `llama_context::set_sampler` (src/llama-context
 
 ## 6. INFRASTRUCTURE NOTES
 
-- 3 build trees on mi50: `/root/mx-Mistral-Large fine-tune/build` (perf/mxfp4-quant, W4A4 dev), `/root/mx-Mistral-Large fine-tune/build-rccl` (PRODUCTION, pre-W4A4), `/root/build-w4a4` (W4A4 testing)
+- 3 build trees on mi50: `/root/mx-Mistral-Large fine-tune/build` (perf/mxfp4-quant, W4A4 dev), `/root/mx-Mistral-Large fine-tune/build-rccl` (PRODUCTION, aa6b4c5cb since 2026-09-26 12:04), `/root/build-w4a4` (W4A4 testing)
 - Standalone reference build: `/root/mx-premerge` (pre-upstream-merge, for day-drift control)
 - All raw data: `/root/*-gauntlet*.txt`, `/root/m4-gauntlet-logs/`, `/root/ppl-logs/`, `/root/w4a4-profile*`
 - Local workspace: `/home/brad/workspace/mx-Mistral-Large fine-tune/` (docs, BENCH.md, design docs)
