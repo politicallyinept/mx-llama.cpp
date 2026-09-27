@@ -863,7 +863,7 @@ reads per block = epilogue-FMA-bound, inherent to per-8. C1 closes: per-8
 GEMM = documented quality-mode trade, not deployable universal mode.
 NOTE: step2 commits 60c627733/2570c9a5a were on-box only; pushed separately.
 
-## 40. C1 follow-up: H-form per-8 epilogue rework - REJECT; per-8 frontier now fully mapped (2026-09-27)
+## 42. C1 follow-up: H-form per-8 epilogue rework - REJECT; per-8 frontier now fully mapped (2026-09-27)
 
 Branch `perf/w4a4-epilogue-h` (results: docs/w4a4-epilogue-h-results.md on that branch). Hypothesis:
 the affine u4p epilogue cost (4 FMA m-term + sWs8 LDS array + SW unpack) could
