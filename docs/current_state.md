@@ -6,7 +6,16 @@
 
 ## 0. STATUS UPDATE (2026-09-26 evening)
 
-- **D1 DEPLOYED**: prod binary rebuilt 12:04 from aa6b4c5cb (build-rccl), llama-swap restarted 13:03. W4A4 gate=1 is env-toggled per-model: GGML_CUDA_W4A4_DOT8=1 on Mistral-Large-123B fine-tune-v2 + TheDrummer-Mistral-Large-123B fine-tune-v3 entries ONLY (flag is getenv-gated, default off). Verified: gate symbols in shipped libggml-hip.so; llama-swap journal shows env delivered at model load. Branch: perf/w4a4-dot8-gfx906 merged into gfx906-w4a4 (2a8de9d9d) - prod branch now matches prod binary. Live-generation smoke test verified post-reboot 17:29: Mistral-Large fine-tune via llama-swap returned the exact greedy response with gate=1 env active. Mistral-Large fine-tune not individually exercised (same binary, same env mechanism).
+- **UPSTREAM MERGE DEPLOYED (2026-09-26 ~23:10)**: ggml-org master (2b129ccfa, 445 commits) merged into gfx906-w4a4; prod branch = e4f26e4cb. All 14 conflict files hand-resolved (plan: docs/upstream-merge-plan-20260926.md), invariants gate green, 3 build-fix rounds (bf16 dedupe in common.cuh, qwen35 Kcur/Vcur + deepseek41 accessor, dflash pos_pinned). VALIDATION: 7-model same-harness A/B all within +-0.9% (table below); primes@32k gate=1 EXACT; coherence + DFlash draft smokes OK. Cutover: build-rccl/bin swapped in place (libggml 0.22->0.25.3), rollback = bin-premerge-aa6b4c5cb/ rename. Live llama-swap smoke: "merge cutover ok".
+
+### Merge A/B matrix (llama-bench -r 3, same session, prod vs merge)
+| Model | tg128 | pp2048 |
+|---|---|---|
+| Cydonia Q8_0 | 26.59 -> 26.59 (+0.00%) | 774.4 -> 773.1 (-0.16%) |
+| Precog Q4_0 | 9.14 -> 9.07 (-0.77%) | 134.9 -> 135.3 (+0.25%) |
+| Mistral-Large fine-tune W4A4 g=1 | 21.25 -> 21.29 (+0.19%) | 238.7 -> 240.8 (+0.88%) |
+| Ornith MoE (gate off) | - | 2696 -> 2702 (+0.21%) |
+GCN MMQ table (#27841) = wash on gfx906 (bandwidth-bound at these batch sizes). NOTE: same-harness deltas are much smaller than vs BENCH.md §35 absolute values (ggml lib generation changed 0.22->0.25.3); §35 numbers remain the historical record. W4A4 gate=1 is env-toggled per-model: GGML_CUDA_W4A4_DOT8=1 on Mistral-Large-123B fine-tune-v2 + TheDrummer-Mistral-Large-123B fine-tune-v3 entries ONLY (flag is getenv-gated, default off). Verified: gate symbols in shipped libggml-hip.so; llama-swap journal shows env delivered at model load. Branch: perf/w4a4-dot8-gfx906 merged into gfx906-w4a4 (2a8de9d9d) - prod branch now matches prod binary. Live-generation smoke test verified post-reboot 17:29: Mistral-Large fine-tune via llama-swap returned the exact greedy response with gate=1 env active. Mistral-Large fine-tune not individually exercised (same binary, same env mechanism).
 - **D2 DECLINED** (user call): not for RP use. Correction on record: gate=2 was +0.5% tg with dPPL +0.019@8k (better than gate=1); declined on the -37% prefill cost.
 - **D3 DEFERRED** (user call): upstreaming deferred until open paths are explored.
 - **D4 SOLVED**: second PSU installed 2026-09-26, no rail-brownout events since. INCIDENT same day ~15:56: all-3-card SMC/powerplay wedge (message 0x2a/0x2b response 0xfc on every card, /dev/kfd open EINVAL, rocm-smi cannot initialize, reset attempts hung D-state). ROOT CAUSE IDENTIFIED: llama-cli kill -9 during model load (DFlash retest debug) - NOT spontaneous, NOT power-related. Recovery: host-side LXC reboot (mi50 is an LXC, /sys read-only from inside; PVE host action). Lesson: never kill -9 llama-cli mid-model-load on this stack. Watch only for a spontaneous (uninduced) recurrence.
