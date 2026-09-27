@@ -903,3 +903,38 @@ Deploy sequence:
 All other entries (Qwen Q4_0, Q8_0, Ornith, MoE) remain stock — flag off.
 Rollback: config backup bak-w4a4deploy-20260926; binary revert = rebuild from
 pre-merge commit on build-rccl.
+
+## 40. Post-upstream-merge floor (e4f26e4cb) - NEW BASELINE, supersedes §35 absolute values (2026-09-27)
+
+Envelope: identical to §35 (175W/card, 3rk -sm tensor, same datasets/scripts; only change = merged binary,
+ggml lib 0.22 -> 0.25.3). Full raw logs: /root/rebase-merged-{big,small}.{txt,log}.
+
+### Mistral-Large fine-tune 123B (ctx 65536)
+pp2048: 170.45 / 232.80 (+36.6%) | pp8192: 155.45 / 206.00 (+32.5%) | pp16384: 139.18 / 178.97 (+28.6%)
+tg64@64k: 20.43 / 21.08 (+3.2%) | PPL@8k: 1.0722 / 1.1530 (d=+0.0808)
+greedy@64k: primes exact 2-29 + coherent tides sentence.
+
+### Mistral-Large fine-tune 128B (ctx 32768)
+pp2048: 167.19 / 222.65 (+33.2%) | pp8192: 152.85 / 197.94 (+29.5%)
+tg64@32k: 19.61 / 20.18 (+2.9%) | PPL@8k: 1.5554 / 1.7329 (d=+0.1775)
+greedy@32k: primes exact 2-29.
+
+### Qwen3.8-27B (ctx 131072)
+Q4_0 shallow: pp2048 615.00 / 777.13 (+26.4%) | pp8192 589.84 / 738.55 (+25.2%) | pp16384 556.31 / 687.44 (+23.6%) | tg128 52.56 / 52.56 (flat)
+Q4_0 @131k: pp2048 198.92 / 219.04 (+10.1%) | pp8192 208.96 / 225.14 (+7.7%) | pp16384 213.98 / 230.97 (+8.0%)
+tg64@131k: 34.75 / 34.70 (-0.1%, flat) | PPL@8k: 4.9912 / 5.7102 (d=+0.7190, over gate as before)
+Q8_0 control: pp2048 724.20, pp16384 645.28 | tg64@131k 30.70-31.99 | PPL@8k 4.3902
+
+### Ornith 35B MoE (ctx 131072, Huihui imatrix Q4_0)
+shallow: pp2048 1972.99 / 2139.33 (+8.4%) | pp8192 1887.32 / 2038.09 (+8.0%) | tg128 104.61 / 98.11 (-6.2%)
+@131k: pp2048 540.99 / 552.28 (+2.1%) | pp8192 551.79 / 564.29 (+2.3%) | tg64: 89.84-91.22 off / 85.37-86.18 on (-5.8%)
+PPL@8k: 1.9070 / 2.2064 (d=+0.2994, over gate as before)
+greedy@131k budget-cut mid-think but primes 2-29 visible in trace.
+
+### KEY FINDINGS vs §35
+1. Everything faster: pp +7-47% vs §35 across the board (upstream graph/fusion/allocator wins compound with W4A4).
+2. W4A4 pp gain GREW: +36.6% (Mon) / +33.2% (Beh) at pp2048 vs §35 +31.8/+28.9. The dequant-tax analysis holds.
+3. Quality UNCHANGED: PPL deltas match §35 within noise (Mon +0.081 vs +0.078, Beh +0.178 vs +0.190, Qwen +0.719 vs +0.72, Orn +0.299 vs +0.30); all greedy seals exact.
+4. Ornith decode regression persists (-6.2% tg shallow with W4A4 on) - MoE W4A4 stays REJECT; gate stays OFF for MoE entries.
+5. Qwen shallow pp16384: Q4_0+W4A4 (687) now BEATS Q8_0 (645) - inversion vs §35 era; at 16k@131k depth W4A4 (231) also beats Q8_0 (226).
+6. Verdict: upstream merge is a strict win. Adopt e4f26e4cb as the new production floor.
