@@ -603,10 +603,12 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     gate = ggml_cont_2d(ctx0, gate, n_embd_head * n_head, n_tokens);
     cb(gate, "mtp_gate", il);
 
+    ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
     cb(Kcur, "mtp_Kcur_normed", il);
 
+    ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
