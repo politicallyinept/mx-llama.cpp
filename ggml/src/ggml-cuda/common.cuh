@@ -328,10 +328,8 @@ static bool fast_fp16_hardware_available(const int cc) {
 // there. Measured on gfx906/Vega20: a bf16 GEMM picks a 64x32x8 macro-tile and
 // runs 3.5x slower than the F32 path on the same weights.
 static bool fast_bf16_hardware_available(const int cc) {
-    if (GGML_CUDA_CC_IS_AMD(cc)) {
-        return GGML_CUDA_CC_IS_CDNA(cc) || cc >= GGML_CUDA_CC_RDNA3;
-    }
-    return true;
+        return (GGML_CUDA_CC_IS_AMD(cc) && (cc >= GGML_CUDA_CC_RDNA3 || GGML_CUDA_CC_IS_CDNA(cc)))
+            || (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
 }
 
 // To be used for feature selection of external libraries, e.g. cuBLAS.
@@ -339,12 +337,6 @@ static bool fp16_mma_hardware_available(const int cc) {
     return (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
-}
-
-// To be used for feature selection of external libraries, e.g. cuBLAS.
-static bool fast_bf16_hardware_available(const int cc) {
-        return (GGML_CUDA_CC_IS_AMD(cc) && (cc >= GGML_CUDA_CC_RDNA3 || GGML_CUDA_CC_IS_CDNA(cc)))
-            || (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE);
 }
 
 static bool bf16_mma_hardware_available(const int cc) {
