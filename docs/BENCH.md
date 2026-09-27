@@ -863,6 +863,47 @@ reads per block = epilogue-FMA-bound, inherent to per-8. C1 closes: per-8
 GEMM = documented quality-mode trade, not deployable universal mode.
 NOTE: step2 commits 60c627733/2570c9a5a were on-box only; pushed separately.
 
+## 40. C1 follow-up: H-form per-8 epilogue rework - REJECT; per-8 frontier now fully mapped (2026-09-27)
+
+Branch `perf/w4a4-epilogue-h` (results: docs/w4a4-epilogue-h-results.md on that branch). Hypothesis:
+the affine u4p epilogue cost (4 FMA m-term + sWs8 LDS array + SW unpack) could
+be deleted by re-parameterizing activations as hierarchical per-8 (one per-32
+center c32 + symmetric per-8 signed scales d4[k], dot = SUM d4*dp8a + c32*SW32).
+H1 CPU seal PASS 144/144 maxrel 2.5e-4 after fixing the host reference to the
+device's strided per-8 groups (grouping is pinned by the nibble word layout -
+same M3b lesson, third occurrence). H3 codegen PASS (256 static dot8, spills
+within step2 bounds).
+
+| Metric | gate0 stock | gate1 per-32 | gate2 H-form | affine per-8 ref |
+|---|---:|---:|---:|---:|
+| pp2048 | 157.43 | 208.30 (+32%) | 142.65 (-9.4%) | 116.58 (-26%) |
+| pp8192 | 145.02 | 186.42 | 132.19 (-8.8%) | 109.26 |
+| PPL@2k | 1.0564 | 1.0564 (0) | 1.0994 (+0.0430) | 1.0564 (0) |
+| PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.1359 (+0.0608) | 1.0943 (+0.019) |
+| Qwen PPL@8k | 4.9847 | 5.7148 (+0.730) | 5.5813 (+0.597) | 5.1380 (+0.153) |
+| tg128@8k | 20.45 | 21.20 | 21.22 (decode=per-32, flat) | 20.85 |
+| greedy@64k | - | - | FAIL: degenerate - only newlines after "Assistant:", deterministic across retry | primes EXACT |
+
+ADOPTION BAR vs RESULT: pp within 10% of stock = PASS (-9.4%); PPL recovery
+>= 60% of gate1 cost = FAIL (Mistral-Large fine-tune 26%, Qwen 18%); greedy@64k exact = FAIL.
+
+VERDICT: REJECT. H-form is dominated: slower than stock AND worse quality than
+stock (PPL +0.061@8k), and it pays a PPL cost already at 2k (+0.043) where
+affine is exact - the coarser level set (7-15 symmetric levels around a block
+center vs affine's 16 asymmetric levels per group) costs real quality, and at
+64k the model collapses into newline loops on the probe prompt. The epilogue
+thesis is VALIDATED (pp recovered -26% -> -9.4% by deleting the m-term/LDS
+machinery), but the quality price disqualifies it for the only role gate-2
+has (long-context quality mode).
+
+C1 CLOSE-OUT: the per-8 frontier is now mapped end to end -
+  stock (pp 100%, PPL base) -> H-form (pp 91%, PPL +0.061, depth-collapse)
+  -> affine per-8 (pp 74%, PPL +0.019, exact) -> per-32 u4 (pp +32%, PPL +0.082).
+Affine per-8 remains the quality corner and stays the shipped gate-2; per-32
+remains the speed mode (gate-1); H-form is parked as a documented frontier
+point. No further per-8 epilogue work is warranted; the remaining depth-PPL
+cost of gate-1 has no cheaper fix on this branch.
+
 ## 39. MTP x W4A4 on Qwen3.6 Native-MTP: lossless FAIL, root cause IDENTIFIED (2026-09-25)
 
 Model: Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q8_0 (29GB), 3rk.
