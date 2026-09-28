@@ -945,7 +945,7 @@ All other entries (Qwen Q4_0, Q8_0, Ornith, MoE) remain stock — flag off.
 Rollback: config backup bak-w4a4deploy-20260926; binary revert = rebuild from
 pre-merge commit on build-rccl.
 
-## 40. Post-upstream-merge floor (e4f26e4cb) - NEW BASELINE, supersedes §35 absolute values (2026-09-27)
+## 41. Post-upstream-merge floor (e4f26e4cb) - NEW BASELINE, supersedes §35 absolute values (2026-09-27)
 
 Envelope: identical to §35 (175W/card, 3rk -sm tensor, same datasets/scripts; only change = merged binary,
 ggml lib 0.22 -> 0.25.3). Full raw logs: /root/rebase-merged-{big,small}.{txt,log}.
