@@ -979,3 +979,28 @@ greedy@131k budget-cut mid-think but primes 2-29 visible in trace.
 4. Ornith decode regression persists (-6.2% tg shallow with W4A4 on) - MoE W4A4 stays REJECT; gate stays OFF for MoE entries.
 5. Qwen shallow pp16384: Q4_0+W4A4 (687) now BEATS Q8_0 (645) - inversion vs §35 era; at 16k@131k depth W4A4 (231) also beats Q8_0 (226).
 6. Verdict: upstream merge is a strict win. Adopt e4f26e4cb as the new production floor.
+
+## 42. RVN-Qwen3.8-Flash-Next (qwen4exp MoE): prod-stack A/B + W4A4 check (2026-09-29)
+
+Model: 0bserverx RVN-Qwen3.8-Flash-Next-Abliterated-Uncensored, Q4_0, 8 shards (94G).
+Architecture qwen4exp: 48 layers, 512 experts @ 10 active, PLE n-gram embedding table
+(per_layer_token_embd.weight, 27465 MiB) host-resident mmap, demand-paged (lazy read, no VRAM).
+Rig: 3x MI50, -sm tensor, -c 32768, 175W. Server bench via /completion, greedy temp=0.
+Prefill = two distinct ~11.3k-token prompts per config; decode = 256 tok @ 56-token prompt.
+Single server per config + 2 passes; prefill spread +/-8% (page-cache warmth), decode is the
+decision-grade number.
+
+| Config | prefill pass1/pass2 | decode run1/run2 |
+|---|---|---|
+| A: repack ON, custom AR OFF | 770 / 809 t/s | 51.5 / 52.1 t/s |
+| B: prod stack (repack + custom AR + skip-xbar) | 766 / 913 t/s | 56.7 / 57.3 t/s |
+| C: B + GGML_CUDA_W4A4_DOT8=1 | 817 / 975 t/s | 51.9 / 54.0 t/s |
+
+### FINDINGS
+1. Custom AR = +10% decode (52.1 -> 57.3 avg); prefill unchanged (twoshot targets decode-sized tensors, as in section 35-era data).
+2. MoE W4A4 REJECT reproduced on qwen4exp: decode -5.4% vs B (54.0 vs 57.3). Matches Ornith verdict (-5.3%, SUMW recompute per block, no amortization). Gate stays OFF for all MoE entries.
+3. NEW: W4A4 PREFILL is a WIN on MoE: +6.8% vs B (975 vs 913 avg pass2; pass1 also up: 817 vs 766). Multi-token batches amortize the per-8 epilogue where single-token decode cannot. A batch-size-gated W4A4 dispatch (W4A4 when ne>1, stock decode path when ne==1) is the candidate if a MoE prefill mode is ever wanted. Not implemented; decode rules RP workloads.
+4. PLE demand-paged table costs ~nothing warm: warm prefill 913-975 t/s at 11k tokens on a 27.5G table that never enters VRAM or RSS (server RSS ~4.3G).
+5. BUG: fully-stock config (GGML_CUDA_REPACK_Q4_0=0) HANGS at warmup on qwen4exp under -sm tensor 3-GPU. Two deterministic repros (10+ min after buffer alloc, no warmup progress, 0% GPU). Repack is functionally REQUIRED for this arch, not just faster. Root cause not investigated.
+
+Prod stack confirmed running on the Flash-Next server (repack Meta buffers + custom AR twoshot F32 3-rank); W4A4 gate OFF.
