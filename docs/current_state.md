@@ -1,4 +1,45 @@
-# MI50 W4A4/Speculative Program — Current State
+# MI50 W4A4/Speculative Program - Current State
+**Date:** 2026-09-29 evening - **Author:** Hermes (deploy + Flash-Next program session)
+**Repo:** mx-llama.cpp, branch `gfx906-w4a4` (production docs) + `perf/w4a4-dot8-gfx906` (all W4A4 work)
+**Rig:** 3x MI50 (gfx906), PLX 88096 P2P, 175W/card power cap, TheRock nightly 7.15.0a runtime
+**Authoritative data:** BENCH.md sections 30-43 on Gitea. Everything below the STATUS UPDATE header is
+the 2026-09-26 snapshot, kept for history; the update supersedes it.
+
+## STATUS UPDATE (2026-09-29)
+
+### Deployed since 09-26
+- **D1 DONE**: dense W4A4 gate=1 IS in production. Prod binary rebuilt 09-26 12:04 at aa6b4c5cb
+  (W4A4 code merged into gfx906-w4a4, commit 2a8de9d9d), llama-swap restarted onto it 13:03.
+  `GGML_CUDA_W4A4_DOT8=1` set per-entry (toggle) on Mistral-Large-123B fine-tune-v2 + TheDrummer-Mistral-Large-123B fine-tune-v3 only.
+- **D2 DECLINED** by user: gate=2 quality mode not adopted (pp -37% not worth it for RP use).
+- **D4 SOLVED**: second PSU installed; no power events since. 175W cap retained as belt-and-braces.
+- **D3 PENDING**: upstream PR trio (nranks-3 twoshot, Q4_0 repack entry, dense-MXFP4 quantize mode) - user wants open paths explored first.
+
+### New program: RVN-Qwen3.8-Flash-Next (qwen4exp MoE) - see BENCH section 42-43
+- Model deployed in llama-swap (RVN-Flash-Next-MTP): target Q4_0 + MTP Q8_0 draft, -b/-ub 4096,
+  GGML_TP_AR_MTP_SAFE=1 + LLAMA_PLE_PREFAULT=1. PLE n-gram table (27.5G) demand-paged from disk, zero VRAM.
+- Prod stack verified active on it: Q4_0 repack + custom AR twoshot (+10% decode vs AR-off).
+- MoE W4A4 REJECT reproduced (decode -5.4%); W4A4 PREFILL is a +7-25% win on this arch -> gate mode 3
+  implemented (batch-gated dispatch, commit 3b1079b84 on perf/w4a4-dot8-gfx906): W4A4 for multi-token
+  GEMMs, stock path for decode. Decode fully protected (-0.1%). Not enabled on any entry yet (MoE pp
+  gain dilutes to +2.5%; natural fit is dense entries).
+- MTP draft: +14.7% tg avg (above the +10% bar), SAFE guard ~free here; NOT lossless (same set_sampler
+  fork bug as 2c below) - deployed as-is per user call, same regime as other MTP entries.
+- Levers landed: LLAMA_PLE_PREFAULT=1 (+23% cold prefill, kills TTL-reload first-request penalty),
+  -ub 4096 (+6-9% warm prefill).
+
+### Open bugs under investigation (2026-09-29, source analysis in flight)
+1. qwen4exp warmup HANG with GGML_CUDA_REPACK_Q4_0=0 under -sm tensor (section 42 finding 5) - deterministic; repack currently functionally required for this arch.
+2. set_sampler MTP fork bug (below, 2c) unchanged - fix design being drafted; upstream status being checked.
+
+### Still open (unchanged from 09-26)
+- DFlash2 retest incomplete (script fixed, greedy leg pending; low priority - MTP won the scheme shootout).
+- /tmp/u4_quant_check.hip multi-channel harness re-run (likely superseded by mode-3 seals, confirm and close).
+- MXFP4 imatrix-aware quantizer (quantize_row_mxfp4_ref ignores imatrix) - biggest untried perf lever.
+
+---
+
+## ARCHIVE: 2026-09-26 snapshot
 **Date:** 2026-09-26 · **Author:** Hermes (session audit + full program state)
 **Repo:** mx-llama.cpp, branch `gfx906-w4a4` (production docs) + `perf/w4a4-dot8-gfx906` (all W4A4 work)
 **Rig:** 3x MI50 (gfx906), PLX 88096 P2P, 175W/card power cap (upp, host-persistent), TheRock nightly 7.15.0a runtime
