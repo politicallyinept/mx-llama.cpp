@@ -1004,3 +1004,51 @@ decision-grade number.
 5. BUG: fully-stock config (GGML_CUDA_REPACK_Q4_0=0) HANGS at warmup on qwen4exp under -sm tensor 3-GPU. Two deterministic repros (10+ min after buffer alloc, no warmup progress, 0% GPU). Repack is functionally REQUIRED for this arch, not just faster. Root cause not investigated.
 
 Prod stack confirmed running on the Flash-Next server (repack Meta buffers + custom AR twoshot F32 3-rank); W4A4 gate OFF.
+
+## 43. RVN Flash-Next: prefault + ub4096, W4A4 gate-mode-3, MTP draft (2026-09-29)
+
+Server-bench followups on the qwen4exp MoE (same rig/flags as section 42 unless noted).
+
+### 43a. LLAMA_PLE_PREFAULT=1 + -ub 4096 (config D vs section 42 config B)
+Prefault touches the full 27465 MiB lazy PLE table at load: 43.7 s, 8 threads, zero VRAM (page cache only).
+| metric | B (base) | D (prefault + ub4096) | delta |
+|---|---|---|---|
+| prefill pass1 (cold table) | 766 t/s | 941 t/s | +23% |
+| prefill warm passes | 913 t/s | 993-997 t/s | +6-9% |
+| decode | 57.3 t/s | 57.4 t/s | - |
+
+Cold-start penalty fully eliminated: pass1 no longer lags pass2. Prefault is recommended for
+any llama-swap entry serving a qwen4exp/PLE model (fixes first-request slowness after TTL reload).
+
+### 43b. W4A4 gate mode 3: batch-gated dispatch (commit 3b1079b84, branch perf/w4a4-dot8-gfx906)
+Design: u4act = mode==3 && activations_rows > 1 (mul-mat.cu: src1->ne[1]; mul-mat-id.cu: ids->ne[1]).
+W4A4 kernel for multi-token GEMMs (prefill/batch), stock repack path for single-token decode.
+Modes 1/2 byte-identical to prior behavior.
+Seals: first-token identity off==m1==g3 PASS (mechanism verified); greedy primes exact in trace PASS;
+byte-identity vs off diverges as expected for any W4A4 prefill (same standard as modes 1/2).
+| config | pp (3-run mean, 6k-byte prompt) | tg (3-run mean) |
+|---|---|---|
+| off | 192.4 t/s | 47.57 t/s |
+| mode 3 | 197.3 t/s | 47.53 t/s |
+| delta | +2.5% | -0.1% (neutral) |
+Decode fully protected (no SUMW tax, vs -5.4% always-on on MoE, section 42). pp gain diluted vs the
++7% server-bench observation: expert GEMMs run w32 tiles with per-expert column counts, so the dense
+W4A4 prefill win shrinks on MoE-dominant workloads. Large-prompt diag (~7.1k tok): g3 429.8 = m1 423.8
+> off 401.0 t/s (full prefill engagement confirmed). Mode 3 = correct default for dense entries that
+want W4A4 prefill without decode exposure; on MoE entries it is safe but low-value.
+
+### 43c. MTP draft (drluoto Qwen3.8-Flash-Next-MTP-GGUF, Q8_0 4.1G draft, llama-cli 3rk)
+| config | tg @ temp 0.1 | greedy tg |
+|---|---|---|
+| base | 47.3 / 49.3 t/s | 51.5 t/s |
+| MTP | 57.3 / 53.4 t/s | 64.1 t/s |
+| MTP + MTP_SAFE | - | 63.6 t/s |
+MTP = +14.7% avg tg (ABOVE the +10% bar, unlike Qwen3.6 Native-MTP +7.5%). SAFE guard costs ~0 here
+(vs -10.4% on Ornith). LOSSLESS: FAIL for both plain and MTP_SAFE - greedy thinking traces diverge
+from base (respond/answer word-level divergence, same set_sampler CPU-fallback signature as section
+39; NOT model-specific). Final response text converged by chance in one seal; treat as non-lossless.
+Deployed 2026-09-29 as llama-swap entry RVN-Flash-Next-MTP with GGML_TP_AR_MTP_SAFE=1 +
+LLAMA_PLE_PREFAULT=1 (accepting trace divergence, same regime as the other MTP entries).
+Methodology note: an initial 'LOSSLESS PASS' verdict from tail-compare was an artifact of differing
+timing footprints; seals must compare response text with timing lines stripped, and a full-trace
+compare is required for the lossless claim (the tail-only pass hid a diverging thinking trace).
