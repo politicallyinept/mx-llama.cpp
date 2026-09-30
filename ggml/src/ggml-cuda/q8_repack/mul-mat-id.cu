@@ -48,8 +48,20 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // Q4_K/Q5_K/Q6_K/IQ4_NL), so a Q4_0 MoE model takes the UNFUSED paths
     // at every decode width -- the fused id1_fused / *_fused epilogues are
     // never reached for Q4_0 and stay untouched. Unset gate = stock q8_1.
+    // BATCH-GATE MODE 3 (mirrors the dense gate in q8_repack/mul-mat.cu):
+    // W4A4 only when the batch has multiple tokens (n_tokens > 1, i.e.
+    // prefill/batch); single-token decode (n_tokens == 1) falls back to the
+    // stock q8_1 repack path — W4A4 is ~+7% prefill but -5.4% decode on
+    // MoE models because the SUMW recompute per block never amortizes at
+    // one token. Every other set value keeps the existing always-on bool
+    // semantics (modes 1/2 unchanged).
     static const bool w4a4_dot8 = getenv("GGML_CUDA_W4A4_DOT8") != nullptr;
-    const bool u4act = w4a4_dot8 && src0->type == GGML_TYPE_Q4_0;
+    static const int w4a4_mode = [] {
+        const char * e = getenv("GGML_CUDA_W4A4_DOT8");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    const bool u4act = (w4a4_dot8 && (w4a4_mode != 3 || n_tokens > 1))
+        && src0->type == GGML_TYPE_Q4_0;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);

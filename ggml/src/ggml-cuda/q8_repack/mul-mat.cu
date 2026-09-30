@@ -54,6 +54,12 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     //   unset/0 = stock q8_1 activations
     //   1       = per-32 asymmetric u4 decode + GEMM (shipped; byte-identical)
     //   2       = decode per-32 (SAME as gate 1) + GEMM per-8 u4p
+    //   3       = BATCH-GATED: W4A4 (per-32, same kernel set as gate 1) only
+    //           when the activation tensor has multiple rows (src1->ne[1] > 1,
+    //           i.e. prefill/batch); single-token decode (ne[1] == 1) falls
+    //           back to the stock q8_1 repack path. Rationale: W4A4 is
+    //           ~+7% prefill but -5.4% decode on MoE models — the SUMW
+    //           recompute per block has no amortization at one token.
     // The per-8 u4p DECODE branch (M3) stays compiled but NO gate selects it:
     // BENCH.md §36 rejected per-8 decode (-9.2% tg). `u4p` below is GEMM-only;
     // the narrow-batch decode sites use `u4act` under both gates 1 and 2.
@@ -62,7 +68,8 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         return e != nullptr ? atoi(e) : 0;
     }();
-    const bool u4act = (w4a4_dot8 == 1 || w4a4_dot8 == 2) && src0->type == GGML_TYPE_Q4_0;
+    const bool u4act = (w4a4_dot8 == 1 || w4a4_dot8 == 2 || (w4a4_dot8 == 3 && ne11 > 1))
+        && src0->type == GGML_TYPE_Q4_0;
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
