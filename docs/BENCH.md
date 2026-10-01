@@ -1234,3 +1234,33 @@ Context for the dense-W4A4 quality picture: Mistral-Large-123B fine-tune +0.082@
 Reproducibility note: an earlier buggy harness run (both legs accidentally W4A4-on due to a
 hardcoded env) produced 7.9541 for the "off" leg - which exactly matches today's true ON value;
 the W4A4 path is deterministic session-to-session.
+
+### 47d. Crash bisect: batch-sequence boundary + gate2 silent corruption (2026-10-01)
+Flag matrix (all GGML_CUDA_W4A4_DOT8=1 unless noted, 9B Q4_0, single GPU):
+| config | result |
+|---|---|
+| c512 -b 2048 -ub 512 (n_seq=4) | CRASH (mmq_gemm_repacked illegal access) |
+| c512 -b 2048 -ub 512 -fa on | CRASH (fa not a factor) |
+| c512 -b 512 -ub 512 (n_seq=1) | OK, PPL 9.5196 |
+| c512 -b 2048 -ub 2048 | CRASH |
+| c512 mmap loader | CRASH (loader not a factor) |
+| c2048 -b 2048 -ub 512 (n_seq=1) | OK, PPL 6.9811 |
+| c2048 -b 2048 -ub 2048 | OK, PPL 7.0322 |
+Bisect (gate x batch x chunks):
+| config | result |
+|---|---|
+| gate1 b2048 c512 (n_seq=4) ch8 | CRASH |
+| gate1 b1024 c512 (n_seq=2) | OK |
+| gate1 b512 c512 (n_seq=1) | OK, 9.5196 |
+| gate2 b2048 c512 (n_seq=4) | NO crash but PPL 295.58 = SILENT CORRUPTION |
+
+Reading: the discriminator is llama-perplexity's multi-sequence batching (n_seq = b/c):
+n_seq<=2 clean, n_seq=4 breaks both W4A4 gates - gate1 hard fault, gate2 silent wrong
+numbers (295 vs ~9.5 at n_seq=1; 8-chunk sample but ~30x off is not sampling noise).
+Single-sequence ne11=2048 is fine (c2048 legs), so it is NOT raw row count. Production
+entries (server, -ub 2048, single-sequence continuous batching) are unaffected.
+Upstream stock repack path handles n_seq=4 fine (section 46 KLD legs ran it) - this is
+a W4A4 u4/u4p activation-path bug specific to multi-sequence src1 handling, two
+different failure modes (u4act: OOB fault; u4p: silent corruption). KLD-with-W4A4 stays
+unavailable until fixed; root cause next (u4 quantize kernel z-dim/grid or x_stride
+handling under ne12>1 in the tiled branch, mul-mat.cu:84-113 + quantize.cu:574-651).
