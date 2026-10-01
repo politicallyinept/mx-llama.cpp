@@ -1128,3 +1128,41 @@ the same pinned-staging pattern (llama-model-loader.cpp:1706-1755).
 Minimal fix (described, not implemented): in ggml_backend_cuda_buffer_set_tensor_2d, stage
 non-pinned strided sources through a small reusable pinned buffer + one contiguous async copy,
 sync deferred to end-of-tensor; or route GPU-bound mmap tensors through the dio upload_backend.
+
+## 45. NVFP4 imatrix leg - the scale answer to the E2M1 wall (2026-10-01, branch perf/nvfp4-imatrix)
+
+Question left by section 28b/28c (MXFP4+imatrix REJECT, PPL@8k 2.1626 vs Q4_0 1.9455, residual
+blamed on the E2M1 mantissa wall): is the residual scale poverty (E8M0 per-32) or mantissa
+poverty (2-bit)? Test: M1-style imatrix-aware NVFP4 quantizer - per-16-sub-block UE4M3 scale
+search weighted by imatrix (window around ref amax/6 code), vs MXFP4's one E8M0 scale per 32.
+
+### Build + seal
+quantize_row_nvfp4_impl in ggml-quants.c; quantize_nvfp4 branches on quant_weights; NVFP4 ftype
+wired in llama-quantize (dense 2D ne0%64 branch). CPU seal: no-imatrix bit-identical to ref;
+synthetic weighted-error ratios 0.825-0.957; REAL Ornith expert data w_err 0.629 (37% error cut,
+vs MXFP4's 5.7% - the finer scale grid actually bites on real weights). Commits ff31bc858 + 1f6be1d1a.
+
+### Numbers (Ornith-35B, same harness as M3, Q4 control same-run)
+| quant | PPL@8k | vs Q4_0 |
+|---|---|---|
+| Q4_0 (control, same run) | 1.9525 | - |
+| Q4_0 (M3 ref) | 1.9455 | - |
+| **NVFP4 + imatrix (this leg)** | **1.9778** | **+1.66%** |
+| MXFP4 + imatrix | 2.1626 | +11.2% |
+| MXFP4 no-imatrix | 2.4418 | +25.5% |
+
+NVFP4+imatrix closes 85% of the gap MXFP4+imatrix left (2.1626 -> 1.9778). Greedy seal PASS
+(primes 2-53 exact). GGUF: 4.54 BPW, 18.8G, token_embd overridden to mxfp4 (no NVFP4 CUDA
+get_rows kernel), output.weight Q6_K prod-matched.
+
+### Perf: non-starter on gfx906 today
+NVFP4 has no repack fast path - generic MMQ: pp8192 972.5 vs MXFP4 1465.2 (-33.6%), tg128@8k
+82.5 vs 106.5 (-22.6%), same session/build. A q8_repack/MoE-fusion port to the NVFP4 block
+layout is the follow-up lever if the quality verdict ever justifies it.
+
+### Verdict: REJECT for adoption (bar: PPL <= Q4_0). Science answer: the M3 "mantissa wall"
+framing was too strong - scale granularity was worth ~0.18 PPL; the irreducible 2-bit-mantissa
+floor is ~+1.7% over Q4_0 at this point size. 4-bit block formats (MXFP4, NVFP4) are both below
+the RP adoption bar on quality AND (for NVFP4) speed on gfx906. The quantizer-side exploration
+of this family is COMPLETE: MXFP4 raw, MXFP4+imatrix, NVFP4+imatrix all measured; no further
+quantizer-side path remains (next rung would be mantissa width, i.e. not MXFP4/NVFP4).
