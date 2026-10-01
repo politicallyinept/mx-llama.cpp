@@ -1052,3 +1052,49 @@ LLAMA_PLE_PREFAULT=1 (accepting trace divergence, same regime as the other MTP e
 Methodology note: an initial 'LOSSLESS PASS' verdict from tail-compare was an artifact of differing
 timing footprints; seals must compare response text with timing lines stripped, and a full-trace
 compare is required for the lossless claim (the tail-only pass hid a diverging thinking trace).
+
+## 44. MTP sampler guard T1 fix + qwen4exp stock-load root cause (2026-09-30)
+
+### 44a. set_sampler T1: capability test replaces hard refusal (fix/mtp-sampler-guard-t1, f83423ec2)
+Background: the guard is upstream-identical (PR #23287, deliberate CPU fallback under -sm tensor).
+Investigation (mtp-sampler-bug-analysis.txt) designed a tiered fix; T1 implemented:
+device sampling allowed iff logits row replicated (tensor_mirror_output / small dense DFLASH
+drafter) or TP width 1 (get_split_state_ud-derived); CPU fallback kept for vocab-parallel heads;
+one-shot warning suppression removed.
+
+Seals (greedy, CUSTOM_AR=0, n=768, response-anchored compare, determinism control IDENTICAL):
+| pair | verdict | guard state |
+|---|---|---|
+| DFlash2 base vs MTP | DIFFERS (near-tie wording) | 0 warnings: device sampling ENGAGED |
+| RVN Flash-Next base vs MTP | DIFFERS (list formatting) | 0 warnings: device sampling ENGAGED |
+| RVN perf @8k | base 36.5 vs MTP 59.1 t/s gen (+62%) | no regression |
+
+CLASSIFICATION: both pairs diverge with device sampling engaged AND custom AR off. 43c had RVN
+diverging with CPU sampling too. So the losslessness problem for RVN MTP and DFlash2 is the
+upstream #25618 batch-invariance class (parallel verify kernels not bitwise-identical to serial
+decode; near-tie flips), NOT the sampler guard. The investigation prediction (guard fix = DFlash2
+fix) is REFUTED. Qwen3.6/Ornith remain the custom-AR reordering class (43c/44: AR=0 restores identity).
+
+Verdict on T1: correct and worth keeping - scopes the guard exactly where backend argmax is safe
+and removes the per-draft-token full-vocab logits D2H for mirrored/single-lane drafts - but it is
+NOT a losslessness fix on this rig. Spec-decode losslessness on -sm tensor stays blocked on the
+upstream #25618 class. Full data: /root/mtp-t1-fix-results.txt.
+
+### 44b. qwen4exp stock-Q4_0 "hang" RESOLVED: mmap loader pathology, -lm dio avoids it
+User catch: every repro ran the default mmap loader; production entries use -lm dio (direct I/O).
+Identical config (GGML_CUDA_REPACK_Q4_0=0, custom AR off, -sm tensor, same model/flags):
+- mmap: never completes within observation windows (90+ min). /proc counters during the "hang":
+  read_bytes 61.7->80.3 GB over 60 s (312 MB/s sustained), majflt +80/s, RSS +1.1 GB - reads
+  outpace residency ~100:1: the meta set_tensor 2D-copy pattern over mmap'd source pages thrashes
+  the page cache instead of retaining data.
+- -lm dio: load complete + listening in ~14 SECONDS (hang-dio-test.log).
+Root cause: interaction of the mmap loader with meta-buffer set_tensor 2D copies on this tensor
+geometry (small odd-sized lane copies, e.g. row=126/108 at pitch 360 for the 3-lane axis-0 ffn
+split; measured 0.4-5.8 GB/s per-copy from cold mmap vs 5.3-8.9 GB/s aligned/pinned - bench files
+memcpy2d_bench*.log). NOT a deadlock, NOT repack-dependency (repack merely takes a different
+staging path), NOT qwen4exp-specific quant handling. Mistral-Large fine-tune Q4_K_M stock tolerance under mmap
+remains unexplained (probable: its tensor shapes avoid the tiny-copy regime) - open, low priority
+since production uses -lm dio everywhere.
+Actions: -lm dio added to the RVN-Flash-Next-MTP llama-swap entry (consistency with the rest of
+the fleet). Optional real fix (not implemented): staging/bulk-copy for mmap sources in the meta
+set_tensor path.
