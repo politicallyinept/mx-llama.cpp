@@ -44,6 +44,13 @@ the 2026-09-26 snapshot, kept for history; the update supersedes it.
   won the scheme shootout (43c).
 - u4_quant_check.hip harness: superseded by mode-3 first-token seals; CLOSED.
 
+### MXFP4/NVFP4 family - CLOSED (2026-10-01, BENCH 45)
+NVFP4 imatrix leg completed the family exploration: NVFP4+imatrix PPL@8k 1.9778 (+1.66% over
+Q4_0) closes 85% of what MXFP4+imatrix left - so scale poverty mattered, but the irreducible
+2-bit-mantissa floor is ~+1.7%. REJECT for adoption (quality bar missed AND no gfx906 repack
+fast path: -22.6% tg / -33.6% pp vs MXFP4). Branch perf/nvfp4-imatrix (ff31bc858). No
+quantizer-side path remains in the 4-bit block family; next rung is mantissa width (out of scope).
+
 ### MXFP4 imatrix - CORRECTION: already done, REJECT (2026-09-28, branch perf/mxfp4-imatrix)
 The 09-26 snapshot listed this as untried; it was completed on 09-28 (commits b0cd9cbb7 M1 quantizer,
 aa11d00de M2 CLI, a531a28a9 M3 Ornith validation):
