@@ -1338,3 +1338,32 @@ Expected (simulation + gate2 anchor): KLD mean ~0.090 (control 0.0683), 99.9pct 
 max <18. Direct derivative of the existing per-8 u4p kernel (2 sub-blocks instead of 4);
 no calibration, no requant, no decode-path change. SmoothQuant = phase-3 fallback only.
 Empirical anchor is strong: per-8 sub-blocks already recover 84.5% of the gap in this fork.
+
+## 49. W4A4 phase 2: per-16 sub-block activation scales - gate 3 IMPLEMENTED (03f75cedd, 2026-10-02)
+
+Gate 3 = GGML_CUDA_W4A4_DOT8=3: GEMM-path activations quantized per-16 sub-blocks (2x fp16
+{d4,m} pairs + 16B nibbles = 28B/32-values, aligned(4); note: struct natural alignment is
+2 from ggml_half - the explicit aligned(4) + 2B pad is REQUIRED, natural packing is 26B).
+Decode/narrow paths untouched (per-32 u4act). Gate 2 (per-8) unchanged. Derived from the
+per-8 u4p kernel (2 sub-blocks instead of 4). Layout note: 28B stride is NOT 16B-aligned -
+scale pairs load as u32, never uint4.
+
+### 49a. Seals + accuracy (Qwen3.5-9B Q4_0, single GPU, -lm dio)
+| leg | gate1 | gate3 (per-16) | per-8 ref |
+|---|---|---|---|
+| GPU seal (vs CPU ref, 4096 cells) | - | maxrel 2.6e-6 PASS | - |
+| PPL c512 (n_seq=1) | 9.5196 | **8.5422** | 9.0520 |
+| KLD mean (n_seq=4, vs bf16) | 0.1226 | **0.0902** | 0.0768 |
+| PPL c2048/-b2048/ub2048 | 7.0322 | **7.4332** | - |
+| greedy seal (-n 700) | primes exact | primes exact, coherent | - |
+
+KLD 0.1226 -> 0.0902 = 73.6% of the way to stock (0.0683); lands between the simulation
+prediction (~0.090 - dead on) and short of per-8's 0.0768 as designed. c512 PPL beats BOTH
+per-32 (9.52) and per-8 (9.05). Production-shape PPL is WORSE (7.03 -> 7.43) - at ub2048 the
+per-16 scale plane costs more than the outlier recovery gains at that depth; see 49b.
+
+### 49b. Perf
+Quick pass: decode tg128 IDENTICAL (82.0 vs 82.2 - decode path untouched, as designed).
+pp512 ~equal (1003.9 vs 1032.3, gate1 noisy +-304). pp2048 gate3 956.8 vs gate1 1211.3
+(-21%) BUT gate1 spread was +-95 - flagged for the clean interleaved A/B (49c).
+### 49c. Clean interleaved A/B: [PENDING - running]
