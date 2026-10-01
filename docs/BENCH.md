@@ -1199,3 +1199,38 @@ tg32 124.5+-5.3 vs 81.8+-6.0 (+52.2%) | tg128 145.6+-1.7 vs 87.2+-0.9 (+66.9%)
 PR mapping: PR1 (nranks-3 twoshot AR) = 46c second table; PR2 (Q4_0 repack entry) = 46b identity
 + 46c first table. Note: llama-bench -dev does not propagate to TP device selection; 3-GPU legs
 used default all-GPU selection.
+
+## 47. W4A4 accuracy on Qwen3.5-9B: KLD unavailable (kernel crash at small ubatch), PPL@8k +2.66% (2026-10-01)
+
+Purpose: extend the upstream-data matrix (section 46) with W4A4 gate=1 accuracy. Reused the 9B
+F16 logits base (f16-c512-ch128.logits) + wikitext-2. Single GPU, -lm dio, w4a4-env environment.
+
+### 47a. Harness verified
+Stock Q4_0 KLD vs F16: KLD 0.068316 +- 0.001681 - EXACTLY reproduces the section 46 agent number
+(0.068316). Harness and base file valid.
+
+### 47b. FINDING: W4A4 gate=1 crashes at c512-class prefill shapes
+llama-perplexity with GGML_CUDA_W4A4_DOT8=1 aborts (rc=134, ROCm illegal memory access in
+mmq_gemm_repacked) at c512 -b 2048 -ub 512, deterministic, independent of --kl-divergence
+(reproduces with plain PPL c512) and of --chunks (128 and 32). SAME binary that ran the
+section 46 matrix (which did not enable W4A4). Plain PPL at c8192 -ub 2048 runs fine, and the
+W4A4 PPL delta is deterministic across sessions (7.9541 reproduced exactly).
+Shape boundary: production entries run -ub 2048 (M=2048 ubatch GEMMs) + decode (M=1), both fine.
+c512/-ub 512 (M=512 prefill GEMM) crashes. Not KLD-specific, not chunk-count-specific: it is the
+ubatch M-dimension. Suspected u4act W4A4 kernel tile-shape hole at M=512 on Q4_0 9B shapes;
+not root-caused yet. KLD with W4A4 is therefore UNAVAILABLE at c512 (the KLD base is c512).
+Action items: (1) reproduce standalone with llama-mmap-perplexity-ish minimal M=512 GEMM,
+(2) root-cause in mul-mat.cu u4act dispatch, (3) add a guard or fix before any entry runs
+non-2048 ubatches with W4A4.
+
+### 47c. W4A4 PPL@8k on 9B Q4_0 (works at production shapes)
+| config | PPL@8k (wikitext-2, -fa on) | delta |
+|---|---|---|
+| W4A4 off | 7.7476 +- 0.0532 | - |
+| W4A4 gate=1 | 7.9541 +- 0.0542 | +0.2065 (+2.66%) |
+
+Context for the dense-W4A4 quality picture: Mistral-Large-123B fine-tune +0.082@8k (+7.7% rel), this 9B dense
++0.2065@8k (+2.66% rel) - relative cost smaller on the smaller model, absolute cost larger.
+Reproducibility note: an earlier buggy harness run (both legs accidentally W4A4-on due to a
+hardcoded env) produced 7.9541 for the "off" leg - which exactly matches today's true ON value;
+the W4A4 path is deterministic session-to-session.
