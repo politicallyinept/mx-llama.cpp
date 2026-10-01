@@ -121,15 +121,23 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
-            // Same block count under either layout, so the slice offset is in
-            // identical block units; the U4ACT kernel reinterprets the base
-            // back to block_q8_1_u4 (pool memory, no aliasing hazard).
+            // PLANE OFFSETS MUST BE COMPUTED IN THE POOL'S OWN ELEMENT SIZE.
+            // The block COUNT per plane is identical under every layout, but
+            // the element SIZE is not: block_q8_1 is 34 B, block_q8_1_u4 is
+            // 20 B, block_q8_1_u4p is 32 B. Adding the plane offset in
+            // block_q8_1 units to a u4/u4p pool mis-places every plane after
+            // the first (ne12 > 1): garbage reads (NaN logits) or reads past
+            // the pool (illegal access). ne12 == 1 has offset 0 and was
+            // always clean, which hid this until multi-sequence shapes ran.
             const block_q8_1 * xq = (u4p_decode
-                    ? reinterpret_cast<const block_q8_1 *>(src1_u4p_own.get())
+                    ? reinterpret_cast<const block_q8_1 *>(
+                        (const char *) src1_u4p_own.get()
+                        + (size_t) (i3 * ne12 + i2) * ne11 * x_stride * sizeof(block_q8_1_u4p))
                     : u4act
-                    ? reinterpret_cast<const block_q8_1 *>(src1_u4_own.get())
-                    : src1_q8_1_d)
-                              + (i3 * ne12 + i2) * ne11 * x_stride;
+                    ? reinterpret_cast<const block_q8_1 *>(
+                        (const char *) src1_u4_own.get()
+                        + (size_t) (i3 * ne12 + i2) * ne11 * x_stride * sizeof(block_q8_1_u4))
+                    : src1_q8_1_d + (i3 * ne12 + i2) * ne11 * x_stride);
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
             if (ne11 == 1) {
                 if (u4p_decode) {
@@ -294,15 +302,23 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
 
         for (int64_t i3 = 0; i3 < ne13; i3++) {
         for (int64_t i2 = 0; i2 < ne12; i2++) {
-            // Slice offset in BLOCK units: identical count under either layout
-            // (nkb per token row vs n_groups*4 per token row), so the token
-            // stride is iter_ne11 * (blocks per token) either way.
+            // Slice offset in BLOCK units: identical COUNT under either
+            // layout (nkb per token row vs n_groups*4 per token row), but the
+            // element SIZE differs (block_q8_1 34 B vs block_q8_1_u4 20 B vs
+            // block_q8_1_u4p 32 B), so the plane offset for u4/u4p must be
+            // taken in BYTES of the pool's own element type. Adding it in
+            // block_q8_1 units mis-places every plane after the first
+            // (ne12 > 1): gate1 reads past the pool (illegal access), gate2
+            // reads in-pool garbage (silent corruption, PPL ~300). ne12 == 1
+            // has offset 0 and was always clean.
             const block_q8_1 * xq = (u4p
-                    ? reinterpret_cast<const block_q8_1 *>(src1_u4p.get())
-                              + (i3 * ne12 + i2) * iter_ne11 * nkb_u4
+                    ? reinterpret_cast<const block_q8_1 *>(
+                        (const char *) src1_u4p.get()
+                        + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4p))
                     : u4act
-                    ? reinterpret_cast<const block_q8_1 *>(src1_u4.get())
-                              + (i3 * ne12 + i2) * iter_ne11 * nkb_u4
+                    ? reinterpret_cast<const block_q8_1 *>(
+                        (const char *) src1_u4.get()
+                        + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4))
                     : reinterpret_cast<const block_q8_1 *>(
                         src1_q8_1.get() + (i3 * ne12 + i2) * iter_ne11 * n_groups));
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
