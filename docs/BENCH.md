@@ -1264,3 +1264,39 @@ a W4A4 u4/u4p activation-path bug specific to multi-sequence src1 handling, two
 different failure modes (u4act: OOB fault; u4p: silent corruption). KLD-with-W4A4 stays
 unavailable until fixed; root cause next (u4 quantize kernel z-dim/grid or x_stride
 handling under ne12>1 in the tiled branch, mul-mat.cu:84-113 + quantize.cu:574-651).
+
+### 47e. ROOT CAUSE + FIX: plane-slice pointer arithmetic in wrong element units (51a43756f, 2026-10-01)
+Bug: both GEMM slice loops (mul-mat.cu narrow ~115 and tiled ~293) offset the activation pool in
+BLOCKS cast to block_q8_1* (34 B equivalent) while the u4act/u4p pools hold block_q8_1_u4 (20 B)
+/ block_q8_1_u4p (32 B). Same block count, wrong size: every (i2,i3) plane after the first was
+misplaced. gate1 (20 B): offsets overshoot 1.7x -> OOB fault. gate2 (32 B): in-pool shifted
+garbage -> silent corruption. ne12=1: offset 0 -> always clean, which hid the bug through every
+prior gauntlet (all ran single-sequence).
+
+Framing correction to 47c/47d: the discriminator is ne12>1, NOT ne11=128. Sweep: 128/ne12=1
+clean (9.3680), 128/ne12=2 NaN, 128/ne12=4 fault, 192+256 at ne12=1 clean. The "ne11=128 only"
+framing was a harness artifact (128 only occurred at n_seq=4). Also: the "clean" ne11=256 b1024
+control was itself ne12=2 and NaN-corrupt with rc=0 - W4A4 KLD legs were silently invalid before
+this fix. Quantizer and kernel indexing verified correct; purely host-side slicing.
+
+Fix: plane offsets taken in BYTES of the pool's own element type at both sites (51a43756f).
+Provably no-op at ne12=1; A/B-identical PPL on identical builds pre/post.
+
+### 47f. Validation matrix + W4A4 KLD (the original goal of this leg)
+| config | before | after fix |
+|---|---|---|
+| gate1 ne11=128 x ne12=4 | fault | rc=0, PPL 9.5196 |
+| gate2 same shape | 295.6 (corrupt) | rc=0, PPL 9.0520 |
+| gate1 ne11=128 x ne12=2 | NaN | rc=0, PPL 9.4845 |
+| gate1 b512 single-seq | 9.5196 | 9.5196 (exact) |
+| gate1 c2048/b2048/ub2048 | 7.0322 | 7.0322 (exact) |
+| greedy seal | - | coherent, primes 2-29 |
+
+W4A4 KLD (c512 -b 2048 -ub 512 --chunks 128 vs F16 base, now runnable):
+Mean KLD 0.122631 +- 0.002149 (two runs 0.12217/0.12263; stock Q4_0 ref 0.068316 -> W4A4
+~1.8x stock mean). Median 0.0643, 99% 0.959, 99.9% 4.29, max 24.2 - the gap is upper-tail
+concentrated (most tokens nearly exact, rare tokens diverge hard), consistent with the
+depth-PPL growth pattern. Mean PPL(Q) 8.845 vs base 8.021 (ratio 1.103).
+Note: single-seq PPL shows ~1% run-to-run wobble on this rig (repack nondeterminism);
+present with fix stashed - environmental, not a regression.
+Full report: mi50:/root/w4a4-nseq-fix.txt; sweep logs /root/w4sweep-results.txt.
