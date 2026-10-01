@@ -1300,3 +1300,41 @@ depth-PPL growth pattern. Mean PPL(Q) 8.845 vs base 8.021 (ratio 1.103).
 Note: single-seq PPL shows ~1% run-to-run wobble on this rig (repack nondeterminism);
 present with fix stashed - environmental, not a regression.
 Full report: mi50:/root/w4a4-nseq-fix.txt; sweep logs /root/w4sweep-results.txt.
+
+## 48. W4A4 accuracy diagnostic: outlier structure + phase-2 selection (2026-10-01, branch perf/w4a4-attrib)
+
+Methods: per-tensor-class KLD via temporary GGML_W4A4_ONLY=attn|ffn dispatch gate; per-layer
+activation dumps (16 chunks x 512 tok, blk.L.ffn_gate, L=0..31) + requant simulation for the
+fix candidates. Results file: mi50:/root/w4a4-attrib-results.txt (Tables 1-3). Debug
+instrumentation committed on perf/w4a4-attrib (3cd5f0fb9), marked debug.
+
+### 48a. Attribution
+| variant | Mean KLD vs bf16 |
+|---|---|
+| control (no W4A4) | 0.068316 |
+| attn-only W4A4 | 0.083501 |
+| ffn-only W4A4 | 0.096451 |
+| full W4A4 | 0.122631 |
+FFN ~52% of the delta, attn ~28%, ~25% superadditive via the residual stream.
+
+### 48b. Outlier structure (the mechanism)
+Outliers are CHANNEL-persistent, not token-persistent: fixed channel offsets ~3968-3999 and
+3456 carry range 35-60 vs median ~2-4, from layer 4 onward; token 0/BOS worst. ~0.8% of
+per-32 blocks (range > 8x median) carry 55-80% of quant MSE in layers 4-18 on ffn_gate and
+attn_qkv inputs. ffn_down (post-SwiGLU) input is clean (12% concentration).
+This is the classic per-channel activation-outlier failure of asymmetric per-32 u4 scales:
+one big value crushes the other 31 in the block.
+
+### 48c. Fix-candidate simulation
+| candidate | activation-MSE cut | notes |
+|---|---|---|
+| per-16 sub-block scales | 42-54% (avg ~50%) | half the scale-plane bandwidth of per-8 |
+| per-8 (gate2 u4p, EMPIRICAL) | 68-87% | recovers 84.5% of the KLD gap: 0.1226 -> 0.0768, max 24.2 -> 14.9; but -9.2% decode (sec 36) |
+| SmoothQuant a=0.75 | 75-86% on foldable inputs | s-vector NOT sparse (top-1% channels carry only 2.4-5.0%); ffn_down unfoldable |
+| clipping 3-6 sigma | REJECT | 3-4 sigma INCREASES MSE 3-13x; 6-sigma no-op |
+
+### 48d. Phase-2 decision: build per-16 sub-block activation scales for the W4A4 GEMM
+Expected (simulation + gate2 anchor): KLD mean ~0.090 (control 0.0683), 99.9pct ~3.5,
+max <18. Direct derivative of the existing per-8 u4p kernel (2 sub-blocks instead of 4);
+no calibration, no requant, no decode-path change. SmoothQuant = phase-3 fallback only.
+Empirical anchor is strong: per-8 sub-blocks already recover 84.5% of the gap in this fork.
