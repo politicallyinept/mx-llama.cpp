@@ -1,6 +1,12 @@
 #include "quantize.cuh"
 #include "q8_repack/repack-common.cuh"   // block_q8_1_u4 (milestone 1)
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
 // this maps to 256-bit loads in PTX on supported devices,
@@ -837,12 +843,64 @@ void quantize_mmq_q8_1_cuda(
 // widest dim maps to the grid's fastest-varying axis). NOT called from any
 // dispatch yet — milestone 2b switches the repacked mat-vec path onto it under
 // the GGML_CUDA_W4A4_DOT8 gate.
+//
+// DEBUG (perf/w4a4-attrib): outlier-localization dump. If GGML_W4A4_DUMP is set
+// to a substring of a src0 tensor name and this call's src0 name matches, the
+// RAW fp32 activations (src1) are copied to host and appended to
+// GGML_W4A4_DUMP_FILE (default /root/w4a4-actdump.bin) before the quantizer
+// runs. At most GGML_W4A4_DUMP_N calls are dumped (default 1), and only calls
+// with ne1 >= 32 (prefill chunks; never decode, never graph capture). Record
+// format: magic 'U4DP' u32 | name_len u32 | name bytes | ne00 i64 | ne1 i64 |
+// float32 data[ne1][ne00] (row-major, row = token).
 void quantize_mmq_q8_1_u4_cuda(
         const float * x, void * vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream,
+        const char * src0_name) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % 32 == 0);
+
+    static const char * dump_sub = getenv("GGML_W4A4_DUMP");
+    static const int    dump_n   = [] { const char * e = getenv("GGML_W4A4_DUMP_N"); return e ? atoi(e) : 1; }();
+    static std::atomic<int> dumps_left{ dump_n };
+    static std::mutex         dump_mtx;
+    if (dump_sub != nullptr && src0_name != nullptr && ne1 >= 32 && ne2 == 1 && ne3 == 1 &&
+        strstr(src0_name, dump_sub) != nullptr && dumps_left.fetch_sub(1) > 0) {
+        std::lock_guard<std::mutex> lock(dump_mtx);
+        bool capturing = false;
+#ifdef GGML_USE_HIP
+        { hipStreamCaptureStatus cap = hipStreamCaptureStatusNone;
+          (void) hipStreamIsCapturing(stream, &cap);
+          capturing = cap != hipStreamCaptureStatusNone; }
+#else
+        { cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+          (void) cudaStreamIsCapturing(stream, &cap);
+          capturing = cap != cudaStreamCaptureStatusNone; }
+#endif
+        if (!capturing) {
+            cudaStreamSynchronize(stream);
+            const char * path = getenv("GGML_W4A4_DUMP_FILE");
+            if (path == nullptr) path = "/root/w4a4-actdump.bin";
+            std::vector<float> host((size_t) ne00 * ne1);
+            for (int64_t i = 0; i < ne1; i++) {
+                (void) cudaMemcpy(host.data() + (size_t) i * ne00, x + (size_t) i * s01,
+                           (size_t) ne00 * sizeof(float), cudaMemcpyDeviceToHost);
+            }
+            FILE * f = fopen(path, "ab");
+            if (f) {
+                const uint32_t magic = 0x50443455; // 'U4DP'
+                const uint32_t nlen  = (uint32_t) strlen(src0_name);
+                const int64_t  a = ne00, b = ne1;
+                fwrite(&magic, 4, 1, f); fwrite(&nlen, 4, 1, f);
+                fwrite(src0_name, 1, nlen, f);
+                fwrite(&a, 8, 1, f); fwrite(&b, 8, 1, f);
+                fwrite(host.data(), sizeof(float), host.size(), f);
+                fclose(f);
+                GGML_LOG_WARN("W4A4 DEBUG: dumped activations of '%s' ne00=%lld ne1=%lld to %s\n",
+                              src0_name, (long long) ne00, (long long) ne1, path);
+            }
+        }
+    }
 
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, ne2*ne3);

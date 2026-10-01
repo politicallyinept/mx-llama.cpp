@@ -68,8 +68,21 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         return e != nullptr ? atoi(e) : 0;
     }();
-    const bool u4act = (w4a4_dot8 == 1 || w4a4_dot8 == 2 || (w4a4_dot8 == 3 && ne11 > 1))
-        && src0->type == GGML_TYPE_Q4_0;
+    // DEBUG (perf/w4a4-attrib): GGML_W4A4_ONLY=attn|ffn restricts the u4act
+    // path to one tensor class, for KLD attribution (attn-linears vs FFN).
+    // 'attn' matches *attn* (attn_qkv/attn_o/attn_q/k/v/attn_gate), 'ffn'
+    // matches *ffn*; every other Q4_0 linear (ssm_*) stays on the stock path
+    // in both variants. Unset = no filter (shipped behavior).
+    static const int w4a4_only = [] {
+        const char * e = getenv("GGML_W4A4_ONLY");
+        if (e == nullptr) return 0;
+        if (strstr(e, "attn") != nullptr) return 1;
+        if (strstr(e, "ffn")  != nullptr) return 2;
+        return 0;
+    }();
+    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || (w4a4_dot8 == 3 && ne11 > 1))
+        && src0->type == GGML_TYPE_Q4_0)
+        && (!w4a4_only || strstr(src0->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr);
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
@@ -111,7 +124,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                 // are a different layout and must not share those entries).
                 src1_u4_own.alloc((size_t) (ne13 * ne12 * ne11 * x_stride));
                 quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
-                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream, src0->name);
             } else {
                 src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10, ne10_padded,
                     s11, s12, s13, ne11, ne12, ne13,
@@ -294,7 +307,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             // G3: token-major u4 quantizer (same launcher args as the narrow
             // path; the chunk offset rides s11 exactly like the stock call).
             quantize_mmq_q8_1_u4_cuda((const float *) src1->data + col*s11, src1_u4.get(),
-                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream);
+                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream, src0->name);
         } else {
             quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
                 src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
