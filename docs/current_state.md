@@ -32,10 +32,33 @@ the 2026-09-26 snapshot, kept for history; the update supersedes it.
 1. qwen4exp warmup HANG with GGML_CUDA_REPACK_Q4_0=0 under -sm tensor (section 42 finding 5) - deterministic; repack currently functionally required for this arch.
 2. set_sampler MTP fork bug (below, 2c) unchanged - fix design being drafted; upstream status being checked.
 
-### Still open (unchanged from 09-26)
-- DFlash2 retest incomplete (script fixed, greedy leg pending; low priority - MTP won the scheme shootout).
-- /tmp/u4_quant_check.hip multi-channel harness re-run (likely superseded by mode-3 seals, confirm and close).
-- MXFP4 imatrix-aware quantizer (quantize_row_mxfp4_ref ignores imatrix) - biggest untried perf lever.
+### 09-30 addendum: investigations closed
+- MTP sampler guard T1 fix IMPLEMENTED + SEALED (fix/mtp-sampler-guard-t1, f83423ec2): capability test
+  (device sampling iff logits MIRRORED or TP width 1). Correct + perf win, but seals REFUTED the guard
+  as the losslessness blocker: RVN MTP + DFlash2 diverge with device sampling engaged and AR off ->
+  upstream #25618 batch-invariance class (BENCH 44a).
+- qwen4exp stock-load "hang" RESOLVED (BENCH 44b + addendum): mmap-loader page-cache thrash in the meta
+  set_tensor 2D-copy path (per-call GART pin + stream sync, 26x read amplification). Mitigation deployed:
+  -lm dio on the RVN swap entry. Fix design documented, not implemented.
+- DFlash2 retest CLOSED: superseded - the 44a seals show DFlash2 losslessness is #25618-class, and MTP
+  won the scheme shootout (43c).
+- u4_quant_check.hip harness: superseded by mode-3 first-token seals; CLOSED.
+
+### MXFP4 imatrix - CORRECTION: already done, REJECT (2026-09-28, branch perf/mxfp4-imatrix)
+The 09-26 snapshot listed this as untried; it was completed on 09-28 (commits b0cd9cbb7 M1 quantizer,
+aa11d00de M2 CLI, a531a28a9 M3 Ornith validation):
+- imatrix closes 56% of the MXFP4-vs-Q4_0 PPL gap (2.4418 -> 2.1626, Q4_0 ref 1.9455)
+- residual = E2M1 mantissa poverty (8 levels vs Q4_0 16): the FORMAT is the wall, not the quantizer
+- ADOPTION BAR FAILED (bar was PPL <= Q4_0); STOP per protocol. Results: RESULTS-mxfp4-imatrix.md
+  on perf/mxfp4-imatrix. MXFP4 stays experimental on gfx906.
+
+### Still open (true remaining items)
+- Upstream PR trio (nranks-3 twoshot, Q4_0 repack entry, dense-MXFP4 quantize mode) + upstream discussion
+  pieces now ready: T1 guard fix + mmap meta-copy pathology (with fix design).
+- MXFP4 frontier beyond the E2M1 wall (only if wanted): no quantizer-side path remains; the wall is
+  format-level. Options: accept, or exotic (NVFP4 E4M3 scales - scale-rich but same 2-bit mantissa,
+  unlikely to clear; GEMM-side per-8 epilogue rework was also REJECT on perf).
+- W4A4 gate mode 3 enablement on dense entries (optional, ~neutral for dense since mode1==mode3 prefill).
 
 ---
 
