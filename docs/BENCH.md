@@ -1098,3 +1098,33 @@ since production uses -lm dio everywhere.
 Actions: -lm dio added to the RVN-Flash-Next-MTP llama-swap entry (consistency with the rest of
 the fleet). Optional real fix (not implemented): staging/bulk-copy for mmap sources in the meta
 set_tensor path.
+
+### 44b-addendum: full mechanism of the mmap crawl (qwen4exp-hang-analysis.txt, 2026-09-30)
+Final agent analysis (hang_final8 + raw-stack pointer resolver; note prior frame-15 $rsi captures
+were invalid, offsetof(ggml_tensor,name)=256). Corrections to 44b: VRAM "growth" during the stall
+was the buffer-alloc phase - VRAM is flat during the copy stall; the stuck point MOVES (~10
+layers/60 s: it is a crawl, not a deadlock; stuck tensors observed: blk.25/35 ffn_up_exps /
+ffn_gate_exps, the AXIS_1 strided path).
+
+Three compounding costs in llama_model_loader::load_all_data mmap branch ->
+ggml_backend_meta_buffer_set_tensor (per-lane 2D copies -> ggml_backend_cuda_buffer_set_tensor_2d,
+cudaMemcpy2DAsync + cudaStreamSynchronize PER CALL):
+1. strided DMA from cold pageable pages: 431 MB/s at the exact ffn_down_exps lane shapes
+   (warm: 8.4 GB/s; 1D contiguous: 14.3 GB/s) - bench3
+2. HIP pins+GART-maps the WHOLE pageable source span per call (hsaKmtMapMemoryToGPUNodes in the
+   captured stack); 93 GiB working set vs 64 GiB RAM => ~26x disk read amplification
+   (310 MB/s disk for ~12 MB/s useful)
+3. per-call stream sync serializes map/fault/disk/DMA across all 3 lanes on one thread
+
+Q4_K_M paradox resolved: Mistral-Large-123B fine-tune-v2 is dense llama-arch (no *_exps tensors, GGUF-verified)
+and Q4_K 256-block cannot take the tiny-row path anyway (AXIS_0 granularity assert,
+ggml-backend-meta.cpp:1234, for ne0=640). Exposure surface: block-32 quants (Q4_0/Q5_0/Q8_0/IQ4_NL)
+on ffn_down_exps AXIS_0; the AXIS_1 strided path (gate/up_exps) hits ANY quant on 3D per-expert
+MoE tensors. Lazy PLE table not implicated (CPU_Mapped).
+
+Why repack/dio dodge it: repack buft nulls iface.set_tensor_2d -> per-row set through a persistent
+PINNED staging buffer + ONE bulk async H2D + repack kernel (q8_repack/buffer.cu:524-599); dio uses
+the same pinned-staging pattern (llama-model-loader.cpp:1706-1755).
+Minimal fix (described, not implemented): in ggml_backend_cuda_buffer_set_tensor_2d, stage
+non-pinned strided sources through a small reusable pinned buffer + one contiguous async copy,
+sync deferred to end-of-tensor; or route GPU-bound mmap tensors through the dio upload_backend.
