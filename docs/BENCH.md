@@ -1166,3 +1166,36 @@ floor is ~+1.7% over Q4_0 at this point size. 4-bit block formats (MXFP4, NVFP4)
 the RP adoption bar on quality AND (for NVFP4) speed on gfx906. The quantizer-side exploration
 of this family is COMPLETE: MXFP4 raw, MXFP4+imatrix, NVFP4+imatrix all measured; no further
 quantizer-side path remains (next rung would be mantissa width, i.e. not MXFP4/NVFP4).
+
+## 46. Qwen3.5-9B upstream-data matrix (2026-10-01, branch bench/qwen35-9b-upstream-data)
+
+Purpose: reviewer-reproducible data for the upstream PRs. Model bartowski/Qwen_Qwen3.5-9B-GGUF
+bf16 (full-precision file in that repo; no F16), Q4_0 + Q4_K_M quantized locally with stock
+llama-quantize. Dataset wikitext-2-raw-v1 test set (wiki.test.raw, scripts/get-wikitext-2.sh from
+ggml-org/ci). Build 3b1079b84, 3x MI50, -t 16, -lm dio, PPL -c 512 -ub 512 --chunks 256 (KLD legs
+--chunks 128). Full data: /root/qwen35-9b-upstream-results.txt, scripts committed on the branch.
+
+### 46a. Accuracy vs F16 (single-GPU, no -sm tensor)
+| quant | PPL | ratio vs F16 | KLD mean (5pctl/median/95pctl) |
+|---|---|---|---|
+| F16 (bf16) | 7.9504 | - | - |
+| Q4_K_M | 7.9546 | 1.004 | 0.0577 (0.0004/0.024/0.162) |
+| Q4_0 | 8.4203 | 1.054 | 0.0683 (0.0005/0.033/0.196) |
+
+### 46b. Q4_0 repack identity (PR2 claim, verified)
+Same Q4_0 file, GGML_CUDA_REPACK_Q4_0=1 vs 0: PPL 8.4203+-0.0858 vs 8.4205+-0.0858 (delta 2e-4,
+uncertainty 8.6e-2); KLD 0.06832+-0.00168 vs 0.06897+-0.00179 (delta 6.6e-4). IDENTICAL within
+noise; repack log line present only in ON runs. Repack is layout-only.
+
+### 46c. Perf
+Single-GPU Q4_0 repack on vs off (llama-bench -r 3, mean+-spread):
+pp512 948.5+-4.1 vs 897.6+-4.1 (+5.7%) | pp2048 942.2+-0.5 vs 892.9+-0.3 (+5.5%)
+tg32 76.0+-1.8 vs 72.5+-2.1 (+4.8%) | tg128 81.0+-0.2 vs 75.7+-0.1 (+7.0%)
+
+3-GPU -sm tensor Q4_0 custom AR on vs off (GGML_ENABLE_CUSTOM_AR):
+pp512 1523.6+-0.7 vs 1332.5+-2.2 (+14.3%) | pp2048 1509.5+-0.1 vs 1318.1+-1.0 (+14.5%)
+tg32 124.5+-5.3 vs 81.8+-6.0 (+52.2%) | tg128 145.6+-1.7 vs 87.2+-0.9 (+66.9%)
+
+PR mapping: PR1 (nranks-3 twoshot AR) = 46c second table; PR2 (Q4_0 repack entry) = 46b identity
++ 46c first table. Note: llama-bench -dev does not propagate to TP device selection; 3-GPU legs
+used default all-GPU selection.
