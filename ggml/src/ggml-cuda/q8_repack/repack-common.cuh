@@ -211,6 +211,25 @@ struct block_q8_1_u4p {
 };
 static_assert(sizeof(block_q8_1_u4p) == 32, "block_q8_1_u4p must be 32 bytes");
 
+// Phase-2 per-16 activation block (gate 3, GGML_CUDA_W4A4_DOT8=3): TWO per-16
+// sub-blocks per 32 values, one fp16 {d4,m} pair per sub-block. 28 B per 32
+// values (u4 per-32 = 20 B, u4p per-8 = 32 B). Nibble order is the canonical
+// Q4_0 weight order (byte j = {val j low, val j+16 high}, SIGNED (q-8)&0xF
+// nibbles), so the sub-blocks are the value PAIRS {4k..4k+3, 16+4k..16+4k+3}
+// (k=0..1) — the same pairing the per-8 u4p uses, halved. The 28 B stride
+// keeps every block 4-byte aligned but NOT 16-byte aligned: qs is assembled as
+// four u32 words and the scale pair as two u32 words (the 20 B per-32 u4
+// precedent); never reinterpret_cast<uint4*> on a 28 B-strided pointer.
+struct __attribute__((aligned(4))) block_q8_1_u4x16 {
+    uint8_t   qs[16];   // 32 signed nibbles, canonical Q4_0 byte order
+    ggml_half d4[2];    // per-sub-block scale: (max_k - min_k) / 15
+    ggml_half m[2];     // per-sub-block min
+    uint8_t   pad[2];   // explicit tail: alignment-4 rounds 26 -> 28 B; the u32
+                        // scale-pair loads at offsets 16/20/24 need 4-byte alignment
+};
+static_assert(sizeof(block_q8_1_u4x16) == 28, "block_q8_1_u4x16 must be 28 bytes");
+static_assert(alignof(block_q8_1_u4x16) == 4, "block_q8_1_u4x16 must be 4-byte aligned");
+
 // Host reference quantizer (fp32 -> block_q8_1_u4), defined in repack-common.cu.
 // NOT wired into any dispatch yet - milestone 2 hooks it into the repacked paths.
 void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
@@ -349,6 +368,27 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_u4p_from_blocks(
     rp_x_sub out;
     out.q0 = *reinterpret_cast<const uint4 *>(b.qs);
     out.q1 = *reinterpret_cast<const uint4 *>(b.d4);
+    out.d  = 0.0f;
+    return out;
+}
+
+// Phase-2 gate 3: fetch one 32-value per-16 activation block from the
+// token-major block_q8_1_u4x16 pool (quantize_mmq_q8_1_u4x16_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block, nkb = ne0/32). The 28 B stride keeps every
+// block 4 B aligned but NOT 16 B aligned, so BOTH the qs nibbles and the
+// d4[2]/m[2] pair are assembled as u32 words (the 20 B per-32 u4 precedent) —
+// never a uint4 load on a 28 B-strided pointer. q0 = the 32 signed
+// two's-complement nibbles (4 words); q1 = the fp16 scales as
+// {d4_0,d4_1},{m_0,m_1} (the per-16 twin of rp_x_sub_u4p_from_blocks' quad).
+// out.d is unused (the per-16 scales ride q1, not the per-32 sXd/sXs tiles).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4x16_from_blocks(
+        const block_q8_1_u4x16 * __restrict__ blocks, const uint32_t idx) {
+    const block_q8_1_u4x16 & b = blocks[idx];
+    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+    const uint32_t * s32 = reinterpret_cast<const uint32_t *>(b.d4);
+    rp_x_sub out;
+    out.q0 = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+    out.q1 = make_uint4(s32[0], s32[1], 0u, 0u);
     out.d  = 0.0f;
     return out;
 }
