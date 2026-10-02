@@ -83,13 +83,28 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         if (strstr(e, "ffn")  != nullptr) return 2;
         return 0;
     }();
+    // DEBUG (perf/w4a4-selective): tensor-class match for the filter.
+    auto w4a4_match = [&](const ggml_tensor * t) {
+        return !w4a4_only || strstr(t->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr;
+    };
+    // DEBUG (perf/w4a4-selective): under gates 1/2 the filter restricts WHICH
+    // tensors use the u4act path at all (phase-1 attribution vs stock). Under
+    // gate 3 the filter's meaning MOVES: it selects which tensors get per-16
+    // u4x16 GEMM activations; every Q4_0 tensor keeps the per-32 u4act base
+    // (non-matching tensors fall back to the u4act per-32 GEMM path), so the
+    // selective run is measured against gate1-full, not against stock.
     const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3)
         && src0->type == GGML_TYPE_Q4_0)
-        && (!w4a4_only || strstr(src0->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr);
+        && (w4a4_dot8 == 3 || w4a4_match(src0));
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
     // Phase-2 gate 3: per-16 GEMM activations (gate-2 semantics: GEMM path
     // only; the narrow/decode paths above keep the per-32 u4act kernels).
-    const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0;
+    // DEBUG (perf/w4a4-selective): the GGML_W4A4_ONLY filter now gates this
+    // selection too. The dispatch is per-tensor (this whole function runs per
+    // mul_mat node, each with its own pool alloc), so a selective run mixes
+    // u4x16 and u4act pools across tensors with no cross-contamination; the
+    // plane-offset fix is per-call.
+    const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0);
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
