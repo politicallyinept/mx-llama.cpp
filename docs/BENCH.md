@@ -1366,4 +1366,32 @@ per-16 scale plane costs more than the outlier recovery gains at that depth; see
 Quick pass: decode tg128 IDENTICAL (82.0 vs 82.2 - decode path untouched, as designed).
 pp512 ~equal (1003.9 vs 1032.3, gate1 noisy +-304). pp2048 gate3 956.8 vs gate1 1211.3
 (-21%) BUT gate1 spread was +-95 - flagged for the clean interleaved A/B (49c).
-### 49c. Clean interleaved A/B: [PENDING - running]
+### 49c. Clean interleaved A/B (9 rounds/gate, trimmed means): pp -21% FLAT, tg unchanged
+| cell | gate1 | gate3 | delta |
+|---|---|---|---|
+| pp512 | 1276.0 | 1003.9 | -21.3% |
+| pp1024 | 1280.4 | 1006.7 | -21.4% |
+| pp2048 | 1270.1 | 1000.1 | -21.3% |
+| pp4096 | 1244.6 | 983.3 | -21.0% |
+| tg128 | 82.19 | 82.25 | +0.07% |
+| tg256 | 82.33 | 82.39 | +0.07% |
+3-GPU TP (pp2048/n256, spread <0.1%): pp2048 2380.8 vs 1890.7 (-20.6%); tg256 88.37 vs
+88.25 (-0.14%). The quick-pass "pp512 ~equal" was wrong; the penalty is flat ~-21% at
+every pp size. Same-gate swings were sporadic one-off samples (5 dropped, both gates),
+not thermal (42-55 C stable). Raw: /root/w4a4-ab/*.jsonl.
+
+### 49d. VERDICT: gate 3 = REJECT for default; env-gated experimental, kept
+Adoption bar was KLD <= 0.095 AND perf within ~2% of gate1. Accuracy: MET (0.0902, 73.6%
+of the gap to stock; c512 PPL 9.52 -> 8.54, beats both gate1 and per-8). Perf: FAILED -
+flat ~-21% pp at every size, both single-GPU and 3-GPU TP. Depth split is real: per-16
+helps shallow (c512 8.54 < 9.52) and hurts deep (c2048 7.43 > 7.03) - long-context RP
+(the production use) sits on the wrong side. Production default stays gate1; gate3 remains
+available as GGML_CUDA_W4A4_DOT8=3 for short-context/quality-sensitive experiments.
+Future lever: the -21% is a per-16 read-path cost (scale-pair loads + sub-block indexing
+in mmq_gemm_repacked_impl), not fundamental - a tuning pass on the U4X16 fetch (vectorized
+28B-stride handling) could narrow it; not scheduled.
+
+Upstream framing (unchanged): the multi-seq plane-offset fix (51a43756f) is the
+PR-ready piece; sections 47-49 are the supporting story (bug, diagnostic methodology,
+sub-block scale exploration with measured KLD/perf tradeoffs) if upstream wants the
+accuracy context.
