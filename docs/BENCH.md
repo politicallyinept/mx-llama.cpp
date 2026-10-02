@@ -1435,3 +1435,16 @@ PROFILING CAVEAT: rocprofv3 (system 7.2.3) cannot attach to TheRock-nightly-runt
 binaries ("register fat binary failed") - kernel-time attribution of the -21% is
 unmeasured. Correction: the "98.9s mmq_gemm / 1.5s quantize" figures quoted mid-session
 were from a STALE Sep-25 results.csv (M4-era), not this program; do not cite them.
+
+### 49g. Kernel-time attribution CLOSED (rocprofv3 per-gate-cwd workaround, 2026-10-02)
+Profiling succeeded after the agent fixed the invocation (rocprofv3 writes to CWD; per-gate
+directories + fresh CWD per run). Matched workload, 1984 GEMM calls per gate, device ROCm1:
+| kernel | total | per-call |
+|---|---|---|
+| mmq_gemm_repacked U4ACT=true (gate1, per-32) | 2718.5 ms | 1.37 ms |
+| mmq_gemm_repacked U4X16=true (gate3, per-16) | 3343.7 ms | 1.69 ms |
+Per-call delta +22.9% inside the GEMM kernel itself = the -21.3% wall clock. Attribution
+CLOSED: the per-16 cost is intrinsic to u4x16 kernel execution (2x scale decode/apply per
+32-value group in the tiled inner loop + 32B LDS footprint); zero contribution from
+dispatch, quantizer, or AR. Recovering it requires restructuring the scale-application
+math, not layout or launch changes. Traces: /root/w4a4-prof32/{gate1,gate3}/prof_kernel_trace.csv.
