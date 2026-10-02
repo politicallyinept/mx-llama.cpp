@@ -1420,3 +1420,18 @@ parity-or-better vs stock at BOTH depths while keeping the W4A4 prefill win (+6%
 +21% TP over stock at pp2048 with AR). c512 stock re-confirmed 8.4570 +- 0.1217 (ref 8.4203,
 within CI). Effective summary: gate1 = +pp but +3.2% PPL at depth; gate3 = +pp, stock-parity
 accuracy at depth, +1.4% at shallow.
+
+### 49f. 32B layout tuning: negative result + profiling caveat (2026-10-02)
+Tested u4x16 28B -> 32B padded stride (alignment hypothesis: 28B stride forces scattered
+u32 loads). Numerics bit-identical (PPL 8.5422, KLD 0.090164 - pure layout move confirmed).
+PERF NOT RECOVERED: interleaved bench gate3-32B pp512 986.7 / pp2048 979.6 / pp4096 962.2
+vs gate1 1268-1282 = -22..-23%, same as 28B. Alignment was not the cost; the per-16 scale
+application (2x decode/apply per 32-value group in the tiled inner loop) is intrinsic to
+the current kernel design. Layout reverted; per-16 stays env-gated (DOT8=3), production
+remains gate1. Future option: scale-application restructure (hoist/pack) - deeper rework,
+not scheduled.
+
+PROFILING CAVEAT: rocprofv3 (system 7.2.3) cannot attach to TheRock-nightly-runtime
+binaries ("register fat binary failed") - kernel-time attribution of the -21% is
+unmeasured. Correction: the "98.9s mmq_gemm / 1.5s quantize" figures quoted mid-session
+were from a STALE Sep-25 results.csv (M4-era), not this program; do not cite them.
