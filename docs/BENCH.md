@@ -1448,3 +1448,16 @@ CLOSED: the per-16 cost is intrinsic to u4x16 kernel execution (2x scale decode/
 32-value group in the tiled inner loop + 32B LDS footprint); zero contribution from
 dispatch, quantizer, or AR. Recovering it requires restructuring the scale-application
 math, not layout or launch changes. Traces: /root/w4a4-prof32/{gate1,gate3}/prof_kernel_trace.csv.
+
+### 49h. 49g refinement from the tuning agent's fresh profiles (no U4P8 aliasing; epilogue ALU is the cost)
+Fresh rocprofv3 traces (per-gate cwd, both gates captured cleanly) refine 49g on two points:
+1. NO ALIASING: gate3 dispatches its own <false,2,4,Q4_0,false,false,true> U4X16 instantiation
+   with quantize_mmq_q8_1_u4x16 - the "U4P8=true template" reading came from the stale Sep-25
+   results.csv. GEMM totals: gate1 2.719 s vs gate3 3.344 s (+23.0%), quantizer delta noise.
+2. COST LOCATION: same VGPR/SGPR, no spill, no occupancy difference between gates - the +23%
+   is the per-16 EPILOGUE ALU (2x {half2->float2 converts, sWs16 float2 loads, FMA chain} vs
+   gate1's single per-32 fold). 28B->32B padding confirmed irrelevant (fetch was never the
+   bottleneck; -20.5/-22.4/-22.6% across pp512/2048/4096, unchanged from 28B).
+Follow-up path if ever funded: pre-fold weight scale d into d4/m at prefetch (sWs16 extension)
+and/or fp32 scale storage - removes the delta ALU ops from the epilogue; layout changes are a
+dead end. Patched sources preserved at /root/w4a4-32b-patch/; tree reverted clean at 98d1d8b18.
