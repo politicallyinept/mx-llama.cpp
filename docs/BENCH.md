@@ -1395,3 +1395,28 @@ Upstream framing (unchanged): the multi-seq plane-offset fix (51a43756f) is the
 PR-ready piece; sections 47-49 are the supporting story (bug, diagnostic methodology,
 sub-block scale exploration with measured KLD/perf tradeoffs) if upstream wants the
 accuracy context.
+
+### 49e. Selective gating REFUTED + depth-table chunk-confound CORRECTED (2026-10-02, branch perf/w4a4-per16 98d1d8b18)
+
+Selective per-16 (GGML_W4A4_ONLY filter extended to the gate-3 u4x16 selection, commit
+98d1d8b18 - the phase-1 filter only covered gate-1 u4act): ffn-per16 retains 40.9% of
+gate3-full's KLD recovery at 75.1% of its pp cost; attn-per16 30.9% at 48.6%. Both strictly
+dominated by full per-16 (recoveries subadditive 71.7%, costs superadditive 123.7%, matching
+the 48a residual-stream superadditivity). SELECTIVE DIRECTION DROPPED; the filter extension
+stays as a debug/attribution tool. Gate wiring note: the phase-1 filter never covered gate-3.
+
+CHUNK-CONFOUND CORRECTION (agent-verified stock controls): the 7.0322 "c2048" values in
+47/49 were run at --chunks 8 (16k tokens) while the stock control and gate3 legs used
+--chunks 64 (131k tokens) - different test slices, invalid comparison. Matched-config remeasure:
+| depth leg (c2048 -b2048 -ub2048 -fa on, chunks 64) | PPL |
+|---|---|
+| stock Q4_0 | 7.4939 +- 0.0753 |
+| W4A4 gate1 | 7.7364 +- 0.0775 (remeasured this session) |
+| W4A4 gate3 per-16 | 7.4332 +- 0.0736 |
+
+CORRECTED depth story: at production depth gate3 is -0.06 BELOW stock (parity), gate1 is
++0.24 ABOVE (+3.2%). The 49d "gate3 hurts deep" conclusion was an artifact; per-16 is
+parity-or-better vs stock at BOTH depths while keeping the W4A4 prefill win (+6% single,
++21% TP over stock at pp2048 with AR). c512 stock re-confirmed 8.4570 +- 0.1217 (ref 8.4203,
+within CI). Effective summary: gate1 = +pp but +3.2% PPL at depth; gate3 = +pp, stock-parity
+accuracy at depth, +1.4% at shallow.
