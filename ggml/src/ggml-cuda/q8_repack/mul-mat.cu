@@ -603,6 +603,29 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         }
     } else {
         const int bn = 32;
+        // GGML_RP_KSPLIT: 1 = default slice count (4), 2/4/8 = explicit. K-splits
+        // the w32 GEMM along K when the batch is in the skinny winning regime
+        // (16 <= ne11 <= 64, standalone bench 2.1-3.0x, /root/w4-bench/bench4):
+        // grid.z slices write fp32 partials to a pool scratch, a fixed-order
+        // reduce kernel sums them into dst. Reorders fp32 accumulation vs the
+        // single pass (maxrel ~1e-5, see /root/ksplit-results.txt). Unset =
+        // stock single-pass, byte-identical. Q4_0 only, not the u4p8 variant.
+        static const int rp_ksplit_env = [] {
+            const char * e = getenv("GGML_RP_KSPLIT");
+            return e != nullptr ? atoi(e) : 0;
+        }();
+        const int ksplit_slices = rp_ksplit_env >= 2 ? rp_ksplit_env
+                                : (rp_ksplit_env == 1 ? 4 : 0);
+        bool ksplit = ksplit_slices > 0 && src0->type == GGML_TYPE_Q4_0 && !u4p8
+                   && ne11 >= 16 && ne11 <= 64
+                   && ne00 / 32 >= 4 * (int64_t) ksplit_slices;
+        ggml_cuda_pool_alloc<float> ksplit_part(ctx.pool());
+        if (ksplit) {
+            float * p = ksplit_part.try_alloc((size_t) ksplit_slices * ne11 * ne01);
+            if (p == nullptr) {
+                ksplit = false;   // scratch did not fit: stock single-pass
+            }
+        }
         const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
                         (ne11 + bn - 1) / bn, 1);
         switch (src0->type) {
@@ -622,9 +645,34 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
-                // G3: under the u4act gate, the dot8 u4-activation GEMM (w32).
-                // M4: under gate=2 (u4p8), the per-8 u4p dot8 GEMM (w32).
-                if (u4p8) {
+                // GGML_RP_KSPLIT: K-sliced w32 GEMM + fixed-order reduce.
+                if (ksplit) {
+                    float * const ypart = ksplit_part.get();
+                    const dim3 gk(grid.x, grid.y, (unsigned) ksplit_slices);
+#define RP_KSPLIT_LAUNCH(UT, KS) \
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, UT, false, KS> \
+                        <<<gk, dim3(32, nrl*2), 0, stream>>>( \
+                            w, xq, ypart, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, \
+                            nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01); \
+                    { const size_t plane = (size_t) ne11 * ne01; \
+                      mmq_gemm_repacked_ksplit_reduce<KS> \
+                          <<<(unsigned) ((plane + 255) / 256), 256, 0, stream>>>( \
+                              ypart, dst_d, (uint32_t) ne01, (uint32_t) ne11, dst_s1); }
+                    if (u4act) {
+                        switch (ksplit_slices) {
+                            case 2:  RP_KSPLIT_LAUNCH(true, 2)  break;
+                            case 8:  RP_KSPLIT_LAUNCH(true, 8)  break;
+                            default: RP_KSPLIT_LAUNCH(true, 4)  break;
+                        }
+                    } else {
+                        switch (ksplit_slices) {
+                            case 2:  RP_KSPLIT_LAUNCH(false, 2) break;
+                            case 8:  RP_KSPLIT_LAUNCH(false, 8) break;
+                            default: RP_KSPLIT_LAUNCH(false, 4) break;
+                        }
+                    }
+#undef RP_KSPLIT_LAUNCH
+                } else if (u4p8) {
                     mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, true><<<grid, dim3(32, nrl*2), 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
