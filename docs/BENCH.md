@@ -1461,3 +1461,23 @@ Fresh rocprofv3 traces (per-gate cwd, both gates captured cleanly) refine 49g on
 Follow-up path if ever funded: pre-fold weight scale d into d4/m at prefetch (sWs16 extension)
 and/or fp32 scale storage - removes the delta ALU ops from the epilogue; layout changes are a
 dead end. Patched sources preserved at /root/w4a4-32b-patch/; tree reverted clean at 98d1d8b18.
+
+## 50. gfx906 wave64 idiom comparison vs Strata (2026-10-04, branch bench/gfx906-idiom-compare 373c62d9e)
+
+Standalone microbenchmarks (/root/w4-bench/*.cu), interleaved A/B, 7 reps, median+spread,
+MI50. Full report: /root/w4-kernel-compare.md; branch has bench sources.
+
+| idiom | verdict | numbers |
+|---|---|---|
+| wavefront-per-row MMVQ butterfly (Strata) | PARITY - ours 4.6x faster at K=4096/rows=2048 (449 vs 97 GB/s: our repacked layout streams, their 18B interleaved stride caps ~145 GB/s); theirs wins 1.3x only at rows=128 launch-bound | PARITY |
+| dp4a(g^m,u)-dp4a(m,u) sign trick | N/A - Q4_0 repack has no sign nibble to mask; where both apply ours = 0.76x of the trick's ALU cost | N/A |
+| router top-k register argmax (one wavefront) | PARITY - our topk_moe 1.75x faster at E=128/256/512 k=10 (11.2 vs 19.6us) | PARITY |
+| skinny-GEMM K-split + reduce (Strata fused_gr.cu:969 observation) | PORT - at ne11=16-32 rows=1536: K-split 2.6-3.0x faster; 1.1-1.4x at 128 blocks; CAVEAT: K-split reduction reorders fp32 sums (maxrel up to 1.4 at ne11>=32 rows=1536, 1.0e-5 at 16) - numerics-changing, needs a determinism decision before wiring | PORT (conditional) |
+| v_perm_b32 IQ4 lookup | PARITY - identical 5-perm sequence both sides; __byte_perm confirmed 14-17x slower on this ROCm (avoid) | PARITY |
+
+Key positive: idiom 4 (K-split for narrow-token GEMMs) measured 2.6-3.0x at ne11=16-32 -
+the spec-decode verify-window and small-prefill-chunk regime. Env-gated port sketch in the
+report; numerics caveat must be resolved (fp32 sum reordering vs our byte-identical
+standard - possible middle ground: K-split only where a tolerance gate allows).
+Also confirmed: HIP 7.2 __shfl_*_sync static-asserts on 32-bit masks; our vendors/hip.h
+shim is required for these idioms (cost one false-alarm HW exception during bring-up).
