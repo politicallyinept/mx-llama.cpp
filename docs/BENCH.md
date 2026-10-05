@@ -1481,3 +1481,38 @@ report; numerics caveat must be resolved (fp32 sum reordering vs our byte-identi
 standard - possible middle ground: K-split only where a tolerance gate allows).
 Also confirmed: HIP 7.2 __shfl_*_sync static-asserts on 32-bit masks; our vendors/hip.h
 shim is required for these idioms (cost one false-alarm HW exception during bring-up).
+
+
+## 51. K-split GEMM + async PLE reader (2026-10-05, branches perf/w4a4-dot8-gfx906 44668c9c3, perf/ple-async 652b4c996)
+
+### 51a. K-split narrow-token GEMM (GGML_RP_KSPLIT=1, default OFF)
+grid.z K-slices + fixed-order reduce kernel; fires only for Q4_0 w32 path, 16<=ne11<=64;
+KSPLIT unset folds to stock at compile time.
+Numerics: q8_1-activation path bit-exact vs stock at all split factors/shapes. u4act path:
+the u4act kernel is itself approximate (stock-vs-fp64-ref maxrel up to 2.45e-02); K-split is
+error-neutral-to-positive vs that reference (one shape 10x closer). Model-level: gate-inert
+control pair bit-identical KLD 0.068316; gate-firing shape (ub32) KLD +0.0008 (+1.1%, inside
+the 0.1226 envelope); PPL c512 +0.09%, c2048 -fa +0.005%. DOT8=3+KSPLIT combo: no crash.
+Perf (llama-bench, interleaved, 2 reps x r3): pp512 +26.5%, pp2048 +22.4% at ub32; +8.3% at
+ub64; decode (ne11=1) parity by design. KSPLIT also cuts run spread 10-30x in fired cells.
+Verdict: SHIP as env-gated. Spec-decode verify windows (ne11 16-64) are the target regime.
+
+### 51b. Async PLE reader (Strata PleReader+DirectFile port, perf/ple-async 652b4c996)
+Prototype: GGML_PLE_ASYNC=1 swaps the PLE table pointer to a 5.9MB staging buffer; per-ubatch
+O_DIRECT prefetch + index remap (byte-identical by construction); mmap memcpy fallback.
+Bench (Kioxia NVMe, 1500 tokens, 16 rows/token): mmap warm-resident (prod) 2289.5us p50 vs
+dio-async with collect hidden behind 300us compute 303.1us p50 (7.5x), p95 ~305; + 1M-row
+cache 303.6us. Cold-mmap reference 4013us/token (confirms 44b). Reader byte-exact vs mmap:
+320,000 row checks, 0 fails.
+CAVEATS: (1) warm-resident mmap is 2.3us/token - async only pays when the table cannot stay
+page-cache-resident (our prod PREFAULT keeps it warm, so no immediate deploy); (2) a live
+mmap section on the same file serializes O_DIRECT reads - the loader must drop the mapping
+when the gate is on (ours does); (3) E2E model-level check pending a host GPU-stack recovery
+cycle (host power cycle needed; the wedge predates this work) - reader-level byte-exactness
+proven, graph-level integration gated but unexercised.
+Verdict: CONTINUE (scoped) - mechanism proven, port clean, ship later behind the env gate
+when a use case needs the table off a slow/resident-constrained disk.
+Files: /root/ple-port-analysis.txt (phase-A mapping: gather site qwen4exp.cpp:1465, row-index
+source llm_graph_input_ple::set_input qwen4exp.cpp:1241-1300, runs pre-graph at
+llama-context.cpp:1778), /root/ple-port-stage/correctness.sh (awaiting host recovery),
+prototype on perf/ple-async (11 files, +1141).
