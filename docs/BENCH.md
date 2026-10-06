@@ -1516,3 +1516,31 @@ Files: /root/ple-port-analysis.txt (phase-A mapping: gather site qwen4exp.cpp:14
 source llm_graph_input_ple::set_input qwen4exp.cpp:1241-1300, runs pre-graph at
 llama-context.cpp:1778), /root/ple-port-stage/correctness.sh (awaiting host recovery),
 prototype on perf/ple-async (11 files, +1141).
+
+## 52. Standard upstream-PR benchmark suite: first run on merged upstream (740299d37, 2026-10-06)
+
+New committed suite (/root/bench_suite.sh): one command produces every table a PR draft needs -
+pp/tg sweep x 3 quants x repack on/off, K-split on/off, PPL+KLD per quant vs bf16 base, greedy
+seal. Model: bartowski Qwen3.5-9B (bf16 + locally quantized Q4_0/Q4_K_M/Q8_0). Dataset:
+wikitext-2-raw test. Single GPU ROCm1, -t 16, -lm dio.
+
+### Results (build 740299d37, post-upstream-merge)
+Perf pp512 (t/s): Q4_0 939.9/937.6 (repack=1/0, +0.2% - NOT significant post-merge)
+Perf tg128 (t/s): Q4_0 80.87 vs 75.46 (repack=1/0, **+7.2%** - repack gain is tg-side)
+Q4_K_M repack: pp ~parity, tg 68.6 vs 68.6 (no repack path for Q4_K on this build)
+Q8_0 repack: pp ~parity, tg128 58.9 vs 59.1 (parity; Q8_0 takes stock path)
+K-split (ne11 16/32/64 pp): 365/490/553 vs 366/493/553 = PARITY at these shapes
+KLD mean: Q4_0 0.0687, Q4_K_M 0.0573, Q8_0 0.0012 (vs bf16; consistent with sec-46)
+Seal: PASS (verbose enumeration, primes 2-29 in order)
+
+### FINDING: repack gain is TG-SIDE ONLY on merged upstream
+Pre-merge (sec-46) showed pp512 +5.7% from repack; post-merge it is gone (+0.2%, noise).
+Upstream master's own changes (fused router, hc gates, etc.) appear to have absorbed the pp
+side. tg128 +7.2% remains - the PR-1 claim should be reworded from "+pp and +tg" to
+"+tg128 7% at zero pp cost, numerics-identical".
+
+### K-split PARITY note
+The 2.6-3x win from the standalone bench (bench4_skinny) does NOT appear at model level on
+these shapes - the standalone's synthetic narrow shape was not representative, or upstream
+master already improved small-batch GEMM. K-split stays env-gated OFF; re-test at true
+verify-window shapes (ne11 2-8) before further investment.
