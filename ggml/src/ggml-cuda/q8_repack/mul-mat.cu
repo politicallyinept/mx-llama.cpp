@@ -10,7 +10,7 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
         cudaStream_t stream, bool u4act = false, uint32_t dst_s1 = 0,
-        bool u4p8 = false);
+        bool u4p8 = false, bool u4x16 = false);
 template <ggml_type WT, bool U4ACT = false, bool U4P8 = false>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
@@ -54,12 +54,15 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     //   unset/0 = stock q8_1 activations
     //   1       = per-32 asymmetric u4 decode + GEMM (shipped; byte-identical)
     //   2       = decode per-32 (SAME as gate 1) + GEMM per-8 u4p
-    //   3       = BATCH-GATED: W4A4 (per-32, same kernel set as gate 1) only
-    //           when the activation tensor has multiple rows (src1->ne[1] > 1,
-    //           i.e. prefill/batch); single-token decode (ne[1] == 1) falls
-    //           back to the stock q8_1 repack path. Rationale: W4A4 is
-    //           ~+7% prefill but -5.4% decode on MoE models — the SUMW
-    //           recompute per block has no amortization at one token.
+    //   3       = Phase-2 per-16 (REDEFINITION of the old batch-gated value 3,
+    //           which was validated in BENCH.md §43 and is retired here):
+    //           decode per-32 u4 (SAME as gates 1/2) + GEMM per-16 u4x16.
+    //           Gate-2 semantics for dispatch: only the tiled GEMM path
+    //           changes; the narrow/decode paths keep the per-32 u4act kernels.
+    //           Rationale: channel-persistent activation outliers crush the
+    //           per-32 blocks (phase-1 diagnostic); per-16 sub-block scales
+    //           halve the scale-plane bandwidth of the per-8 u4p (gate 2)
+    //           while recovering most of its KLD gap closure.
     // The per-8 u4p DECODE branch (M3) stays compiled but NO gate selects it:
     // BENCH.md §36 rejected per-8 decode (-9.2% tg). `u4p` below is GEMM-only;
     // the narrow-batch decode sites use `u4act` under both gates 1 and 2.
@@ -68,9 +71,40 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         return e != nullptr ? atoi(e) : 0;
     }();
-    const bool u4act = (w4a4_dot8 == 1 || w4a4_dot8 == 2 || (w4a4_dot8 == 3 && ne11 > 1))
-        && src0->type == GGML_TYPE_Q4_0;
+    // DEBUG (perf/w4a4-attrib): GGML_W4A4_ONLY=attn|ffn restricts the u4act
+    // path to one tensor class, for KLD attribution (attn-linears vs FFN).
+    // 'attn' matches *attn* (attn_qkv/attn_o/attn_q/k/v/attn_gate), 'ffn'
+    // matches *ffn*; every other Q4_0 linear (ssm_*) stays on the stock path
+    // in both variants. Unset = no filter (shipped behavior).
+    static const int w4a4_only = [] {
+        const char * e = getenv("GGML_W4A4_ONLY");
+        if (e == nullptr) return 0;
+        if (strstr(e, "attn") != nullptr) return 1;
+        if (strstr(e, "ffn")  != nullptr) return 2;
+        return 0;
+    }();
+    // DEBUG (perf/w4a4-selective): tensor-class match for the filter.
+    auto w4a4_match = [&](const ggml_tensor * t) {
+        return !w4a4_only || strstr(t->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr;
+    };
+    // DEBUG (perf/w4a4-selective): under gates 1/2 the filter restricts WHICH
+    // tensors use the u4act path at all (phase-1 attribution vs stock). Under
+    // gate 3 the filter's meaning MOVES: it selects which tensors get per-16
+    // u4x16 GEMM activations; every Q4_0 tensor keeps the per-32 u4act base
+    // (non-matching tensors fall back to the u4act per-32 GEMM path), so the
+    // selective run is measured against gate1-full, not against stock.
+    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3)
+        && src0->type == GGML_TYPE_Q4_0)
+        && (w4a4_dot8 == 3 || w4a4_match(src0));
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
+    // Phase-2 gate 3: per-16 GEMM activations (gate-2 semantics: GEMM path
+    // only; the narrow/decode paths above keep the per-32 u4act kernels).
+    // DEBUG (perf/w4a4-selective): the GGML_W4A4_ONLY filter now gates this
+    // selection too. The dispatch is per-tensor (this whole function runs per
+    // mul_mat node, each with its own pool alloc), so a selective run mixes
+    // u4x16 and u4act pools across tensors with no cross-contamination; the
+    // plane-offset fix is per-call.
+    const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0);
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
@@ -111,7 +145,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                 // are a different layout and must not share those entries).
                 src1_u4_own.alloc((size_t) (ne13 * ne12 * ne11 * x_stride));
                 quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
-                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream, src0->name);
             } else {
                 src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10, ne10_padded,
                     s11, s12, s13, ne11, ne12, ne13,
@@ -234,7 +268,13 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // per token is identical (nkb_u4 = ne00/32) — only the element size
     // changes with the type, same mirror as every other layout swap here.
     ggml_cuda_pool_alloc<block_q8_1_u4p>   src1_u4p(ctx.pool());
+    // Phase-2 gate 3: per-16 u4x16 GEMM activations. ALLOC MATH: 28 B/block
+    // vs the u4p 32 B/block, BLOCK COUNT per token identical (nkb_u4).
+    ggml_cuda_pool_alloc<block_q8_1_u4x16> src1_u4x16(ctx.pool());
     auto try_workspace = [&]() {
+        if (u4x16) {
+            return (void *) src1_u4x16.try_alloc(ne13 * ne12 * chunk_ne11 * nkb_u4);
+        }
         if (u4p) {
             return (void *) src1_u4p.try_alloc(ne13 * ne12 * chunk_ne11 * nkb_u4);
         }
@@ -281,7 +321,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
     for (int64_t col = 0; col < ne11; col += chunk_ne11) {
         const int64_t iter_ne11 = std::min(chunk_ne11, ne11 - col);
-        if (u4p) {
+        if (u4x16) {
+            // Phase-2 gate 3: token-major u4x16 quantizer (same launcher args
+            // as the per-32/per-8 calls below; one 28 B block per (token, 32
+            // values), token-major ib = (z*ne1 + x)*nkb + k_block; ne0 = ne00,
+            // NOT ne10_padded — see the G3 alloc-math note above).
+            quantize_mmq_q8_1_u4x16_cuda((const float *) src1->data + col*s11, src1_u4x16.get(),
+                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream);
+        } else if (u4p) {
             // C1/B8 M4: token-major u4p quantizer (same launcher args as the
             // per-32 u4 GEMM call below — the u4p quantizer emits one 32 B
             // block per (token, 32 values) with the same token-major ib =
@@ -294,7 +341,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             // G3: token-major u4 quantizer (same launcher args as the narrow
             // path; the chunk offset rides s11 exactly like the stock call).
             quantize_mmq_q8_1_u4_cuda((const float *) src1->data + col*s11, src1_u4.get(),
-                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream);
+                ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream, src0->name);
         } else {
             quantize_mmq_q8_1_cuda((const float *) src1->data + col*s11, nullptr, src1_q8_1.get(),
                 src0->type, ne10, s11, s12, s13, ne10_padded, iter_ne11, ne12, ne13, stream);
@@ -311,7 +358,11 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             // (ne12 > 1): gate1 reads past the pool (illegal access), gate2
             // reads in-pool garbage (silent corruption, PPL ~300). ne12 == 1
             // has offset 0 and was always clean.
-            const block_q8_1 * xq = (u4p
+            const block_q8_1 * xq = (u4x16
+                    ? reinterpret_cast<const block_q8_1 *>(
+                        (const char *) src1_u4x16.get()
+                        + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4x16))
+                    : u4p
                     ? reinterpret_cast<const block_q8_1 *>(
                         (const char *) src1_u4p.get()
                         + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4p))
@@ -324,7 +375,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
                            + col*dst_s1;
             ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-                ne00, ne01, iter_ne11, stream, u4act && !u4p, dst_s1, u4p);
+                ne00, ne01, iter_ne11, stream, u4act && !u4p && !u4x16, dst_s1, u4p, u4x16);
         }
         }
     }
@@ -447,8 +498,21 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
-        cudaStream_t stream, bool u4act, uint32_t dst_s1, bool u4p8) {
+        cudaStream_t stream, bool u4act, uint32_t dst_s1, bool u4p8, bool u4x16) {
     if (ne11 == 1) {
+        if (u4x16) {
+            // Phase-2 gate 3 edge case: workspace pressure shrank a gate-3
+            // GEMM chunk to a single token. The pool holds u4x16 blocks, so
+            // route through the single-token u4x16 nc kernel (M3 shape,
+            // NCOLS=1) with xs = ne00/32 (quantizer invoked with ne0 = ne00).
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_0, false, false, true>
+                <<<grid, 64, 0, stream>>>(w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01,
+                    (uint32_t) (ne00 / 32),
+                    dst_s1);
+            return;
+        }
         if (u4p8) {
             // C1/B8 M4 edge case: workspace pressure shrank a gate-2 GEMM
             // chunk to a single token. The pool holds u4p blocks, so route
@@ -565,7 +629,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_0:
                 // G3: under the u4act gate, the dot8 u4-activation GEMM.
                 // M4: under gate=2 (u4p8), the per-8 u4p dot8 GEMM instead.
-                if (u4p8) {
+                if (u4x16) {
+                    mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0, false, false, true><<<grid, dim3(64, nrl), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                } else if (u4p8) {
                     mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0, false, true><<<grid, dim3(64, nrl), 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
@@ -646,11 +714,17 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_Q4_0:
                 // GGML_RP_KSPLIT: K-sliced w32 GEMM + fixed-order reduce.
+                // INTEGRATION (perf/w4a4-integrated): K-split now wraps the
+                // per-32 u4act AND the per-16 u4x16 read paths as well as the
+                // stock q8_1 path — the u4x16 activation read is token-major
+                // (xcol*n_sub + sb), so a K-slice reads its own contiguous slab
+                // of the pool and the sb_lo/sb_hi bounds do the rest. The per-8
+                // u4p variant stays excluded (unchanged from side A).
                 if (ksplit) {
                     float * const ypart = ksplit_part.get();
                     const dim3 gk(grid.x, grid.y, (unsigned) ksplit_slices);
-#define RP_KSPLIT_LAUNCH(UT, KS) \
-                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, UT, false, KS> \
+#define RP_KSPLIT_LAUNCH(UT, U16, KS) \
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, UT, false, U16, KS> \
                         <<<gk, dim3(32, nrl*2), 0, stream>>>( \
                             w, xq, ypart, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, \
                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01); \
@@ -658,20 +732,31 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                       mmq_gemm_repacked_ksplit_reduce<KS> \
                           <<<(unsigned) ((plane + 255) / 256), 256, 0, stream>>>( \
                               ypart, dst_d, (uint32_t) ne01, (uint32_t) ne11, dst_s1); }
-                    if (u4act) {
+                    if (u4x16) {
                         switch (ksplit_slices) {
-                            case 2:  RP_KSPLIT_LAUNCH(true, 2)  break;
-                            case 8:  RP_KSPLIT_LAUNCH(true, 8)  break;
-                            default: RP_KSPLIT_LAUNCH(true, 4)  break;
+                            case 2:  RP_KSPLIT_LAUNCH(false, true, 2)  break;
+                            case 8:  RP_KSPLIT_LAUNCH(false, true, 8)  break;
+                            default: RP_KSPLIT_LAUNCH(false, true, 4)  break;
+                        }
+                    } else if (u4act) {
+                        switch (ksplit_slices) {
+                            case 2:  RP_KSPLIT_LAUNCH(true, false, 2)  break;
+                            case 8:  RP_KSPLIT_LAUNCH(true, false, 8)  break;
+                            default: RP_KSPLIT_LAUNCH(true, false, 4)  break;
                         }
                     } else {
                         switch (ksplit_slices) {
-                            case 2:  RP_KSPLIT_LAUNCH(false, 2) break;
-                            case 8:  RP_KSPLIT_LAUNCH(false, 8) break;
-                            default: RP_KSPLIT_LAUNCH(false, 4) break;
+                            case 2:  RP_KSPLIT_LAUNCH(false, false, 2) break;
+                            case 8:  RP_KSPLIT_LAUNCH(false, false, 8) break;
+                            default: RP_KSPLIT_LAUNCH(false, false, 4) break;
                         }
                     }
 #undef RP_KSPLIT_LAUNCH
+                } else if (u4x16) {
+                    // G3: under the u4x16 gate, the dot8 per-16 GEMM (w32).
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, false, true><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 } else if (u4p8) {
                     mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, true><<<grid, dim3(32, nrl*2), 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
