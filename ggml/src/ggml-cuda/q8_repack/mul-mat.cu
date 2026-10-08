@@ -5,6 +5,7 @@
 #include "repack-kernels.cuh"
 #include "../quantize.cuh"
 #include "../mmq.cuh"
+#include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
 
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
@@ -93,10 +94,19 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // u4x16 GEMM activations; every Q4_0 tensor keeps the per-32 u4act base
     // (non-matching tensors fall back to the u4act per-32 GEMM path), so the
     // selective run is measured against gate1-full, not against stock.
+    // Lever 2 (GGML_CUDA_W4A4_SKIP): prefix-excluded tensors drop out of u4act
+    // entirely and run the stock q8_1 activation path (W4A8 semantics,
+    // bitwise-stock for those GEMMs). Applies under EVERY gate, including
+    // gate 3: an excluded tensor loses the per-16 u4x16 GEMM too (it is not a
+    // u4act tensor at all). ONLY applies first, then SKIP subtracts.
+    // Gate unset/empty: ggml_cuda_w4a4_skip() is a constant false (empty
+    // static vector), so gate-off dispatch is unchanged.
+    const bool w4a4_skip = ggml_cuda_w4a4_skip(src0->name);
     const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3)
         && src0->type == GGML_TYPE_Q4_0)
-        && (w4a4_dot8 == 3 || w4a4_match(src0));
-    const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0;
+        && (w4a4_dot8 == 3 || w4a4_match(src0))
+        && !w4a4_skip;
+    const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0 && !w4a4_skip;
     // Phase-2 gate 3: per-16 GEMM activations (gate-2 semantics: GEMM path
     // only; the narrow/decode paths above keep the per-32 u4act kernels).
     // DEBUG (perf/w4a4-selective): the GGML_W4A4_ONLY filter now gates this
@@ -104,7 +114,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // mul_mat node, each with its own pool alloc), so a selective run mixes
     // u4x16 and u4act pools across tensors with no cross-contamination; the
     // plane-offset fix is per-call.
-    const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0);
+    const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0) && !w4a4_skip;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The

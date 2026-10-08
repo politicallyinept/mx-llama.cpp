@@ -6,6 +6,7 @@
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../mmid.cuh"
+#include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
 
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
@@ -60,8 +61,10 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         return e != nullptr ? atoi(e) : 0;
     }();
+    // Lever 2 (GGML_CUDA_W4A4_SKIP): same prefix exclusion as the dense path.
     const bool u4act = (w4a4_dot8 && (w4a4_mode != 3 || n_tokens > 1))
-        && src0->type == GGML_TYPE_Q4_0;
+        && src0->type == GGML_TYPE_Q4_0
+        && !ggml_cuda_w4a4_skip(src0->name);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
