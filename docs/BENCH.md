@@ -1544,3 +1544,54 @@ The 2.6-3x win from the standalone bench (bench4_skinny) does NOT appear at mode
 these shapes - the standalone's synthetic narrow shape was not representative, or upstream
 master already improved small-batch GEMM. K-split stays env-gated OFF; re-test at true
 verify-window shapes (ne11 2-8) before further investment.
+
+## 54. Layer-selective W4A8: GGML_CUDA_W4A4_SKIP frontier (2026-10-08, branch perf/w4a4-skip-layers e32025786)
+
+Env `GGML_CUDA_W4A4_SKIP` = comma-separated tensor-NAME prefixes; any Q4_0 GEMM input whose
+name starts with a prefix is excluded from u4act entirely and runs the stock q8_1 activation
+path (bitwise-stock for those GEMMs - selection, zero new numerics). Unset/empty =
+bit-identical gate1 dispatch. Composes with GGML_W4A4_ONLY (ONLY applies first, SKIP
+subtracts); under gate 3 an excluded tensor also loses the per-16 u4x16 GEMM. Dense
+(q8_repack/mul-mat.cu) + MoE (mul-mat-id.cu) dispatch sites gated; static-once parse; one
+WARN audit line at startup lists the active prefix count (WARN not INFO: llama-perplexity
+default verbosity filters INFO). Helper scripts/w4a4_skip_expand.sh expands "4-18" ->
+blk.4.,...,blk.18. Build /root/build-skip; raw data /root/w4a4-skip/.
+
+PHASE-A SEALS (all PASS): (a) gate-off parity - SKIP unset chunks-32 PPL 12.5836 +- 0.36763
+== gate1 reference, identical across two runs, audit marker absent = gate provably inert;
+(b) mechanism proof - SKIP=late chunks-2 PPL 4.8276 vs gate-off chunks-2 5.2859: dispatch
+differs and sane (not ~1e5 garbage), marker present; (c) determinism - gate-on chunks-2 legs
+byte-identical PPL lines across reruns.
+
+PHASE-B FRONTIER (full-corpus wiki.test, KLD vs f16-c512-ch128 base; anchors: stock-repack
+floor KLD 0.0684 / pp512 938.8, gate1 0.12215 / 1249.75 / tg 82.54, per-16 0.090147 / 984 /
+82.56):
+
+| arm (SKIP set) | KLD | % gap closed (gate1->stock) | pp512 vs stock | tg128 | depth PPL (c2048 ch64) |
+|---|---|---|---|---|---|
+| SKIP-early L4-18 (15 prefixes) | 0.097917 +- 0.001819 | 45.1% | +14.4% (1073.65) | 79.62 | 7.6130 |
+| SKIP-late L19-31 (13 prefixes) | 0.103386 +- 0.002009 | 34.9% | +18.4% (1111.47) | 70.02 SUSPECT | 7.5888 |
+| SKIP-narrow27 (h32-sel set) | 0.116919 +- 0.002171 | 9.7% | +25.7% (1180.56) | 79.67 | 7.7019 |
+| full-skip L4-31 (bonus, ch32 shallow only) | - | - | - | - | shallow 7.2532 (<= per-16 ref 7.2774) |
+
+MECHANISM FINDING: coverage, not granularity. SKIP-narrow27 and h32-sel cover the IDENTICAL
+27-tensor outlier set; replacing those GEMMs with stock q8_1 recovers 9.7% of the
+gate1->stock KLD gap vs 6.0% for finer H32 WHT scales on the same tensors (16.3% vs 10.1%
+of the per-16 gap). Fixing the 27 by ANY mechanism recovers <=16% of the per-16 gap - the
+per-16 win is an all-tensor coverage effect, not a 27-tensor effect. Skipping ALL of L4-31
+approaches the stock floor (ch32 PPL 7.2532, direction only): quality scales with skipped
+coverage and skip is the cheapest mechanism (pure selection, no new numerics).
+
+EFFICIENCY (%gap closed per %pp cost vs gate1): SKIP-early 45.1/14.1 = 3.20 vs per-16
+59.5/21.3 = 2.80 - skip trades a lower ceiling for a better exchange rate.
+
+FLAGS: SKIP-late tg128 70.02 +- 2.13 (-15.2% vs gate1) is SUSPECT and UNCONFIRMED - early
+and narrow27 hold tg at -3.5%/-1.0% with equal or larger prefix counts; 13 prefixes should
+not cost 15% tg. Possible slot contention (ROCm0) or a real decode-path effect; not re-run.
+Late arm's accuracy legs are clean (marker present, seal deterministic).
+
+DISPOSITION: SKIP-early = ADOPT-CANDIDATE (best quality arm: KLD -19.8% vs gate1, shallow
+8.5739 / depth 7.6130 both improved, seal PASS primes 2-29, tg near parity) pending
+interleaved A/B vs gate1, matched dPPL vs stock, and 64k-context legs. Gate stays env-gated
+OFF by default; unset = bit-identical gate1. Raw: /root/w4a4-skip/phaseA-kernel.md,
+/root/w4a4-skip/phaseB/phaseB-leg{0,1,2}.{md,json}.
