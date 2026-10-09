@@ -1358,7 +1358,12 @@ scale pairs load as u32, never uint4.
 | greedy seal (-n 700) | primes exact | primes exact, coherent | - |
 
 KLD 0.1226 -> 0.0902 = 73.6% of the way to stock (0.0683); lands between the simulation
-prediction (~0.090 - dead on) and short of per-8's 0.0768 as designed. c512 PPL beats BOTH
+prediction (~0.090 - dead on) and short of per-8's 0.0768 as designed.
+**CORRECTION (2026-10-08, pre-reboot audit, unverified pending re-derivation): the recorded
+"73.6% of the gap" does NOT recompute from the recorded numbers above -
+(0.1226-0.0902)/(0.1226-0.0683) = 59.7%. Either the 73.6% came from different inputs or it
+is a transcription error. FLAGGED FOR RE-DERIVATION at next BENCH pass; until then treat the
+gap-closure as ~60%, not ~74%.** c512 PPL beats BOTH
 per-32 (9.52) and per-8 (9.05). Production-shape PPL is WORSE (7.03 -> 7.43) - at ub2048 the
 per-16 scale plane costs more than the outlier recovery gains at that depth; see 49b.
 
@@ -1544,6 +1549,15 @@ The 2.6-3x win from the standalone bench (bench4_skinny) does NOT appear at mode
 these shapes - the standalone's synthetic narrow shape was not representative, or upstream
 master already improved small-batch GEMM. K-split stays env-gated OFF; re-test at true
 verify-window shapes (ne11 2-8) before further investment.
+
+**SCOPE CORRECTION (2026-10-08, verified - kernel-level rocprofv3, traces
+/root/ppmax/ksplit_probe/, resolution /root/ppmax/ksplit-resolution.md): k-split positives
+hold ONLY on the stock q8_1 path (GGML_CUDA_W4A4_DOT8 unset). Under gate1-u4act (DOT8=1)
+k-split is NEGATIVE on both lineages (acf8ca295 and integrated): kernel -29.8%/call
+stock-path vs +13.2%/call gate1-path, measured 2026-10-08. The sign follows the activation
+gate, not the lineage - the u4act kernel is dp4a/ALU-bound so K-slicing does not shrink
+per-slice cost, and reduce + doubled dispatch make it net-worse. Keep GGML_RP_KSPLIT
+default-off; NEVER combine it with DOT8=1.**
 
 ## 54. Layer-selective W4A8: GGML_CUDA_W4A4_SKIP frontier (2026-10-08, branch perf/w4a4-skip-layers e32025786)
 
