@@ -54,15 +54,23 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // prefill/batch); single-token decode (n_tokens == 1) falls back to the
     // stock q8_1 repack path — W4A4 is ~+7% prefill but -5.4% decode on
     // MoE models because the SUMW recompute per block never amortizes at
-    // one token. Every other set value keeps the existing always-on bool
-    // semantics (modes 1/2 unchanged).
-    static const bool w4a4_dot8 = getenv("GGML_CUDA_W4A4_DOT8") != nullptr;
+    // one token. Modes 1/2 stay always-on.
+    //
+    // VALUE SEMANTICS MATCH THE DENSE GATE (q8_repack/mul-mat.cu): unset/0 = stock, 1/2 =
+    // always-on, 3 = batch-gated. This used to test `getenv(...) != nullptr`, so the
+    // documented OFF value GGML_CUDA_W4A4_DOT8=0 enabled this path (mode 0 passed both the
+    // "set at all" test and the `!= 3` test).
     static const int w4a4_mode = [] {
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
-        return e != nullptr ? atoi(e) : 0;
+        const int mode = e != nullptr ? atoi(e) : 0;
+        if (mode != 0) {
+            GGML_LOG_WARN("CUDA w4a4 (MoE): GGML_CUDA_W4A4_DOT8=%d gate ACTIVE (mode 3 = batch-gated, n_tokens>1)\n", mode);
+        }
+        return mode;
     }();
     // Lever 2 (GGML_CUDA_W4A4_SKIP): same prefix exclusion as the dense path.
-    const bool u4act = (w4a4_dot8 && (w4a4_mode != 3 || n_tokens > 1))
+    const bool u4act = ((w4a4_mode == 1 || w4a4_mode == 2 || w4a4_mode == 3)
+            && (w4a4_mode != 3 || n_tokens > 1))
         && src0->type == GGML_TYPE_Q4_0
         && !ggml_cuda_w4a4_skip(src0->name);
 
@@ -98,7 +106,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         block_q8_1 * src1_q8_1_d = nullptr;
         if (u4act) {
             // ALLOC MATH mirrors the dense milestone-3 wiring: block_q8_1_u4
-            // is 20 B vs block_q8_1's 32 B but the BLOCK COUNT is identical
+            // is 20 B vs block_q8_1's 36 B but the BLOCK COUNT is identical
             // (ne10_padded/32 per token column = x_stride), so xs keeps its
             // "blocks per token column" meaning and the kernels'
             // `ids_src1[a] * xs` / `c*xs + sb` indexing is unchanged.
@@ -681,11 +689,11 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                     w_gate, x_bias, gate_bias, fusion->glu_op);
                 break;
             case GGML_TYPE_Q4_0:
-                mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q4_0><<<grid_nc, 256, 0, stream>>>(
-                    w, src1_q8_1_d, (float *) dst->data, (uint32_t) ne00, (uint32_t) ne01,
-                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
-                    expert_stride, (uint32_t) x_stride, dst_s1,
-                    w_gate, x_bias, gate_bias, fusion->glu_op);
+                // Q4_0 is NOT in the MoE fusion admission set
+                // (ggml_cuda_repack_mmv_id_fusion_supported), so this arm is unreachable.
+                // Fail loud instead of dispatching: a fused Q4_0 step has no U4ACT variant
+                // and would read a 20 B block_q8_1_u4 pool through the q8_1 epilogue.
+                GGML_ABORT("Q4_0 is not admitted to the MoE fused repack path");
                 break;
             case GGML_TYPE_Q5_K:
                 mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q5_K><<<grid_nc, 256, 0, stream>>>(

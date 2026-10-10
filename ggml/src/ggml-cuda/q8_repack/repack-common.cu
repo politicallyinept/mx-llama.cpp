@@ -2,6 +2,7 @@
 // repack routine, and the persistent per-view cache shared by dense and MoE paths.
 #include "repack.cuh"
 #include "repack-common.cuh"
+#include "ggml-cuda.h"   // GGML_LOG_WARN for the gate-engagement markers
 
 #include <cstdlib>
 
@@ -19,7 +20,11 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // stock canonical-kernel path for Q4_0 exactly as before.
     static const bool s_q4_0 = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
-        return e != nullptr && atoi(e) != 0;
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0 gate ACTIVE: Q4_0 admitted to the gfx906 repack path\n");
+        }
+        return on;
     }();
     switch (t->type) {
         case GGML_TYPE_Q8_0:

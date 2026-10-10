@@ -70,7 +70,15 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // Gate=0/1 stay byte-identical to the shipped states.
     static const int w4a4_dot8 = [] {
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
-        return e != nullptr ? atoi(e) : 0;
+        const int mode = e != nullptr ? atoi(e) : 0;
+        if (mode != 0) {
+            GGML_LOG_WARN("CUDA w4a4: GGML_CUDA_W4A4_DOT8=%d gate ACTIVE (%s)\n", mode,
+                          mode == 1 ? "per-32 u4 activations" :
+                          mode == 2 ? "per-32 u4 decode + per-8 u4p GEMM" :
+                          mode == 3 ? "per-16 u4x16 GEMM (decode stays per-32 u4)" :
+                                      "unrecognised mode: no W4A4 dispatch");
+        }
+        return mode;
     }();
     // DEBUG (perf/w4a4-attrib): GGML_W4A4_ONLY=attn|ffn restricts the u4act
     // path to one tensor class, for KLD attribution (attn-linears vs FFN).
@@ -146,7 +154,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                 quantize_mmq_q8_1_u4p_cuda((const float *) src1->data, src1_u4p_own.get(),
                     ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
             } else if (u4act) {
-                // ALLOC MATH: block_q8_1_u4 is 20 B vs block_q8_1's 32 B, but
+                // ALLOC MATH: block_q8_1_u4 is 20 B vs block_q8_1's 36 B, but
                 // the BLOCK COUNT is identical (ne10_padded/32 per token row =
                 // x_stride), so xs keeps its "blocks per token column" meaning
                 // and the kernel's `c*xs + sb` indexing is unchanged -- only the
@@ -167,7 +175,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         for (int64_t i2 = 0; i2 < ne12; i2++) {
             // PLANE OFFSETS MUST BE COMPUTED IN THE POOL'S OWN ELEMENT SIZE.
             // The block COUNT per plane is identical under every layout, but
-            // the element SIZE is not: block_q8_1 is 34 B, block_q8_1_u4 is
+            // the element SIZE is not: block_q8_1 is 36 B, block_q8_1_u4 is
             // 20 B, block_q8_1_u4p is 32 B. Adding the plane offset in
             // block_q8_1 units to a u4/u4p pool mis-places every plane after
             // the first (ne12 > 1): garbage reads (NaN logits) or reads past
@@ -690,11 +698,20 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         // stock single-pass, byte-identical. Q4_0 only, not the u4p8 variant.
         static const int rp_ksplit_env = [] {
             const char * e = getenv("GGML_RP_KSPLIT");
-            return e != nullptr ? atoi(e) : 0;
+            const int n = e != nullptr ? atoi(e) : 0;
+            if (n != 0) {
+                GGML_LOG_WARN("CUDA repack: GGML_RP_KSPLIT=%d gate ACTIVE (K-sliced w32 GEMM at 16<=ne11<=64)\n", n);
+            }
+            return n;
         }();
         const int ksplit_slices = rp_ksplit_env >= 2 ? rp_ksplit_env
                                 : (rp_ksplit_env == 1 ? 4 : 0);
+        // K-split's measured positives are on the STOCK q8_1 activation path only: under gate1
+        // (u4act) it is NEGATIVE on both lineages, and the u4x16 combination is unmeasured.
+        // Restrict it to the stock path so the gate cannot silently engage a known-negative
+        // combination (BENCH 52a + the 2026-10-09 sign resolution).
         bool ksplit = ksplit_slices > 0 && src0->type == GGML_TYPE_Q4_0 && !u4p8
+                   && !u4act && !u4x16
                    && ne11 >= 16 && ne11 <= 64
                    && ne00 / 32 >= 4 * (int64_t) ksplit_slices;
         ggml_cuda_pool_alloc<float> ksplit_part(ctx.pool());
@@ -733,8 +750,8 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                 if (ksplit) {
                     float * const ypart = ksplit_part.get();
                     const dim3 gk(grid.x, grid.y, (unsigned) ksplit_slices);
-#define RP_KSPLIT_LAUNCH(UT, U16, KS) \
-                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, UT, false, U16, KS> \
+#define RP_KSPLIT_LAUNCH(KS) \
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, false, false, KS> \
                         <<<gk, dim3(32, nrl*2), 0, stream>>>( \
                             w, xq, ypart, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, \
                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01); \
@@ -742,24 +759,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                       mmq_gemm_repacked_ksplit_reduce<KS> \
                           <<<(unsigned) ((plane + 255) / 256), 256, 0, stream>>>( \
                               ypart, dst_d, (uint32_t) ne01, (uint32_t) ne11, dst_s1); }
-                    if (u4x16) {
-                        switch (ksplit_slices) {
-                            case 2:  RP_KSPLIT_LAUNCH(false, true, 2)  break;
-                            case 8:  RP_KSPLIT_LAUNCH(false, true, 8)  break;
-                            default: RP_KSPLIT_LAUNCH(false, true, 4)  break;
-                        }
-                    } else if (u4act) {
-                        switch (ksplit_slices) {
-                            case 2:  RP_KSPLIT_LAUNCH(true, false, 2)  break;
-                            case 8:  RP_KSPLIT_LAUNCH(true, false, 8)  break;
-                            default: RP_KSPLIT_LAUNCH(true, false, 4)  break;
-                        }
-                    } else {
-                        switch (ksplit_slices) {
-                            case 2:  RP_KSPLIT_LAUNCH(false, false, 2) break;
-                            case 8:  RP_KSPLIT_LAUNCH(false, false, 8) break;
-                            default: RP_KSPLIT_LAUNCH(false, false, 4) break;
-                        }
+                    // ksplit implies the stock q8_1 activation path (guarded above), so only
+                    // the stock w32 variant is ever launched here.
+                    switch (ksplit_slices) {
+                        case 2:  RP_KSPLIT_LAUNCH(2) break;
+                        case 8:  RP_KSPLIT_LAUNCH(8) break;
+                        default: RP_KSPLIT_LAUNCH(4) break;
                     }
 #undef RP_KSPLIT_LAUNCH
                 } else if (u4x16) {
