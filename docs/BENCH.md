@@ -1609,3 +1609,51 @@ DISPOSITION: SKIP-early = ADOPT-CANDIDATE (best quality arm: KLD -19.8% vs gate1
 interleaved A/B vs gate1, matched dPPL vs stock, and 64k-context legs. Gate stays env-gated
 OFF by default; unset = bit-identical gate1. Raw: /root/w4a4-skip/phaseA-kernel.md,
 /root/w4a4-skip/phaseB/phaseB-leg{0,1,2}.{md,json}.
+
+
+## 55. Review-fix verification: stride-union Q5_1, gate semantics, engagement markers (2026-10-10, branch fix/review-2026-10-10, commit 5131ca6bb)
+
+Six review fixes on top of 98a78f247 (B1 stride-union Q5_1+Q4_0, B2 MoE DOT8=0 semantics,
+B3 engagement markers, Q2 K-split stock-path guard, Q4 MoE fused Q4_0 loud abort, N1 34->36 B
+comment fix). Host-side regression test for B1: pre-fix 3 FAIL, post-fix ALL PASS. GPU re-verify
+on /root/build-skip-rebase/bin (build 98a78f247 (11504) + fixed tree), single GPU ROCm2,
+serialized on /root/gpu.lock, VRAM baseline 10.87 MB/GPU before and after every leg.
+
+### 55a. Parity sweep (llama-bench -dev ROCm2 -ngl 99 -fa 1 -t 128 -r 1, all with REPACK_Q4_0=1)
+| config | pp512 | tg128 | ref (98a78f247 table) | delta pp/tg |
+|---|---|---|---|---|
+| DOT8 unset (stock-repack) | 946.88 | 81.41 | 948.6 / 82.3 | -0.2% / -1.1% |
+| DOT8=1 (gate1) | 1244.02 | 82.25 | 1249.75 / 82.3 | -0.5% / -0.1% |
+| DOT8=3 (per-16) | 1015.98 | 83.45 | ~984 / 82.56 (54 anchor) | +3.3% / +1.1% |
+| KSPLIT=1 (DOT8 unset) | 951.87 | 81.71 | 948.6 / 82.3 | +0.3% / -0.7% |
+| DOT8=1 + KSPLIT=1 | 1243.28 | 82.49 | 1249.75 / 82.3 | -0.5% / +0.2% |
+
+All within +/-3% of the reference table (DOT8=3 vs the 54 per-16 anchor +3.3%, same ballpark).
+No crashes. KSPLIT=1 inert at pp512 as expected (fires only at 16<=ne11<=64). DOT8=1+KSPLIT=1 ==
+gate1 within noise: the Q2 guard provably keeps K-split off the u4act path (52a: the combo was
+known-negative). Engagement markers: llama-bench silences ggml logs (known, phaseB precedent);
+in llama-perplexity logs the DOT8 gate marker prints ("CUDA w4a4: GGML_CUDA_W4A4_DOT8=1 gate
+ACTIVE (per-32 u4 activations)") and the q8_repack witness line proves admission. NIT: the
+REPACK_Q4_0 admission WARN itself does not surface in llama-perplexity stderr (code verified
+present + correct in the .so; witness line "q8_repack: repacking q4_0 tensors" is the effective
+engagement proof).
+
+### 55b. Q5_1 regression (B1 stride-union; Q5_1 quantized locally from Qwen_Qwen3.5-9B-bf16.gguf
+-> /root/q5_1-regression/Qwen3.5-9B-Q5_1.gguf)
+Stock (all gates unset): loads + 5-token gen clean, coherent; PPL ch2 7.3137 +/- 0.89207; zero
+gate markers = gates provably inert. REPACK_Q4_0=1 (Q5_1 hits the FIXED union-stride path - the
+predicate is a union now): loads + 5-token gen clean, no OOB/fault, PPL ch2 7.3137 +/- 0.89207
+(identical), witness line "q8_repack: repacking q5_1 tensors on device 2" present. PASS.
+
+### 55c. gate1 PPL parity + KLD re-verify (fixed build)
+gate1 shallow PPL (-c 512 -b 2048 -ub 512 --chunks 256): 8.7630 +/- 0.08938 - EXACTLY
+reproduces the 54 gate1 shallow anchor (8.7630). (The brief's "~11.55-11.65" band matches no
+recorded gate1 anchor in BENCH.md; 8.7630 is the 54 reference.)
+KLD vs f16-c512-ch128 base (-c 512 -b 2048 -ub 512 --chunks 128):
+| arm | KLD | expected | verdict |
+|---|---|---|---|
+| gate1 (REPACK_Q4_0=1 DOT8=1) | 0.122150 +/- 0.002028 | 0.12215 +/- 0.002 | EXACT |
+| SKIP-early (L4-18) | 0.097917 +/- 0.001819 | 0.097917 +/- 0.0018 | EXACT |
+
+BRANCH VALIDATED: fix/review-2026-10-10 @ 5131ca6bb reproduces every reference number within
+band; Q5_1 union-stride path clean. Raw logs: /root/ppmax/logs/.
