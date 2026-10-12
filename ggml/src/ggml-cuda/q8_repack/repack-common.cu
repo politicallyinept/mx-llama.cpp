@@ -26,6 +26,20 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return on;
     }();
+    // Q4_1 admission is opt-in on the W4A4 gate: GGML_CUDA_W4A4_DOT8=4 admits
+    // Q4_1 to the repack pool AND selects the u4 (dp8a) decode. A Q4_1 tensor
+    // with the gate unset is NOT admitted at all (this returns false), so it
+    // never lands in repacked layout and silently runs a wrong fast path — the
+    // buffer falls back to the canonical stock path for it, byte-identical to
+    // pre-branch behavior.
+    static const bool s_q4_1 = [] {
+        const char * e = getenv("GGML_CUDA_W4A4_DOT8");
+        const bool on = e != nullptr && atoi(e) == 4;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_W4A4_DOT8=4 gate ACTIVE: Q4_1 admitted to the gfx906 repack path (u4 dp8a decode)\n");
+        }
+        return on;
+    }();
     switch (t->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
@@ -44,6 +58,13 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         case GGML_TYPE_Q5_1: {
             // 32-value blocks, multi-plane like the K-quants, so no view splice either
             return t->ne[0] % 32 == 0 && t->view_src == nullptr;
+        }
+        case GGML_TYPE_Q4_1: {
+            // Gated on GGML_CUDA_W4A4_DOT8=4 (s_q4_1 above). 32-value blocks,
+            // two-plane (nibble rows + half2 {d,m} plane) like Q5_1, so no view
+            // splice either. With the gate unset this returns false: the tensor
+            // is not repacked at all and runs the canonical stock path.
+            return s_q4_1 && t->ne[0] % 32 == 0 && t->view_src == nullptr;
         }
         default:             return false;
     }
@@ -317,6 +338,28 @@ void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0
     }
 }
 
+// Host repack of one Q4_1 matrix: the canonical nibble bytes (already in plane
+// order: byte i = value i | value (16+i) << 4, Q4_0's byte order) and the half2
+// {d, m} per 32-value block. Q5_1's converter minus the fifth-bit plane.
+void repack_q41_host(const block_q4_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_sub  = ne0 / 32;
+    const int64_t qs_str = repack_qs_row_stride(GGML_TYPE_Q4_1, ne0);
+    const size_t  doff   = (size_t) ne1 * qs_str;
+
+    memset(dst, 0, doff + (size_t) ne1 * n_sub * 4);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        const block_q4_1 * brow = blocks + row * n_sub;
+        for (int64_t sb = 0; sb < n_sub; sb++) {
+            const block_q4_1 * b = &brow[sb];
+            const size_t wi = (size_t) row * n_sub + sb;
+            memcpy(dst + (size_t) row * qs_str + (size_t) sb * 16, b->qs, 16);
+            memcpy(dst + doff + wi * 4, &b->dm, 4);
+        }
+    }
+}
+
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     switch (type) {
         case GGML_TYPE_Q8_0:
@@ -344,6 +387,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             break;
         case GGML_TYPE_Q5_1:
             repack_q51_host((const block_q5_1 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_1:
+            repack_q41_host((const block_q4_1 *) blocks, dst, ne0, ne1);
             break;
         default:
             GGML_ABORT("unsupported repack type");
@@ -379,7 +425,7 @@ const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base,
         cudaStream_t stream) {
     // the K-quant multi-plane layouts have no view splice: supports() refuses their views
-    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && base->type != GGML_TYPE_Q5_1 && "repack: multi-plane views are not spliced");
+    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && base->type != GGML_TYPE_Q5_1 && base->type != GGML_TYPE_Q4_1 && "repack: multi-plane views are not spliced");
     const int64_t ne0_v = view->ne[0];
     const int64_t ne1_v = view->ne[1];
     const int64_t ne2_v = view->ne[2];

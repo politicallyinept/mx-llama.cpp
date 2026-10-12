@@ -46,7 +46,9 @@ static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, c
     // (2 values per byte => qs row stride ne0/2). Keep this predicate in sync with
     // repack_gcn_nbytes(): the Q4_0 admission once REPLACED the Q5_1 entry here instead of
     // UNIONing it, which desynced this row stride from the allocation size for Q5_1.
-    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0) ? ne0 / 2 : ne0);
+    // Q4_1 (q41-u4-probe) is UNIONed in the same way: canonical nibble bytes are
+    // byte-order-identical to Q4_0's, so its qs row is ne0/2 like every other entry.
+    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) ? ne0 / 2 : ne0);
 }
 template <typename T>
 static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
@@ -85,13 +87,18 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // Q5_1: de-aliased nibble rows, a 4-byte fifth-bit plane and a half2 {d, m} plane per 32-value block: canonical 6 bpw.
         case GGML_TYPE_Q5_1:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 8);
+        // Q4_1 (q41-u4-probe): de-aliased nibble rows plus a half2 {d, m} plane per
+        // 32-value block (Q5_1's planes minus the fifth-bit plane): canonical 5 bpw,
+        // VRAM-neutral like the other nibble types.
+        case GGML_TYPE_Q4_1:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 4);
         default:             GGML_ABORT("unsupported repack type");
     }
 }
 
 // Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
 static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
-    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0) ? 16 : 32;
+    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) ? 16 : 32;
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
@@ -570,6 +577,65 @@ template <> struct rp_traits<GGML_TYPE_Q4_0> {
 #endif
 };
 
+// Q4_1 (q41-u4-probe): the 32-value affine block x = d*q + m with q an UNSIGNED
+// int4 nibble, one half2 {d, m} per block — Q5_1's layout minus the fifth-bit
+// plane (the canonical block_q4_1 keeps nibbles as byte i = value i | value
+// (16+i) << 4, exactly Q4_0's byte order, so the nibble plane is a copy).
+// Stock (q8_1-activation) decode uses the shipped affine epilogue
+// dlo*dx*idot - dhi*sx with scale2 = {d, -m} (the Q5_1 twin). The u4 (dp8a)
+// decode is NOT expressible through scale2: the weight nibbles are XOR-8'd to
+// two's complement at prefetch while the activation nibbles stay raw, so the
+// Q4_1 u4 epilogue carries BOTH cross terms — see the U4Q41 branches in
+// repack-kernels.cuh (derived literally from the shipped Q4_0 u4 branch and
+// the shipped Q4_K affine branch; sealed in math_seal_q41.cc).
+template <> struct rp_traits<GGML_TYPE_Q4_1> {
+    using slot_t = uint32_t;   // half2 {d, m} bits
+    static constexpr bool split_scales = false;
+    static constexpr bool affine       = true;
+    static constexpr bool raw_lds      = false;
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   doff;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_1, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5),
+              doff((size_t) ne1 * rs) {}
+    };
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint32_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        const uint4  pk = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        lo = make_uint4(pk.x & 0x0F0F0F0Fu, pk.y & 0x0F0F0F0Fu,
+                        pk.z & 0x0F0F0F0Fu, pk.w & 0x0F0F0F0Fu);
+        hi = make_uint4((pk.x >> 4) & 0x0F0F0F0Fu, (pk.y >> 4) & 0x0F0F0F0Fu,
+                        (pk.z >> 4) & 0x0F0F0F0Fu, (pk.w >> 4) & 0x0F0F0F0Fu);
+        d = *reinterpret_cast<const uint32_t *>(wbase + g.doff + ((size_t) wrow * g.n_sub + sb) * 4);
+    }
+    // dp8a path: raw packed nibble uint4 (byte-order-identical to canonical
+    // Q4_1 qs, same contract as rp_traits<Q4_0>::load_w_raw).
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint32_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = *reinterpret_cast<const uint32_t *>(wbase + g.doff + ((size_t) wrow * g.n_sub + sb) * 4);
+    }
+    static __device__ __forceinline__ float scale(const uint32_t slot) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2 *>(&slot));
+        return dm.x;
+    }
+    // {d, -m}: the stock affine epilogue does dlo*dx*idot - dhi*sum (Q5_1's form).
+    static __device__ __forceinline__ float2 scale2(const uint32_t slot) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2 *>(&slot));
+        return make_float2(dm.x, -dm.y);
+    }
+    // u4 (dp8a) path: the raw {d, m} pair (the u4 epilogue needs +m, not -m).
+    static __device__ __forceinline__ float2 dm(const uint32_t slot) {
+        return __half22float2(*reinterpret_cast<const half2 *>(&slot));
+    }
+#endif
+};
+
 template <> struct rp_traits<GGML_TYPE_Q6_K> {
     // Four planes: de-aliased packed lows [16 B/32], packed 2-bit highs [8 B/32], int8 scale pairs [2 B/32] (Q6_K scales are per 16 values) and f16 d per 256.
     // Values are pre-shifted, ((q6 - 32) << 2) as int8 (a shift and an XOR 0x80, gfx906 has no byte subtract), and the exact 0.25 is folded into the scale.
@@ -773,7 +839,10 @@ template <> struct rp_traits<GGML_TYPE_Q5_1> {
 };
 
 // One entry per supported repack type - generates the dispatch switches.
-#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q4_0)          X(GGML_TYPE_Q5_1)
+// Q4_1 is gated: it joins the pool only under GGML_CUDA_W4A4_DOT8=4 (see
+// ggml_cuda_repack_tensor_supported), same opt-in discipline as Q4_0's
+// GGML_CUDA_REPACK_Q4_0.
+#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q4_0)          X(GGML_TYPE_Q5_1)          X(GGML_TYPE_Q4_1)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_iq4nl_host(const block_iq4_nl * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
@@ -781,6 +850,7 @@ void repack_q6k_host(const block_q6_K * blocks, uint8_t * dst, const int64_t ne0
 void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_q5k_host(const block_q5_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q41_host(const block_q4_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 
 const uint8_t * repack_view_get_cached(
