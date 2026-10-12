@@ -1690,3 +1690,32 @@ g4 0.092895 - gate4 adds only +0.0017 over gate1 (4.5% of the Q4_0-u4 penalty), 
 greedy primes 2..29 EXACT; SKIP-under-gate4 runs Q4_1 tensors on the repacked STOCK kernel (rocprofv3
 witness, admission gate-aware); VRAM g0 vs g4 resident sample -4.75 MB (noise) = canonical 5 bpw neutral.
 Depth PPL c2048 ch64: g0 7.2473 -> g4 7.4194 (the Q4_0-u4 penalty dominates; superset dPPL on Q4_0 files 0.000).
+
+## 57. SKIP KLD transferred to the 27B: f16 3-GPU base, skip-layer recovery does NOT transfer (2026-10-12, build-merge 6c463aca8, /root/kld27b/)
+
+§54's skip-layer frontier (GGML_CUDA_W4A4_SKIP) was measured on the 9B with a single-GPU f16
+KLD base; the fleet A/B could only re-check the 27B by PPL (weaker instrument). This leg builds
+the missing KLD base: ggml-org Qwen3.8-27B-BF16.gguf (53.8 GB) -> llama-quantize BF16->F16
+passthrough (rc=0, 16.00 BPW) -> llama-perplexity --save-all-logits on 3 GPUs
+(-dev ROCm0,ROCm1,ROCm2 -sm tensor, c512 b2048 ub512 ch128, wiki.test.raw); base PPL
+6.8457 +- 0.09353, logits 16.2 GB. 54 GB weights + KV fit 3x32 GB tensor-split with no split
+tuning. KLD legs on Qwen3.8-27B-Q4_0 (2 GPUs, same chunk protocol, gate markers verified):
+
+| arm | Mean KLD vs f16 base | % gap closed (gate1->stock) | 9B §54 |
+|---|---|---|---|
+| gate1 (DOT8=1) | 0.062311 +- 0.000777 | anchor | 0.12215 |
+| gate1+skipE blk.4-18 | 0.058537 +- 0.000707 | **12.6%** | 45.1% |
+| gate1+skipL blk.19-31 | 0.057454 +- 0.000750 | **16.3%** | 34.9% |
+| stock repack floor | 0.032452 +- 0.000374 | anchor | 0.0684 |
+
+gate1->stock gap = 0.029859 on 27B vs 0.05375 on 9B: the gate costs ~44% less KLD on the 27B.
+Bonus §55-style: gate1 PPL ch256 fresh 6.9896 +- 0.06770 (ch128 refs: gate1 7.0916, stock
+6.9514) - depth closes ~73% of the ch128 gate1->stock PPL gap.
+
+FINDING: skip-layer recovery does NOT transfer at fixed layer ranges. Closure collapses
+45.1->12.6 (early) and 34.9->16.3 (late) and the early/late ordering INVERTS (9B early>late,
+27B late>early). The blk.4-18/19-31 ranges are tuned to the 9B's 48-layer outlier band; on
+65 layers they cover 23%/20% instead of 31%/27%, and the 27B's gate-damage mass sits later.
+PPL-based closure from the fleet A/B (skipE 15.5%, skipL 29.0%) agrees: low-teens, not 45%.
+DISPOSITION: do not ship skipE/skipL on the 27B on the strength of §54; re-derive any 27B skip
+list via per-layer KLD attribution on this f16 base. Raw: /root/kld27b/.
