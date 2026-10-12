@@ -1061,16 +1061,7 @@ static __device__ void mmq_gemm_repacked_impl(
                     const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
                     const float d4 = __half2float(b.d4);
                     const float ma = __half2float(b.m);
-                    // ISOLATION MEASUREMENT BUILD (q41-u4-probe, commit 1): the
-                    // Sigma_a staging COST (the 4-dp8a signed-nibble-sum chain)
-                    // is FORCED OUT — SA is a precomputed constant — while the
-                    // q1-plane stores and the inner-loop staged reads stay
-                    // byte-identical to the full variant. That isolates the
-                    // pure epilogue-instruction delta vs the Q4_0 U4ACT loop
-                    // (the go/no-go number vs the +22.9% U4X16 precedent) from
-                    // the per-(token,block) staging cost. Commit 2 restores the
-                    // act_sum_signed_u4(a) call.
-                    const float SA = 0.0f;
+                    const float SA = act_sum_signed_u4(a);
                     rp_x_sub out;
                     out.q0 = a;
                     out.q1 = make_uint4(
@@ -1296,7 +1287,7 @@ static __device__ void mmq_gemm_repacked_impl(
                 const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
                 const float d4 = __half2float(b.d4);
                 const float ma = __half2float(b.m);
-                const float SA = 0.0f;  // ISOLATION BUILD: see prefetch_x_checked
+                const float SA = act_sum_signed_u4(a);
                 rp_x_sub out;
                 out.q0 = a;
                 out.q1 = make_uint4(
