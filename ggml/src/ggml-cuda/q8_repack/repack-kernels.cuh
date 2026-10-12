@@ -87,6 +87,29 @@ static __device__ __forceinline__ uint32_t nib_sum_u4(const uint4 v) {
     return s;
 }
 
+// Q4_1 u4 (q41-u4-probe): SA = sum of the 32 TWO'S-COMPLEMENT nibbles of a raw
+// block_q8_1_u4 qs uint4 (the quantizer stores (q-8)&0xF, so the signed nibble
+// value is q-8 and SA = sum(q) - 256). NOTE nib_sum_u4(a) is NOT usable here: it
+// sums the stored codes UNSIGNED, which differs from the signed sum by 16 per
+// wrapped nibble (the milestone-3b corruption class — the weight side never hits
+// it because weight codes are excess-8 and never wrap). dp8a against an all-ones
+// operand sums the signed nibbles exactly: 4 VALU per (token, 32-block).
+// Cost note (the gate rests on this): SA is computed once per (token, 32-block)
+// at activation prefetch and reused across the tile's weight ROWS only — NOT the
+// same reuse class as the weight-sum tile (once per weight tile, all tokens).
+static __device__ __forceinline__ float act_sum_signed_u4(const uint4 a) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    int s = ggml_cuda_dp8a((int) a.x, 0x11111111, 0);
+    s = ggml_cuda_dp8a((int) a.y, 0x11111111, s);
+    s = ggml_cuda_dp8a((int) a.z, 0x11111111, s);
+    s = ggml_cuda_dp8a((int) a.w, 0x11111111, s);
+    return (float) s;
+#else
+    GGML_UNUSED(a);
+    return 0.0f;
+#endif
+}
+
 // Sum of the 8 raw excess-8 nibble codes in ONE 32-bit word (per-8 variant for
 // the u4p path: SW_k = nib_sum_word(raw_k) - 64, signed before any float cast).
 static __device__ __forceinline__ uint32_t nib_sum_word(const uint32_t x) {
@@ -469,7 +492,7 @@ static __global__ void mul_mat_vec_q8_0_repacked(
 // machinery. Q8_0 keeps its tuned bespoke kernel; every other type gets this
 // one for free, including the fused up/gate variant.
 template <ggml_type WT, int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64,
-          bool HAS_FUSION = false, bool U4ACT = false>
+          bool HAS_FUSION = false, bool U4ACT = false, bool U4Q41 = false>
 static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -489,6 +512,11 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     // the fused up/gate epilogue (the gate accumulator was never u4-ized).
     static_assert(!U4ACT || WT == GGML_TYPE_Q4_0, "U4ACT (dp8a) is only defined for Q4_0 weights");
     static_assert(!U4ACT || !HAS_FUSION, "U4ACT (dp8a) does not support the fused-FFN variant");
+    // Q4_1 u4 (q41-u4-probe): the dp8a variant for Q4_1 weights, same guards as
+    // U4ACT, mutually exclusive with it (one activation layout per kernel).
+    static_assert(!U4Q41 || WT == GGML_TYPE_Q4_1, "U4Q41 (dp8a) is only defined for Q4_1 weights");
+    static_assert(!U4Q41 || !HAS_FUSION, "U4Q41 (dp8a) does not support the fused-FFN variant");
+    static_assert(!(U4ACT && U4Q41), "U4ACT (Q4_0) and U4Q41 (Q4_1) are mutually exclusive");
 
     if constexpr (!HAS_FUSION) {
         GGML_UNUSED_VARS(wbase_gate, x_bias, gate_bias, glu_op);
@@ -506,7 +534,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
                 wbase_gate += e * expert_stride;
             }
         }
-        if constexpr (!U4ACT) {
+        if constexpr (!U4ACT && !U4Q41) {
             xq    += (size_t)(a % nchannels_y) * xs_id;
         }
         y     += (size_t) a * dst_s1;
@@ -527,7 +555,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
     // offset above is skipped under U4ACT; see the HAS_IDS block).
     [[maybe_unused]] const block_q8_1_u4 * xq4 =
         reinterpret_cast<const block_q8_1_u4 *>(xq);
-    if constexpr (U4ACT && HAS_IDS) {
+    if constexpr ((U4ACT || U4Q41) && HAS_IDS) {
         xq4 += (size_t)(blockIdx.y % nchannels_y) * xs_id;
     }
     float acc = 0.0f;
@@ -560,6 +588,44 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
             const float d4 = __half2float(xb4->d4);
             const float m  = __half2float(xb4->m);
             acc += d * (d4 * ((float) idot + 8.0f * sw) + m * sw);
+            continue;
+        }
+        if constexpr (U4Q41) {
+            // documented-algebra-twin: intentionally uninstantiated (no codegen);
+            // NOT dead — keep in sync with the instantiated path when the algebra
+            // changes. No launch site ever passes U4Q41=true to mul_mat_vec_rp
+            // (the Q4_1 u4 decode is served by mul_mat_vec_repacked_nc and the
+            // GEMM; this branch documents the same sealed algebra in mat-vec form).
+            // Q4_1 u4 (q41-u4-probe): derived LITERALLY from the U4ACT branch
+            // above (same weight XOR-8, same raw activation nibbles, same signed
+            // sw = nib_sum_u4(raw) - 256) plus the Q4_1 weight offset m_w. The
+            // weight block is w = d*q + m_w with q UNSIGNED: expanding through
+            // the two's-complement conventions of the branch above (w_tc nibble
+            // = q-8, activation nibble = qa-8, SA = signed activation nibble
+            // sum, sum(q) = sw + 256):
+            //   acc += d*( d4*(idot + 8*sw + 8*SA + 2048) + ma*(sw + 256) )
+            //        + m_w*( d4*(SA + 256) + 32*ma )
+            // (the sealed two-cross-term form; math_seal_q41.cc proves the
+            // one-cross-term short form FAILS — both cross terms are required).
+            // Dead rows: clamped wrow, finite terms discarded at the guarded
+            // write — same as the U4ACT branch above.
+            uint4 pk;
+            typename rp_traits<WT>::slot_t db;
+            rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pk, db);
+            const uint4 w_tc = make_uint4(pk.x ^ 0x88888888u, pk.y ^ 0x88888888u,
+                                        pk.z ^ 0x88888888u, pk.w ^ 0x88888888u);
+            const float2 dmw = rp_traits<WT>::dm(db);
+            const float  sw  = (float) ((int) nib_sum_u4(pk) - 256);
+            const block_q8_1_u4 * xb4 = xq4 + sb;
+            const uint32_t * q32 = reinterpret_cast<const uint32_t *>(xb4->qs);
+            const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+            const int idot = mmvq_dp8a_u4(w_tc, a);
+            const float d4 = __half2float(xb4->d4);
+            const float ma = __half2float(xb4->m);
+            const float SA = act_sum_signed_u4(a);
+            acc += dmw.x * (d4 * ((float) idot + 8.0f * sw + 8.0f * SA + 2048.0f)
+                          + ma * (sw + 256.0f))
+                 + dmw.y * (d4 * (SA + 256.0f) + 32.0f * ma);
             continue;
         }
         uint4 lo, hi;
@@ -644,7 +710,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 // read is token-major (xcol*n_sub + sb) so a K-slice reads its own contiguous
 // slab of the pool. Both can be active at once (gate 3 + GGML_RP_KSPLIT).
 template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
-          int KSPLIT = 1>
+          bool U4Q41 = false, int KSPLIT = 1>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -673,6 +739,15 @@ static __device__ void mmq_gemm_repacked_impl(
     static_assert(!U4X16 || !HAS_IDS, "U4X16 (dp8a per-16) GEMM is dense-only");
     static_assert(!(U4ACT && U4X16), "U4ACT (per-32) and U4X16 (per-16) are mutually exclusive");
     static_assert(!(U4P8 && U4X16), "U4P8 (per-8) and U4X16 (per-16) are mutually exclusive");
+    // Q4_1 u4 (q41-u4-probe, GGML_CUDA_W4A4_DOT8=4): the dp8a variant for Q4_1
+    // weights. Same guards as U4ACT (dense-only, one activation layout per
+    // kernel); K-split is never dispatched for Q4_1 (the ksplit predicate is
+    // Q4_0-only), asserted rather than left to the dispatcher.
+    static_assert(!U4Q41 || WT == GGML_TYPE_Q4_1, "U4Q41 (dp8a) is only defined for Q4_1 weights");
+    static_assert(!U4Q41 || !HAS_IDS, "U4Q41 (dp8a) GEMM is dense-only");
+    static_assert(!U4Q41 || KSPLIT == 1, "U4Q41 (dp8a) has no K-split variant");
+    static_assert(!(U4ACT && U4Q41) && !(U4P8 && U4Q41) && !(U4X16 && U4Q41),
+                  "U4Q41 is mutually exclusive with the other u4 activation variants");
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
@@ -736,7 +811,7 @@ static __device__ void mmq_gemm_repacked_impl(
     // unnamed variable and cannot be implicitly captured by the stage lambdas.
     union rp_w_planes {
         uint4 sW_hi[MMQ_RP_Q8_BM][MMQ_RP_Q8_BK];
-        float sWs[U4ACT ? MMQ_RP_Q8_BK : 1][U4ACT ? MMQ_RP_Q8_BM : 1];
+        float sWs[(U4ACT || U4Q41) ? MMQ_RP_Q8_BK : 1][(U4ACT || U4Q41) ? MMQ_RP_Q8_BM : 1];
         // C1/B8 M4: per-8 weight sums — FOUR SW_k per (row, slab), SW_k =
         // nib_sum_word(raw_k) - 64 (signed, exact in fp32, range [-64, 64]).
         // 4*4 B * BK * BM = 4096 B = exactly the sW_hi footprint, so the union
@@ -765,7 +840,16 @@ static __device__ void mmq_gemm_repacked_impl(
     // with room to spare).
     __shared__ float    sXd[(U4P8 || U4X16) ? 1 : BN][MMQ_RP_Q8_BK + 1];
     // Activation sums, affine types only (the [1] alternative keeps the LDS footprint of every other type unchanged).
+    // Under U4Q41 this tile carries ma8 = ma/8 (exact power-of-two scaling of the
+    // activation min; the epilogue's ma*(SW+256) folds to ma8*sw8 + 256*ma, both
+    // exact-scaled products, one rounding at the add).
     __shared__ float    sXs[(rp_traits<WT>::affine && !U4P8 && !U4X16) ? BN : 1][MMQ_RP_Q8_BK + 1];
+    // Under U4Q41 the three remaining staged activation scalars ride the DEAD
+    // q[lk][1] plane of sXq (zeroed and unread under U4ACT) as one float4
+    // {sa, sa8, ma256, -}: sa = d4*(SA+256) + 32*ma (the whole m_w multiplier),
+    // sa8 = 8*SA + 2048, ma256 = 256*ma. No new LDS: the static total stays at
+    // the stock 32768 B (the sWs[1][1] occupancy lesson), and the per-(r,n)
+    // handoff is ONE LDS.128.
     // G1 (W4A4 GEMM): per-weight-block two's-complement nibble sum
     // (sw = (int)nib_sum_u4(raw) - 256), computed at prefetch so compute_stage
     // stays dot-bound (see plan §2). Lives in the sW_hi/sWs union above (G2)
@@ -850,6 +934,15 @@ static __device__ void mmq_gemm_repacked_impl(
                     pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                          raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                     pw_s[i]  = (float) ((int) nib_sum_u4(raw) - 256);
+                } else if constexpr (U4Q41) {
+                    // Q4_1 u4: same raw XOR-8 + signed sw as U4ACT, staged
+                    // pre-scaled as sw8 = 8*sw (exact power-of-two scaling) so
+                    // the epilogue's 8*sw costs zero VALU in the inner loop.
+                    uint4 raw;
+                    rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, raw, pw_d[i]);
+                    pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
+                                         raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
+                    pw_s[i]  = 8.0f * (float) ((int) nib_sum_u4(raw) - 256);
                 } else if constexpr (U4P8) {
                     // C1/B8 M4: same raw XOR-8 staging as U4ACT, but the
                     // per-8 sums: SW_k = nib_sum_word(raw_k) - 64 per word
@@ -891,7 +984,7 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(0, 0, 0, 0);
                 pw_hi[i] = make_uint4(0, 0, 0, 0);
                 pw_d [i] = {};
-                if constexpr (U4ACT) {
+                if constexpr (U4ACT || U4Q41) {
                     pw_s[i] = 0.0f;
                 }
                 if constexpr (U4P8) {
@@ -934,6 +1027,60 @@ static __device__ void mmq_gemm_repacked_impl(
                     // epilogue d*(d4*(idot+8*sw) + m*sw) collapses to 0
                     // regardless of the weight term (same trick as the stock
                     // affine dead-column zeroing).
+                    px[i] = {};
+                    px_s[i] = 0.0f;
+                }
+            }
+            return;
+        }
+        if constexpr (U4Q41) {
+            // Q4_1 u4: same token-major block_q8_1_u4 pool as U4ACT, but the
+            // sealed Q4_1 epilogue needs FOUR staged activation scalars per
+            // (token, 32-block), derived here at prefetch (amortized across the
+            // tile's weight rows — NOT across tokens; see act_sum_signed_u4):
+            //   d4      -> out.d (sXd tile, as U4ACT)
+            //   sa  = d4*(SA+256) + 32*ma  -> q1.x  (the whole m_w multiplier)
+            //   sa8 = 8*SA + 2048          -> q1.y
+            //   ma256 = 256*ma             -> q1.z
+            //   ma8 = ma/8                 -> px_s (sXs tile)
+            // with SA = act_sum_signed_u4(qs) (4 dp8a + cvt). The q1 plane is
+            // dead under U4ACT (zeroed, unread), so riding it adds zero LDS.
+            GGML_UNUSED(x_grp);
+            const block_q8_1_u4 * __restrict__ xq_u4 =
+                reinterpret_cast<const block_q8_1_u4 *>(xq);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                const int e = t + i * NTHREADS;
+                if constexpr (X_EPT * NTHREADS != X_ELM) {
+                    if (e >= X_ELM) {
+                        break;
+                    }
+                }
+                const int      lr = e / MMQ_RP_Q8_BK;
+                const int      lk = e % MMQ_RP_Q8_BK;
+                const uint32_t sb = sb0 + lk;
+                const uint32_t xcol = tok0 + lr;
+                if (xcol < n_tok && sb < sb_hi) {
+                    const block_q8_1_u4 & b = xq_u4[xcol * n_sub + sb];
+                    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+                    const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+                    const float d4 = __half2float(b.d4);
+                    const float ma = __half2float(b.m);
+                    const float SA = act_sum_signed_u4(a);
+                    rp_x_sub out;
+                    out.q0 = a;
+                    out.q1 = make_uint4(
+                        __float_as_uint(d4 * (SA + 256.0f) + 32.0f * ma),  // sa
+                        __float_as_uint(8.0f * SA + 2048.0f),              // sa8
+                        __float_as_uint(256.0f * ma),                       // ma256
+                        0u);
+                    out.d = d4;
+                    px[i] = out;
+                    px_s[i] = 0.125f * ma;                                  // ma8
+                } else {
+                    // Dead token/slab: zero d4, all four staged scalars AND ma8
+                    // so the sealed epilogue collapses to 0 regardless of the
+                    // weight term (dead-column trick, U4ACT precedent).
                     px[i] = {};
                     px_s[i] = 0.0f;
                 }
@@ -1066,6 +1213,13 @@ static __device__ void mmq_gemm_repacked_impl(
                 pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
                                      raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
                 pw_s[i]  = (float) ((int) nib_sum_u4(raw) - 256);
+            } else if constexpr (U4Q41) {
+                // Q4_1 u4: same raw XOR-8 + sw8 = 8*sw as the checked path.
+                uint4 raw;
+                rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, raw, pw_d[i]);
+                pw_lo[i] = make_uint4(raw.x ^ 0x88888888u, raw.y ^ 0x88888888u,
+                                     raw.z ^ 0x88888888u, raw.w ^ 0x88888888u);
+                pw_s[i]  = 8.0f * (float) ((int) nib_sum_u4(raw) - 256);
             } else if constexpr (U4P8) {
                 // C1/B8 M4: same raw XOR-8 + per-8 SW_k as the checked path.
                 uint4 raw;
@@ -1116,6 +1270,39 @@ static __device__ void mmq_gemm_repacked_impl(
                 const int      lk = e % MMQ_RP_Q8_BK;
                 const uint32_t sb = sb0 + lk;
                 px[i] = rp_x_sub_u4_from_blocks(xq_u4, (tok0 + lr) * n_sub + sb, px_s[i]);
+            }
+            return;
+        }
+        if constexpr (U4Q41) {
+            // Q4_1 u4: same staged fetch as prefetch_x_checked, unchecked.
+            GGML_UNUSED(x_grp);
+            const block_q8_1_u4 * __restrict__ xq_u4 =
+                reinterpret_cast<const block_q8_1_u4 *>(xq);
+#pragma unroll
+            for (int i = 0; i < X_EPT; i++) {
+                const int e = t + i * NTHREADS;
+                if constexpr (X_EPT * NTHREADS != X_ELM) {
+                    if (e >= X_ELM) break;
+                }
+                const int      lr = e / MMQ_RP_Q8_BK;
+                const int      lk = e % MMQ_RP_Q8_BK;
+                const uint32_t sb = sb0 + lk;
+                const block_q8_1_u4 & b = xq_u4[(tok0 + lr) * n_sub + sb];
+                const uint32_t * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+                const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+                const float d4 = __half2float(b.d4);
+                const float ma = __half2float(b.m);
+                const float SA = act_sum_signed_u4(a);
+                rp_x_sub out;
+                out.q0 = a;
+                out.q1 = make_uint4(
+                    __float_as_uint(d4 * (SA + 256.0f) + 32.0f * ma),
+                    __float_as_uint(8.0f * SA + 2048.0f),
+                    __float_as_uint(256.0f * ma),
+                    0u);
+                out.d = d4;
+                px[i] = out;
+                px_s[i] = 0.125f * ma;
             }
             return;
         }
@@ -1188,7 +1375,7 @@ static __device__ void mmq_gemm_repacked_impl(
             }
             const int lr = e / MMQ_RP_Q8_BK;
             const int lk = e % MMQ_RP_Q8_BK;
-            if constexpr (U4ACT) {
+            if constexpr (U4ACT || U4Q41) {
                 // G1 (W4A4 GEMM): weight side is the raw block XOR-8'd at
                 // prefetch (two's-complement nibbles) — one uint4, no lo/hi
                 // split, sW_hi stays unused. sw rides sWs for the epilogue.
@@ -1306,6 +1493,58 @@ static __device__ void mmq_gemm_repacked_impl(
                             const float mu = sXs[xcol][kk];
                             const int idot = mmvq_dp8a_u4(w_c, a);
                             acc[r][n] += d * (d4 * ((float) idot + 8.0f * sw) + mu * sw);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if constexpr (U4Q41) {
+            // Q4_1 u4 (q41-u4-probe): the sealed two-cross-term dot loop, GEMM
+            // twin of the mul_mat_vec_rp U4Q41 branch. Per slab kk, per weight
+            // row r, per token col n:
+            //   acc += d*( d4*(idot + sw8 + sa8) + ma8*sw8 + ma256 ) + m_w*sa
+            // which is the sealed form
+            //   acc += d*( d4*(idot + 8*SW + 8*SA + 2048) + ma*(SW + 256) )
+            //        + m_w*( d4*(SA + 256) + 32*ma )
+            // with every staging pre-scaled by an EXACT power of two (sw8 = 8*SW
+            // at weight prefetch; sa8 = 8*SA + 2048, sa = d4*(SA+256) + 32*ma,
+            // ma256 = 256*ma at activation prefetch; ma8 = ma/8 in sXs), so the
+            // per-(r,n) delta vs the Q4_0 U4ACT epilogue is ~+2 VALU and ONE
+            // extra LDS.128 (the q1 float4 {sa, sa8, ma256, -} — the plane U4ACT
+            // leaves dead). d/m_w come from the half2 slot (dmw), zeroed for dead
+            // rows at prefetch -> zeroes the whole term; dead columns zero d4,
+            // sa, sa8, ma256 and ma8 -> the term collapses to 0 as well.
+            for (int kk = 0; kk < MMQ_RP_Q8_BK; kk++) {
+                const int row_base = ty * NROW;
+                uint4 w = sW_lo[row_base][kk];
+                const uint4 * dp16 = reinterpret_cast<const uint4 *>(&sWdh[kk][row_base]);
+#pragma unroll
+                for (int g = 0; g < NROW; g += SPW) {
+                    const uint4 dh4 = dp16[g / SPW];
+                    const slot_t * dh = reinterpret_cast<const slot_t *>(&dh4);
+#pragma unroll
+                    for (int rr = 0; rr < SPW; rr++) {
+                        const int r = g + rr;
+                        const uint4 w_c = w;
+                        if (r + 1 < NROW) {
+                            w = sW_lo[row_base + r + 1][kk];
+                        }
+                        const float2 dmw = rp_traits<WT>::dm(dh[rr]);
+                        const float sw8 = sWs[kk][row_base + r];
+#pragma unroll
+                        for (int n = 0; n < TN_; n++) {
+                            // Activation operands read straight from LDS inside
+                            // the n loop (the U4ACT spill lesson).
+                            const int xcol = sxc0 + n * CW;
+                            const uint4 a  = sXq[xcol].q[kk][0];
+                            const float4 s4 = *reinterpret_cast<const float4 *>(&sXq[xcol].q[kk][1]);
+                            const float d4  = sXd[xcol][kk];
+                            const float ma8 = sXs[xcol][kk];
+                            const int idot = mmvq_dp8a_u4(w_c, a);
+                            acc[r][n] += dmw.x * (d4 * ((float) idot + sw8 + s4.y)
+                                                + ma8 * sw8 + s4.z)
+                                       + dmw.y * s4.x;
                         }
                     }
                 }
@@ -1627,7 +1866,8 @@ static __device__ void mmq_gemm_repacked_impl(
 // were already threaded; they were not -- done here). Default false keeps the
 // stock instantiation byte-identical.
 // M4: U4P8 threaded the same way (default false = byte-identical stock).
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false>
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
+          bool U4Q41 = false>
 static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1637,7 +1877,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT, U4P8, U4X16>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
@@ -1656,7 +1896,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
 // path and the MoE ids path keep their existing kernels.
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, bool HAS_FUSION = false,
           int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false,
-          bool U4P8 = false, bool U4X16 = false>
+          bool U4P8 = false, bool U4X16 = false, bool U4Q41 = false>
 static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1678,6 +1918,11 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
     static_assert(!U4X16 || !HAS_FUSION, "U4X16 (dp8a per-16) does not support the fused-FFN variant");
     static_assert(!(U4ACT && U4X16), "U4ACT (per-32) and U4X16 (per-16) are mutually exclusive");
     static_assert(!(U4P8 && U4X16), "U4P8 (per-8) and U4X16 (per-16) are mutually exclusive");
+    // Q4_1 u4 (q41-u4-probe): same guards as U4ACT, mutually exclusive with all.
+    static_assert(!U4Q41 || WT == GGML_TYPE_Q4_1, "U4Q41 (dp8a) is only defined for Q4_1 weights");
+    static_assert(!U4Q41 || !HAS_FUSION, "U4Q41 (dp8a) does not support the fused-FFN variant");
+    static_assert(!(U4ACT && U4Q41) && !(U4P8 && U4Q41) && !(U4X16 && U4Q41),
+                  "U4Q41 is mutually exclusive with the other u4 activation variants");
     // LANES is the number of lanes cooperating on ONE row. It is the geometry
     // knob that matters here: the strided loop runs n_blocks/LANES iterations
     // and is then followed by a log2(LANES)-step DPP reduction, so a wide lane
@@ -1773,6 +2018,45 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
                     const float d4 = __half2float(xb4->d4);
                     const float m  = __half2float(xb4->m);
                     acc[r][c] += d * (d4 * ((float) idot + 8.0f * sw) + m * sw);
+                }
+            }
+            continue;
+        }
+        if constexpr (U4Q41) {
+            // Q4_1 u4 (q41-u4-probe): the sealed two-cross-term decode, twin of
+            // the mul_mat_vec_rp U4Q41 branch (same conventions: weight XOR-8,
+            // raw activation nibbles, signed sw/SA):
+            //   acc += d*( d4*(idot + 8*sw + 8*SA + 2048) + ma*(sw + 256) )
+            //        + m_w*( d4*(SA + 256) + 32*ma )
+            // SA is recomputed per (r, c) here — the shipped U4ACT branch
+            // re-reads the activation block per row for the same register-pressure
+            // reason (L1 re-read beats holding NCOLS blocks live); the GEMM
+            // stages it once per (token, block) instead.
+            // Dead rows: zero the scale slot (rp_slot_keep) — d == 0 AND m_w == 0
+            // zero the whole term (the offset term needs BOTH halves of the slot
+            // zeroed, which rp_slot_keep<uint32> does).
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                uint4 pk;
+                typename rp_traits<WT>::slot_t db;
+                rp_traits<WT>::load_w_raw(wbase, wg, wrows[r], sb, pk, db);
+                const uint4 w_tc = make_uint4(pk.x ^ 0x88888888u, pk.y ^ 0x88888888u,
+                                            pk.z ^ 0x88888888u, pk.w ^ 0x88888888u);
+                const float2 dmw = rp_traits<WT>::dm(rp_slot_keep(db, rvalid[r]));
+                const float  sw  = (float) ((int) nib_sum_u4(pk) - 256);
+#pragma unroll
+                for (int c = 0; c < NCOLS; ++c) {
+                    const block_q8_1_u4 * xb4 =
+                        reinterpret_cast<const block_q8_1_u4 *>(xq) + (size_t) c * xs + sb;
+                    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(xb4->qs);
+                    const uint4 a = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+                    const int idot = mmvq_dp8a_u4(w_tc, a);
+                    const float d4 = __half2float(xb4->d4);
+                    const float ma = __half2float(xb4->m);
+                    const float SA = act_sum_signed_u4(a);
+                    acc[r][c] += dmw.x * (d4 * ((float) idot + 8.0f * sw + 8.0f * SA + 2048.0f)
+                                        + ma * (sw + 256.0f))
+                               + dmw.y * (d4 * (SA + 256.0f) + 32.0f * ma);
                 }
             }
             continue;
@@ -1965,12 +2249,12 @@ static __device__ __forceinline__ void mul_mat_vec_repacked_nc_impl(
 }
 
 template <int ROWS, int NWAVES, int NCOLS, int RPL = 1, int LANES = 64, ggml_type WT = GGML_TYPE_Q8_0,
-          bool U4ACT = false, bool U4P8 = false, bool U4X16 = false>
+          bool U4ACT = false, bool U4P8 = false, bool U4X16 = false, bool U4Q41 = false>
 static __global__ void mul_mat_vec_repacked_nc(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys) {
-    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT, U4ACT, U4P8, U4X16>(
+    mul_mat_vec_repacked_nc_impl<ROWS, NWAVES, NCOLS, RPL, false, LANES, WT, U4ACT, U4P8, U4X16, U4Q41>(
         wbase, xq, y, ne0, ne1, xs, ys, nullptr, nullptr, nullptr,
         GGML_GLU_OP_REGLU, 0);
 }
@@ -2061,7 +2345,7 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 }
 
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
-          int KSPLIT = 1>
+          bool U4Q41 = false, int KSPLIT = 1>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -2071,7 +2355,7 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT, U4P8, U4X16, KSPLIT>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41, KSPLIT>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else

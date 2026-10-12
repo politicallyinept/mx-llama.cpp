@@ -11,8 +11,8 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, int64_t ne00, int64_t ne01, int64_t ne11,
         cudaStream_t stream, bool u4act = false, uint32_t dst_s1 = 0,
-        bool u4p8 = false, bool u4x16 = false);
-template <ggml_type WT, bool U4ACT = false, bool U4P8 = false>
+        bool u4p8 = false, bool u4x16 = false, bool u4q41 = false);
+template <ggml_type WT, bool U4ACT = false, bool U4P8 = false, bool U4Q41 = false>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
@@ -51,7 +51,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // kernels. Function-local static, fork pattern (mirrors GGML_RP_GENERIC_MMV
     // in the slice dispatch below). Unset gate = stock q8_1-activation path:
     // every u4 branch is inside `if (u4act)`, so gate-off behavior is unchanged.
-    // C1/B8 M4 GATE REDEFINITION (three-valued, read with atoi):
+    // C1/B8 M4 GATE REDEFINITION (read with atoi):
     //   unset/0 = stock q8_1 activations
     //   1       = per-32 asymmetric u4 decode + GEMM (shipped; byte-identical)
     //   2       = decode per-32 (SAME as gate 1) + GEMM per-8 u4p
@@ -64,6 +64,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     //           per-32 blocks (phase-1 diagnostic); per-16 sub-block scales
     //           halve the scale-plane bandwidth of the per-8 u4p (gate 2)
     //           while recovering most of its KLD gap closure.
+    //   4       = SUPERSET of gate 1: per-32 u4 on Q4_0 weights (identical to
+    //           gate 1, same u4act predicates below) PLUS the Q4_1 u4 (dp8a)
+    //           path on Q4_1 weights. A Q4_1-only file is a degenerate case:
+    //           real Q4_1-heavy files are ~97.6% Q4_0 with a small ffn_down
+    //           Q4_1 guard band (~2.4%), so gate 4 must carry the Q4_0 u4 path
+    //           too or the overwhelming majority of MACs would run stock.
+    //           Modes 2/3 semantics stay EXCLUSIVE: u4p (per-8 GEMM) and
+    //           u4x16 (per-16 GEMM) never engage at mode 4.
     // The per-8 u4p DECODE branch (M3) stays compiled but NO gate selects it:
     // BENCH.md §36 rejected per-8 decode (-9.2% tg). `u4p` below is GEMM-only;
     // the narrow-batch decode sites use `u4act` under both gates 1 and 2.
@@ -76,6 +84,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                           mode == 1 ? "per-32 u4 activations" :
                           mode == 2 ? "per-32 u4 decode + per-8 u4p GEMM" :
                           mode == 3 ? "per-16 u4x16 GEMM (decode stays per-32 u4)" :
+                          mode == 4 ? "SUPERSET of gate 1: per-32 u4 on Q4_0 + Q4_1 u4 (dp8a) on Q4_1 (repack admission + u4 decode)" :
                                       "unrecognised mode: no W4A4 dispatch");
         }
         return mode;
@@ -96,7 +105,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     auto w4a4_match = [&](const ggml_tensor * t) {
         return !w4a4_only || strstr(t->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr;
     };
-    // DEBUG (perf/w4a4-selective): under gates 1/2 the filter restricts WHICH
+    // DEBUG (perf/w4a4-selective): under gates 1/2/4 the filter restricts WHICH
     // tensors use the u4act path at all (phase-1 attribution vs stock). Under
     // gate 3 the filter's meaning MOVES: it selects which tensors get per-16
     // u4x16 GEMM activations; every Q4_0 tensor keeps the per-32 u4act base
@@ -110,10 +119,18 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // Gate unset/empty: ggml_cuda_w4a4_skip() is a constant false (empty
     // static vector), so gate-off dispatch is unchanged.
     const bool w4a4_skip = ggml_cuda_w4a4_skip(src0->name);
-    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3)
+    // Gate 4 is a SUPERSET of gate 1 for Q4_0: the per-32 u4act path fires at
+    // modes 1/2/3/4 (the GGML_W4A4_ONLY filter keeps its gate-1 meaning at
+    // mode 4 — only mode 3 moves the filter to the u4x16 selection). The Q4_1
+    // half of gate 4 is the u4q41 predicate below; the two are disjoint by the
+    // src0->type test (Q4_0 vs Q4_1), so no tensor ever takes both paths.
+    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3 || w4a4_dot8 == 4)
         && src0->type == GGML_TYPE_Q4_0)
         && (w4a4_dot8 == 3 || w4a4_match(src0))
         && !w4a4_skip;
+    // Mode semantics are EXCLUSIVE here: per-8 u4p is gate-2-only, per-16
+    // u4x16 is gate-3-only — neither may fire at mode 4 (gate 4 = gate-1
+    // per-32 Q4_0 semantics + Q4_1 u4).
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0 && !w4a4_skip;
     // Phase-2 gate 3: per-16 GEMM activations (gate-2 semantics: GEMM path
     // only; the narrow/decode paths above keep the per-32 u4act kernels).
@@ -123,6 +140,16 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // u4x16 and u4act pools across tensors with no cross-contamination; the
     // plane-offset fix is per-call.
     const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0) && !w4a4_skip;
+    // Q4_1 u4 (q41-u4-probe): DOT8=4 selects the Q4_1 dp8a path on Q4_1 weights
+    // (gate 4 is a SUPERSET: the Q4_0 half is the u4act per-32 path above, so a
+    // mostly-Q4_0 file with a Q4_1 guard band gets u4 on BOTH classes).
+    // The SAME env value drives the repack admission (ggml_cuda_repack_tensor_supported
+    // admits Q4_1 only at DOT8=4), so admission and decode can never disagree: a
+    // Q4_1 tensor either runs the repack fast path (gate on) or is not repacked at
+    // all and runs the canonical stock path (gate off) — never repacked-but-stock-decoded.
+    // A skipped tensor (GGML_CUDA_W4A4_SKIP) under gate 4 runs the REPACKED STOCK
+    // path (q8_1 activations, affine epilogue) — same semantics as SKIP under gates 1-3.
+    const bool u4q41 = w4a4_dot8 == 4 && src0->type == GGML_TYPE_Q4_1 && !w4a4_skip;
 
     if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
@@ -153,7 +180,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                 src1_u4p_own.alloc((size_t) (ne13 * ne12 * ne11 * x_stride));
                 quantize_mmq_q8_1_u4p_cuda((const float *) src1->data, src1_u4p_own.get(),
                     ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-            } else if (u4act) {
+            } else if (u4act || u4q41) {
                 // ALLOC MATH: block_q8_1_u4 is 20 B vs block_q8_1's 36 B, but
                 // the BLOCK COUNT is identical (ne10_padded/32 per token row =
                 // x_stride), so xs keeps its "blocks per token column" meaning
@@ -185,7 +212,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                     ? reinterpret_cast<const block_q8_1 *>(
                         (const char *) src1_u4p_own.get()
                         + (size_t) (i3 * ne12 + i2) * ne11 * x_stride * sizeof(block_q8_1_u4p))
-                    : u4act
+                    : (u4act || u4q41)
                     ? reinterpret_cast<const block_q8_1 *>(
                         (const char *) src1_u4_own.get()
                         + (size_t) (i3 * ne12 + i2) * ne11 * x_stride * sizeof(block_q8_1_u4))
@@ -205,6 +232,12 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                     // single-token kernels stay for every other weight type.
                     const dim3 grid((ne01 + 1) / 2, 1, 1);
                     mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_0, true>
+                        <<<grid, 64, 0, stream>>>(w, xq, dst_d,
+                            (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride, dst_s1);
+                } else if (u4q41) {
+                    // Q4_1 u4 single-token decode: same nc shape, U4Q41 variant.
+                    const dim3 grid((ne01 + 1) / 2, 1, 1);
+                    mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_1, false, false, false, true>
                         <<<grid, 64, 0, stream>>>(w, xq, dst_d,
                             (uint32_t) ne00, (uint32_t) ne01, (uint32_t) x_stride, dst_s1);
                 } else {
@@ -234,6 +267,15 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                                 ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         } else {
                             ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_0>(w, xq, dst_d,
+                                ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        }
+                        break;
+                    case GGML_TYPE_Q4_1:
+                        if (u4q41) {
+                            ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_1, false, false, true>(w, xq, dst_d,
+                                ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
+                        } else {
+                            ggml_cuda_mul_mat_repacked_nc_t<GGML_TYPE_Q4_1>(w, xq, dst_d,
                                 ne00, ne01, ne11, (uint32_t) x_stride, dst_s1, stream);
                         }
                         break;
@@ -296,7 +338,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         if (u4p) {
             return (void *) src1_u4p.try_alloc(ne13 * ne12 * chunk_ne11 * nkb_u4);
         }
-        return u4act
+        return (u4act || u4q41)
             ? (void *) src1_u4.try_alloc(ne13 * ne12 * chunk_ne11 * nkb_u4)
             : (void *) src1_q8_1.try_alloc(ne13 * ne12 * chunk_ne11 * n_groups);
     };
@@ -355,9 +397,11 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             // alloc-math note above).
             quantize_mmq_q8_1_u4p_cuda((const float *) src1->data + col*s11, src1_u4p.get(),
                 ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream);
-        } else if (u4act) {
+        } else if (u4act || u4q41) {
             // G3: token-major u4 quantizer (same launcher args as the narrow
             // path; the chunk offset rides s11 exactly like the stock call).
+            // Q4_1 u4 (u4q41) uses the SAME activation layout — only the weight
+            // decode differs.
             quantize_mmq_q8_1_u4_cuda((const float *) src1->data + col*s11, src1_u4.get(),
                 ne10, s11, s12, s13, ne00, iter_ne11, ne12, ne13, stream, src0->name);
         } else {
@@ -384,7 +428,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                     ? reinterpret_cast<const block_q8_1 *>(
                         (const char *) src1_u4p.get()
                         + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4p))
-                    : u4act
+                    : (u4act || u4q41)
                     ? reinterpret_cast<const block_q8_1 *>(
                         (const char *) src1_u4.get()
                         + (size_t) (i3 * ne12 + i2) * iter_ne11 * nkb_u4 * sizeof(block_q8_1_u4))
@@ -393,14 +437,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
             float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2])
                            + col*dst_s1;
             ggml_cuda_mul_mat_repacked_slice(ctx, src0, w, xq, dst_d,
-                ne00, ne01, iter_ne11, stream, u4act && !u4p && !u4x16, dst_s1, u4p, u4x16);
+                ne00, ne01, iter_ne11, stream, u4act && !u4p && !u4x16, dst_s1, u4p, u4x16, u4q41);
         }
         }
     }
 }
 
 // Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
-template <ggml_type WT, bool U4ACT, bool U4P8>
+template <ggml_type WT, bool U4ACT, bool U4P8, bool U4Q41>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
@@ -455,11 +499,11 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             if (lanes16_ok) {
                 // 16 lanes to a row, 32 rows per block, one row per lane.
                 const dim3 grid((ne01 + 31) / 32, 1, 1);
-                mul_mat_vec_repacked_nc<32, 8, 2, 1, 16, WT, U4ACT, U4P8><<<grid, 512, 0, stream>>>(
+                mul_mat_vec_repacked_nc<32, 8, 2, 1, 16, WT, U4ACT, U4P8, false, U4Q41><<<grid, 512, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
-                mul_mat_vec_repacked_nc<2, 2, 2, 1, 64, WT, U4ACT, U4P8><<<grid, 128, 0, stream>>>(
+                mul_mat_vec_repacked_nc<2, 2, 2, 1, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 128, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             }
         } break;
@@ -467,37 +511,37 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
             if (lanes32_ok) {
                 // 32 lanes to a row, 8 rows per block, one row per lane.
                 const dim3 grid((ne01 + 7) / 8, 1, 1);
-                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT, U4ACT, U4P8><<<grid, 256, 0, stream>>>(
+                mul_mat_vec_repacked_nc<8, 4, 3, 1, 32, WT, U4ACT, U4P8, false, U4Q41><<<grid, 256, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             } else {
                 const dim3 grid((ne01 + 1) / 2, 1, 1);
-                mul_mat_vec_repacked_nc<2, 1, 3, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+                mul_mat_vec_repacked_nc<2, 1, 3, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
             }
         } break;
         case 4: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 4, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 5: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 5, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 6: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 6, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 7: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 7, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         case 8: {
             const dim3 grid((ne01 + 1) / 2, 1, 1);
-            mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT, U4ACT, U4P8><<<grid, 64, 0, stream>>>(
+            mul_mat_vec_repacked_nc<2, 1, 8, 2, 64, WT, U4ACT, U4P8, false, U4Q41><<<grid, 64, 0, stream>>>(
                 w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys);
         } break;
         default: GGML_ABORT("nc mat-vec: unsupported batch width");
@@ -516,7 +560,7 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
         float * dst_d, const int64_t ne00, const int64_t ne01, const int64_t ne11,
-        cudaStream_t stream, bool u4act, uint32_t dst_s1, bool u4p8, bool u4x16) {
+        cudaStream_t stream, bool u4act, uint32_t dst_s1, bool u4p8, bool u4x16, bool u4q41) {
     if (ne11 == 1) {
         if (u4x16) {
             // Phase-2 gate 3 edge case: workspace pressure shrank a gate-3
@@ -557,6 +601,17 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     dst_s1);
             return;
         }
+        if (u4q41) {
+            // Q4_1 u4 single-token (workspace-pressure chunk of 1): same shape,
+            // U4Q41 variant, xs = ne00/32 (Q4_1 guarantees ne00 % 32 == 0).
+            const dim3 grid((ne01 + 1) / 2, 1, 1);
+            mul_mat_vec_repacked_nc<2, 1, 1, 2, 64, GGML_TYPE_Q4_1, false, false, false, true>
+                <<<grid, 64, 0, stream>>>(w, xq, dst_d,
+                    (uint32_t) ne00, (uint32_t) ne01,
+                    (uint32_t) (ne00 / 32),
+                    dst_s1);
+            return;
+        }
         switch (src0->type) {
             case GGML_TYPE_Q8_0: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
@@ -589,6 +644,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_0: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q4_0, 16, 16, false><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, 0, 0, 0, 1, 0, 0, 0);
+            } break;
+            case GGML_TYPE_Q4_1: {
+                const dim3 grid((ne01 + 15) / 16, 1, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_1, 16, 16, false><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     nullptr, 0, 0, 0, 1, 0, 0, 0);
             } break;
@@ -661,6 +722,21 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 } else {
                     mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_0><<<grid, dim3(64, nrl), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                }
+                break;
+            case GGML_TYPE_Q4_1:
+                // Q4_1 u4 (q41-u4-probe): under DOT8=4 the dp8a u4 GEMM; the
+                // gate-off/SKIP case runs the repacked STOCK affine GEMM (the
+                // q8_1 DS4 activation sum arrives automatically — mmq_get_q8_1_ds_layout
+                // already maps Q4_1 to DS4).
+                if (u4q41) {
+                    mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_1, false, false, false, true><<<grid, dim3(64, nrl), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                } else {
+                    mmq_gemm_repacked<false, MMQ_RP_Q8_TN, nrl, GGML_TYPE_Q4_1><<<grid, dim3(64, nrl), 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 }
@@ -751,7 +827,7 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     float * const ypart = ksplit_part.get();
                     const dim3 gk(grid.x, grid.y, (unsigned) ksplit_slices);
 #define RP_KSPLIT_LAUNCH(KS) \
-                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, false, false, KS> \
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0, false, false, false, false, KS> \
                         <<<gk, dim3(32, nrl*2), 0, stream>>>( \
                             w, xq, ypart, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11, \
                             nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01); \
@@ -782,6 +858,19 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 } else {
                     mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_0><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                }
+                break;
+            case GGML_TYPE_Q4_1:
+                // Q4_1 u4 (q41-u4-probe): see the 64-wide arm above. ksplit is
+                // never set here (its predicate is Q4_0-only).
+                if (u4q41) {
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_1, false, false, false, true><<<grid, dim3(32, nrl*2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
+                } else {
+                    mmq_gemm_repacked_w32<false, 1, nrl*2, GGML_TYPE_Q4_1><<<grid, dim3(32, nrl*2), 0, stream>>>(
                         w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) ne11,
                         nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 }

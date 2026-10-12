@@ -1657,3 +1657,36 @@ KLD vs f16-c512-ch128 base (-c 512 -b 2048 -ub 512 --chunks 128):
 
 BRANCH VALIDATED: fix/review-2026-10-10 @ 5131ca6bb reproduces every reference number within
 band; Q5_1 union-stride path clean. Raw logs: /root/ppmax/logs/.
+
+
+## 56. Phase-3 GPU ladder: Q4_1 u4 (gate 4) validated end-to-end (2026-10-12, branch q41-u4-probe acdf841e7, ROCm2)
+
+FULL build /root/wt-q41/build-q41 (acdf841e7) + ISOLATION build /root/wt-q41-iso (831108ad8, Sigma_a staging
+forced SA=0.0f). Serialized on /root/gpu2.lock, VRAM baseline 10.87 MB/GPU before/after every leg.
+VERDICT: GO on every leg. Full report: /root/ppmax/q41q4k-probe/phase3-gpu-report.md.
+
+LEG 0 (exact-anchor regression, upstream 9B Q4_0): gate1 PPL ch256 8.7630 EXACT; gate1 KLD 0.122150 EXACT;
+SKIP-early KLD 0.097917 EXACT; DOT8=3 PPL ch32 7.2774 EXACT (the 54 per-16 ref). The U4Q41 wrapper-threading
++ KSPLIT macro-arg shift perturbed gates 1/3 by zero ULP.
+
+LEG 0b (isolation A/B): on the pure Q4_0 file the gate1 kernel counters are BIT-IDENTICAL FULL vs ISO
+(VALU 68,111,311/call, LDS 6,271,669.7, WAVES 1440, n=992) - shipped path provably untouched. Kernel-level
+isolation on the map file (U4Q41 actually runs): FULL 181,390,336 VALU/call vs ISO 180,114,432 = Sigma_a
+staging +0.71% VALU, 0.00% LDS; vs stock Q4_1 repack on the same tensors (SKIP arm): +2.50% VALU, -26.8%
+LDS. Far below the +22.9% U4X16 NO-GO bar. Disassembly (llvm-objdump on extracted hsaco,
+mmq_gemm_repacked<...,Q4_1,...,U4Q41=true>): FULL 2192 vs ISO 2132 instrs; the entire delta is the forced-out
+staging chain (+32 v_dot8_i32_i4, +8 cvt, +8 fma, +8 add, +6 s_waitcnt); 71 opcodes identical counts;
+vgpr/sgpr identical (128/44) -> inner-loop ISA identity PROVEN, not argued. gfx906 exposes no dynamic
+occupancy counters (SQ_LEVEL_WAVES/SQ_WAVE_CYCLES/SQ_BUSY_CYCLES unavailable); static metadata + SQ_WAVES
+identical used instead. Bench-level FULL-vs-ISO on the map file is confounded (831108ad8 predates the
+superset redesign: ISO at gate4 leaves Q4_0 stock) - counters are the clean isolation.
+
+LEG 1-2 (gate 4 full gates): (a) SUPERSET property on pure Q4_0 file: gate4 PPL ch256 8.7630 bit-identical
+to gate1 (dPPL 0.000), pp512 within noise. (b) map-built Q4_1 file (bf16 -> Q4_0 + explicit
+blk.{4..7}.ffn_down=q4_1 full-name overrides on the ffmap2 map; histogram Q4_0x169/Q4_1x4): pp512 g0 951.5 /
+g1 1195.0 / g4 1197.2 -> gate4 gain +25.8% = 81% of the pure-Q4_0 gate1 gain (bar >=50%) PASS; tg128
++3.1% no-regress (6 reps, 6s drain); KLD internal anchors on the same file g0 0.053048 / g1 0.091156 /
+g4 0.092895 - gate4 adds only +0.0017 over gate1 (4.5% of the Q4_0-u4 penalty), inside the u4 envelope;
+greedy primes 2..29 EXACT; SKIP-under-gate4 runs Q4_1 tensors on the repacked STOCK kernel (rocprofv3
+witness, admission gate-aware); VRAM g0 vs g4 resident sample -4.75 MB (noise) = canonical 5 bpw neutral.
+Depth PPL c2048 ch64: g0 7.2473 -> g4 7.4194 (the Q4_0-u4 penalty dominates; superset dPPL on Q4_0 files 0.000).
