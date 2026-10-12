@@ -32,6 +32,12 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // never lands in repacked layout and silently runs a wrong fast path — the
     // buffer falls back to the canonical stock path for it, byte-identical to
     // pre-branch behavior.
+    // MIRROR RULE (peer review): admission must always mirror the decode
+    // predicates in q8_repack/mul-mat.cu. Gate 4 is a SUPERSET (per-32 Q4_0 u4
+    // + Q4_1 u4): Q4_0 admission is unchanged (GGML_CUDA_REPACK_Q4_0, modes
+    // 1-4 all use the same repacked Q4_0 layout), Q4_1 admission stays
+    // DOT8==4-only. A tensor that is admitted is decoded by exactly the path
+    // its type selects; a tensor that is not admitted never reaches a u4 path.
     static const bool s_q4_1 = [] {
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         const bool on = e != nullptr && atoi(e) == 4;

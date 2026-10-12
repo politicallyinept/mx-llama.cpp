@@ -51,7 +51,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // kernels. Function-local static, fork pattern (mirrors GGML_RP_GENERIC_MMV
     // in the slice dispatch below). Unset gate = stock q8_1-activation path:
     // every u4 branch is inside `if (u4act)`, so gate-off behavior is unchanged.
-    // C1/B8 M4 GATE REDEFINITION (three-valued, read with atoi):
+    // C1/B8 M4 GATE REDEFINITION (read with atoi):
     //   unset/0 = stock q8_1 activations
     //   1       = per-32 asymmetric u4 decode + GEMM (shipped; byte-identical)
     //   2       = decode per-32 (SAME as gate 1) + GEMM per-8 u4p
@@ -64,6 +64,14 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     //           per-32 blocks (phase-1 diagnostic); per-16 sub-block scales
     //           halve the scale-plane bandwidth of the per-8 u4p (gate 2)
     //           while recovering most of its KLD gap closure.
+    //   4       = SUPERSET of gate 1: per-32 u4 on Q4_0 weights (identical to
+    //           gate 1, same u4act predicates below) PLUS the Q4_1 u4 (dp8a)
+    //           path on Q4_1 weights. A Q4_1-only file is a degenerate case:
+    //           real Q4_1-heavy files are ~97.6% Q4_0 with a small ffn_down
+    //           Q4_1 guard band (~2.4%), so gate 4 must carry the Q4_0 u4 path
+    //           too or the overwhelming majority of MACs would run stock.
+    //           Modes 2/3 semantics stay EXCLUSIVE: u4p (per-8 GEMM) and
+    //           u4x16 (per-16 GEMM) never engage at mode 4.
     // The per-8 u4p DECODE branch (M3) stays compiled but NO gate selects it:
     // BENCH.md §36 rejected per-8 decode (-9.2% tg). `u4p` below is GEMM-only;
     // the narrow-batch decode sites use `u4act` under both gates 1 and 2.
@@ -76,7 +84,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
                           mode == 1 ? "per-32 u4 activations" :
                           mode == 2 ? "per-32 u4 decode + per-8 u4p GEMM" :
                           mode == 3 ? "per-16 u4x16 GEMM (decode stays per-32 u4)" :
-                          mode == 4 ? "Q4_1 u4 (dp8a) on Q4_1 weights (repack admission + u4 decode)" :
+                          mode == 4 ? "SUPERSET of gate 1: per-32 u4 on Q4_0 + Q4_1 u4 (dp8a) on Q4_1 (repack admission + u4 decode)" :
                                       "unrecognised mode: no W4A4 dispatch");
         }
         return mode;
@@ -97,7 +105,7 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     auto w4a4_match = [&](const ggml_tensor * t) {
         return !w4a4_only || strstr(t->name, w4a4_only == 1 ? "attn" : "ffn") != nullptr;
     };
-    // DEBUG (perf/w4a4-selective): under gates 1/2 the filter restricts WHICH
+    // DEBUG (perf/w4a4-selective): under gates 1/2/4 the filter restricts WHICH
     // tensors use the u4act path at all (phase-1 attribution vs stock). Under
     // gate 3 the filter's meaning MOVES: it selects which tensors get per-16
     // u4x16 GEMM activations; every Q4_0 tensor keeps the per-32 u4act base
@@ -111,10 +119,18 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // Gate unset/empty: ggml_cuda_w4a4_skip() is a constant false (empty
     // static vector), so gate-off dispatch is unchanged.
     const bool w4a4_skip = ggml_cuda_w4a4_skip(src0->name);
-    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3)
+    // Gate 4 is a SUPERSET of gate 1 for Q4_0: the per-32 u4act path fires at
+    // modes 1/2/3/4 (the GGML_W4A4_ONLY filter keeps its gate-1 meaning at
+    // mode 4 — only mode 3 moves the filter to the u4x16 selection). The Q4_1
+    // half of gate 4 is the u4q41 predicate below; the two are disjoint by the
+    // src0->type test (Q4_0 vs Q4_1), so no tensor ever takes both paths.
+    const bool u4act = ((w4a4_dot8 == 1 || w4a4_dot8 == 2 || w4a4_dot8 == 3 || w4a4_dot8 == 4)
         && src0->type == GGML_TYPE_Q4_0)
         && (w4a4_dot8 == 3 || w4a4_match(src0))
         && !w4a4_skip;
+    // Mode semantics are EXCLUSIVE here: per-8 u4p is gate-2-only, per-16
+    // u4x16 is gate-3-only — neither may fire at mode 4 (gate 4 = gate-1
+    // per-32 Q4_0 semantics + Q4_1 u4).
     const bool u4p   = w4a4_dot8 == 2 && src0->type == GGML_TYPE_Q4_0 && !w4a4_skip;
     // Phase-2 gate 3: per-16 GEMM activations (gate-2 semantics: GEMM path
     // only; the narrow/decode paths above keep the per-32 u4act kernels).
@@ -124,7 +140,9 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     // u4x16 and u4act pools across tensors with no cross-contamination; the
     // plane-offset fix is per-call.
     const bool u4x16 = w4a4_dot8 == 3 && src0->type == GGML_TYPE_Q4_0 && w4a4_match(src0) && !w4a4_skip;
-    // Q4_1 u4 (q41-u4-probe): DOT8=4 selects the Q4_1 dp8a path on Q4_1 weights.
+    // Q4_1 u4 (q41-u4-probe): DOT8=4 selects the Q4_1 dp8a path on Q4_1 weights
+    // (gate 4 is a SUPERSET: the Q4_0 half is the u4act per-32 path above, so a
+    // mostly-Q4_0 file with a Q4_1 guard band gets u4 on BOTH classes).
     // The SAME env value drives the repack admission (ggml_cuda_repack_tensor_supported
     // admits Q4_1 only at DOT8=4), so admission and decode can never disagree: a
     // Q4_1 tensor either runs the repack fast path (gate on) or is not repacked at

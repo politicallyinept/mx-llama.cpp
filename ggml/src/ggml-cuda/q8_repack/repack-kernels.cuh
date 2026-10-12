@@ -591,6 +591,11 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
             continue;
         }
         if constexpr (U4Q41) {
+            // documented-algebra-twin: intentionally uninstantiated (no codegen);
+            // NOT dead — keep in sync with the instantiated path when the algebra
+            // changes. No launch site ever passes U4Q41=true to mul_mat_vec_rp
+            // (the Q4_1 u4 decode is served by mul_mat_vec_repacked_nc and the
+            // GEMM; this branch documents the same sealed algebra in mat-vec form).
             // Q4_1 u4 (q41-u4-probe): derived LITERALLY from the U4ACT branch
             // above (same weight XOR-8, same raw activation nibbles, same signed
             // sw = nib_sum_u4(raw) - 256) plus the Q4_1 weight offset m_w. The

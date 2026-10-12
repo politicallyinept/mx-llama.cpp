@@ -57,19 +57,25 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // one token. Modes 1/2 stay always-on.
     //
     // VALUE SEMANTICS MATCH THE DENSE GATE (q8_repack/mul-mat.cu): unset/0 = stock, 1/2 =
-    // always-on, 3 = batch-gated. This used to test `getenv(...) != nullptr`, so the
+    // always-on, 3 = batch-gated, 4 = SUPERSET of 1 (per-32 Q4_0 u4 always-on,
+    // same as mode 1, plus the Q4_1 u4 path which is DENSE-ONLY and never
+    // engages here). This used to test `getenv(...) != nullptr`, so the
     // documented OFF value GGML_CUDA_W4A4_DOT8=0 enabled this path (mode 0 passed both the
     // "set at all" test and the `!= 3` test).
     static const int w4a4_mode = [] {
         const char * e = getenv("GGML_CUDA_W4A4_DOT8");
         const int mode = e != nullptr ? atoi(e) : 0;
         if (mode != 0) {
-            GGML_LOG_WARN("CUDA w4a4 (MoE): GGML_CUDA_W4A4_DOT8=%d gate ACTIVE (mode 3 = batch-gated, n_tokens>1; mode 4 = Q4_1 u4, DENSE-ONLY, never engages MoE)\n", mode);
+            GGML_LOG_WARN("CUDA w4a4 (MoE): GGML_CUDA_W4A4_DOT8=%d gate ACTIVE (mode 3 = batch-gated, n_tokens>1; mode 4 = superset of mode 1 for Q4_0, Q4_1 u4 is DENSE-ONLY and never engages MoE)\n", mode);
         }
         return mode;
     }();
     // Lever 2 (GGML_CUDA_W4A4_SKIP): same prefix exclusion as the dense path.
-    const bool u4act = ((w4a4_mode == 1 || w4a4_mode == 2 || w4a4_mode == 3)
+    // Mode 4 joins the always-on set (superset of mode 1): the Q4_0 half of
+    // gate 4 runs the same per-32 u4act here as at mode 1. The Q4_1 half never
+    // engages: this predicate is Q4_0-only and the U4Q41 MoE variants are
+    // asserted out (dense-only).
+    const bool u4act = ((w4a4_mode == 1 || w4a4_mode == 2 || w4a4_mode == 3 || w4a4_mode == 4)
             && (w4a4_mode != 3 || n_tokens > 1))
         && src0->type == GGML_TYPE_Q4_0
         && !ggml_cuda_w4a4_skip(src0->name);
@@ -160,7 +166,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_1:
                 // Q4_1 (q41-u4-probe): stock repack decode on the MoE path. The
                 // u4 (dp8a) variant is dense-only (HAS_IDS && U4Q41 asserted out);
-                // DOT8=4 never engages the MoE u4act predicate (modes 1-3 only).
+                // DOT8=4 engages the MoE u4act predicate only for Q4_0 (superset
+                // of mode 1) — never for Q4_1 weights.
                 mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_1><<<grid, 128, 0, stream>>>(
                     w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
