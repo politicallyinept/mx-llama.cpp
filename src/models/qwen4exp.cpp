@@ -245,7 +245,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
             layer.nextn.eh_proj   = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,   "weight", il), { eh_fused ? 2*n_embd : n_embd, n_embd }, mtp_flags);
             layer.nextn.fc_hidden = create_tensor(tn(LLM_TENSOR_NEXTN_FC_HIDDEN, "weight", il), { n_embd, n_embd }, eh_fused ? TENSOR_NOT_REQUIRED : mtp_flags);
-            layer.nextn.hc_norm   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_NORM,   "weight", il), { hc_dim }, mtp_flags);
+            layer.nextn.hc_norm   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_NORM,   "weight", il), { n_embd, hc }, TENSOR_ALLOW_RESHAPE | mtp_flags);
             layer.nextn.hc_down   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_DOWN,   "weight", il), { hc_dim, hc_lr }, mtp_flags);
             layer.nextn.hc_up     = create_tensor(tn(LLM_TENSOR_NEXTN_HC_UP,     "weight", il), { hc_lr, hc_dim }, mtp_flags);
         }
