@@ -1719,3 +1719,37 @@ FINDING: skip-layer recovery does NOT transfer at fixed layer ranges. Closure co
 PPL-based closure from the fleet A/B (skipE 15.5%, skipL 29.0%) agrees: low-teens, not 45%.
 DISPOSITION: do not ship skipE/skipL on the 27B on the strength of §54; re-derive any 27B skip
 list via per-layer KLD attribution on this f16 base. Raw: /root/kld27b/.
+
+
+## 59. Adopt-validation: stock+ksplit A/B (27B + Ornith MoE) + first MTP x W4A4 interaction measurement (2026-10-13, build-merge 0338132f7 b11507, /root/ppmax/adopt/)
+
+PART A - ksplit adoption gate on the 27B (Qwen3.8-27B-Q4_0, ROCm0, -t 128, r=5): stock vs
+GGML_RP_KSPLIT=1: pp16 +10.6% (81.19->89.78), pp32 +7.2%, pp64 +1.2%, pp512/pp2048/tg128 parity
+(<=0.7%). PPL c512 ch256 BIT-IDENTICAL (6.8534 +- 0.06639 both arms, per-chunk arrays byte-equal;
+ch128 prefix 6.9514 matches sec-57 stock ref). per16 (DOT8=3) arm: +4..+6% pp, and per16+ksplit ==
+per16 within noise - the ksplit gate (q8_repack/mul-mat.cu: !u4act && !u4x16 && Q4_0 && 16<=ne11<=64)
+is self-guarding, so GGML_RP_KSPLIT=1 is inert under every DOT8 gate and on non-Q4_0 quants.
+Ornith-1.5-35B-A3B Q4_0 MoE (2-GPU tensor, r=3): ksplit parity (-0.6..+0.4%); per16 +2.3..2.8% pp,
+tg spread +-15 swamps the -11% point est. VERDICT: ADOPT-READY. llama-swap per-model env diff
+drafted (26 models get GGML_RP_KSPLIT=1, the 2 DOT8 models untouched) at /root/ppmax/adopt/
+config.yaml.ksplit-draft; validated by a live llama-swap instance on :19191 (28 models listed,
+zero errors). Prod config NOT touched (it runs --watch-config).
+
+PART B - MTP x W4A4 on the same 27B (llama-server -c 4096, /completion temp 0, ~775-tok wikitext
+prompt, tg128 x3 reps, draft-mtp n_max=4 p_min=0.75). ARCH FACT: both the main gguf and the
+mtp-Qwen3.8-27B draft module are general.architecture=qwen35 (NOT qwen4exp) - the hc_norm fix
+6c92ab0cc is qwen4exp-specific and irrelevant; zero build_hc_mix SIGABRTs, qwen35 MTP loads clean.
+The "mtp" gguf is a draft-only module (18 tensors, blk.64.nextn.* + embd/output); the main Q4_0
+gguf carries a NATIVE nextn head (qwen35.nextn_predict_layers=1) which works with no -md.
+
+tg128 t/s: stock-noMTP 32.4 | stock+MTP 48.7 (+50%, mean acc len 4.13) | gate1+MTP 29.8 |
+gate1+ksplit+MTP 29.6 | per16+MTP 30.6 | per16+ksplit+MTP 30.8 | native-MTP 51.1 (best).
+no-MTP gate baselines: gate1 33.2, per16 33.2. Accept-rate per pos is NOT hurt by the gates
+(gate1 4.28, per16 4.39 mean acc len vs stock 4.13; ksplit adds zero accept-rate delta).
+FINDING (the inversion): MTP's win COLLAPSES under the gates - gate1+MTP is -10% vs gate1 no-MTP,
+per16+MTP -8%: MTP verify runs at ne11 ~= n_max+1 = 5 rows, below the gates' winning window and
+below ksplit's 16-row floor (ksplit is inert under DOT8 by design anyway), where u4act/u4x16 are
+slower than stock q8_1. ksplit x MTP coexistence is safe but inert (c4 ~= c3, c6 ~= c5 within 0.7%).
+pp unaffected by MTP. VRAM: 5.74 GB no-MTP, +0.98 GB draft module. No TP AR warnings (single GPU).
+DISPOSITION: ship GGML_RP_KSPLIT=1 globally (env-only); NEVER combine DOT8=1/3 with MTP on
+qwen35-family models; for Qwen3.8-27B Q4_0 the best decode config is native MTP, no -md, stock.
