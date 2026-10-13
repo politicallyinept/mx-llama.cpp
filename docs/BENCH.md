@@ -1820,7 +1820,7 @@ Mistral-Large-123B fine-tune-v2 Q4_0 (64.5 GiB, 2 shards), 3× MI50, `-dev ROCm0
 | gate1 (DOT8=1) | **213.59 ± 0.09** (+34.4%) | 21.15 ± 0.37 |
 
 Cross-check vs server-based prod numbers (162.0/197.9 prefill, 20.02/20.40 decode): bench
-agrees within 1.9% (stock prefill), 5.6% (gate1 prefill), ≤3.7% (decode) — bench fidelity
+agrees within 1.9% (stock prefill), 7.9% (gate1 prefill), ≤3.7% (decode) — bench fidelity
 confirmed, r=3 noise ≤0.4 t/s. Gate1 prefill delta reads larger in bench (+34.4%) than server
 (+22.2%): bench pp813 runs the whole prompt as one batch and misses the server's mixed
 chunked-prefill/decode overlap that partially hides the stock path's prefill cost. Direction
