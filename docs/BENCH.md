@@ -1753,3 +1753,42 @@ slower than stock q8_1. ksplit x MTP coexistence is safe but inert (c4 ~= c3, c6
 pp unaffected by MTP. VRAM: 5.74 GB no-MTP, +0.98 GB draft module. No TP AR warnings (single GPU).
 DISPOSITION: ship GGML_RP_KSPLIT=1 globally (env-only); NEVER combine DOT8=1/3 with MTP on
 qwen35-family models; for Qwen3.8-27B Q4_0 the best decode config is native MTP, no -md, stock.
+
+## 60. Per-block least-squares Q4_0 scale: encode-side headroom probe — NEGATIVE, imatrix path is already LS (2026-10-13, branch exp/q40-ls-scale off 0338132f7, /root/bench-results/q40ls/)
+
+R3 accuracy-headroom item 1: replace the Q4_0 per-block scale choice with iterated least-squares
+(seed max|x|, then d = sum(w·x·l)/sum(w·l·l) with l = clamp(round(x/d)), 4 sweeps), env-gated in
+ggml-quants.c (GGML_Q40_LS=sweeps; GGML_Q40_LS_MODE=1 weighted by the imatrix weight vector
+w=qw·sqrt(sigma2+x²), 2 = unweighted, the brief's literal sum(scale·q − w)²). CPU-only quantizer
+(/root/wt-q40ls/build-cpu); files re-encoded from the same bf16 source + map-ff4 + train-split
+imatrix as ffmap4, size identical (6,288,666,624 B). Control arm GGML_Q40_LS=0 reproduced ffmap4
+**bit-exactly** (md5 49b7aed8...), so every delta below is the LS scale alone. KLD c512 ch128 vs
+f16-c512-ch128 base, wiki.test, build-merge @ 807d8f0f1, ROCm2:
+
+| arm | gate0 (weight floor) | vs 0.041157 | gate1 (W4A4) | vs 0.076382 |
+|---|---|---|---|---|
+| ffmap4 anchor (known) | 0.041157 | — | 0.076382 | — |
+| LS ctrl (LS=0, bit-exact) | 0.041157 ± 0.001281 | 0.0% | 0.076382 ± 0.001605 | 0.0% |
+| LS mode1 s4 (imatrix-weighted) | 0.050086 ± 0.001615 | **+21.7%** | 0.086219 ± 0.001744 | **+12.9%** |
+| LS mode2 s4 (unweighted) | 0.051336 ± 0.001534 | **+24.7%** | 0.087302 ± 0.001774 | **+14.3%** |
+
+Weight-MSE cross-check (blk.10.ffn_gate dequant vs bf16, gguf-py dequantize): ffmap4 9.5175e-07,
+m1s4 +5.0%, m2s4 +3.8% — LS also loses on plain MSE while it *shrinks* max|err| (3.13e-2 →
+1.05e-2): the max|x| seed + imatrix pattern search is better than iterated LS even on the
+unweighted block-MSE proxy the LS objective itself optimizes.
+
+VERDICT: **NO — LS scale regresses, do not pursue.** Success bar was ≥2% KLD *reduction*; measured
+is a 12.9–24.7% *increase* (5–7x the per-arm KLD error bar, and the control arm reproduces the
+anchor bit-exactly so the delta is systematic, not drift). Mechanism: the imatrix Q4_0 path is
+already least-squares — make_qx_quants(rmse_type=1) computes scale = sumlx/suml2 over the
+imatrix-derived weight vector, then searches discrete iscale variants (−nmax−0.1i)/max, i∈[−9,9],
+picking the best **clamping-pattern** by sumlx²/suml2. Iterated LS from the max|x| seed converges
+to the continuous stationary point of its own objective but drops that discrete pattern search,
+and the pattern search is what wins: LS lands in a worse local optimum of the *rounding* problem
+(the clamping pattern at the LS scale is not the one the search finds). The brief's literal
+unweighted LS is worse still: unweighted block MSE is the wrong proxy for KLD — the imatrix
+weighting is load-bearing. R3's "possible negative near saturation" prediction confirmed: the
+imatrix encode is saturated with respect to scale-selection changes; headroom, if any, is in the
+weight *values* (SmoothQuant-style rescale, see /root/ppmax/smoothquant-feasibility.md) or the
+activation side, not the Q4_0 scale rule. Raw: /root/bench-results/q40ls/; code: branch
+exp/q40-ls-scale (env-gated, inert by default).
