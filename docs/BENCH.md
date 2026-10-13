@@ -1792,3 +1792,36 @@ imatrix encode is saturated with respect to scale-selection changes; headroom, i
 weight *values* (SmoothQuant-style rescale, see /root/ppmax/smoothquant-feasibility.md) or the
 activation side, not the Q4_0 scale rule. Raw: /root/bench-results/q40ls/; code: branch
 exp/q40-ls-scale (env-gated, inert by default).
+
+## 61. llama-bench -dev delimiter fix (comma = device list, slash = cross-product) + first proper Mistral-Large-123B fine-tune bench (2026-10-13, branch fix/llama-bench-dev-comma 177481e37, /root/ab-gates/Mistral-Large fine-tune-bench-ab-*.log)
+
+Root cause of the "llama-bench cannot load the sharded Mistral-Large fine-tune" mystery (§3 of
+/root/w4a4-gates-fleet-ab.md): llama-bench parsed `-dev` with **inverted delimiters** vs every
+other tool. common/arg.cpp `parse_device_list()` (llama-server, llama-perplexity) treats COMMA
+as the device list for one model instance; llama-bench split the value on COMMA into separate
+benchmark combos and each combo on SLASH into a device list. So `-dev ROCm0,ROCm1,ROCm2
+-sm tensor` created three single-device combos, each trying to load the full 64.5 GiB shard set
+onto one 32 GB GPU — silent load failure (error only under --verbose). The slash form
+`ROCm0/ROCm1/ROCm2` worked but was backwards vs the codebase convention.
+
+Fix (one file, tools/llama-bench/llama-bench.cpp, +9/−3): swap the delimiters —
+`parse_devices_arg()` splits on comma (device list per instance, matches common parser); the
+`-dev` arg handler splits on slash (cross-product of device-set combos); help text updated.
+Verified: `-dev ROCm0,ROCm1 -sm tensor` → one tensor-split instance; `-dev ROCm0/ROCm1` →
+two single-device combos (slash semantics unchanged for existing users). Build RC=0.
+Branch pushed to gitea + github fork; upstream PR to be opened by Brad.
+
+Mistral-Large-123B fine-tune-v2 Q4_0 (64.5 GiB, 2 shards), 3× MI50, `-dev ROCm0/ROCm1/ROCm2 -sm tensor
+-ngl 999 -fa on -lm dio -p 813 -n 128 -r 3 -t 128`, build-merge @ 1e3e0ccff:
+
+| arm | pp813 | tg128 |
+|---|---|---|
+| stock | 158.95 ± 0.12 | 20.43 ± 0.39 |
+| gate1 (DOT8=1) | **213.59 ± 0.09** (+34.4%) | 21.15 ± 0.37 |
+
+Cross-check vs server-based prod numbers (162.0/197.9 prefill, 20.02/20.40 decode): bench
+agrees within 1.9% (stock prefill), 5.6% (gate1 prefill), ≤3.7% (decode) — bench fidelity
+confirmed, r=3 noise ≤0.4 t/s. Gate1 prefill delta reads larger in bench (+34.4%) than server
+(+22.2%): bench pp813 runs the whole prompt as one batch and misses the server's mixed
+chunked-prefill/decode overlap that partially hides the stock path's prefill cost. Direction
+and magnitude class (large prefill win, decode within noise) both confirmed.
