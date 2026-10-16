@@ -2,6 +2,7 @@
 // repack routine, and the persistent per-view cache shared by dense and MoE paths.
 #include "repack.cuh"
 #include "repack-common.cuh"
+#include "ggml-cuda.h"   // GGML_LOG_WARN for the gate-engagement markers
 
 #include <cstdlib>
 
@@ -15,11 +16,24 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
+    // Q4_0 admission is opt-in: GGML_CUDA_REPACK_Q4_0=1. Unset/0 keeps the
+    // stock canonical-kernel path for Q4_0 exactly as before.
+    static const bool s_q4_0 = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0 gate ACTIVE: Q4_0 admitted to the gfx906 repack path\n");
+        }
+        return on;
+    }();
     switch (t->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ4_NL: {
             return t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_Q4_0: {
+            return s_q4_0 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q4_K:
@@ -314,6 +328,11 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
         case GGML_TYPE_IQ4_NL:
             repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
             break;
+        case GGML_TYPE_Q4_0:
+            // block_q4_0 is byte-identical to block_iq4_nl (f16 d + 16 nibble
+            // bytes), so the converter is the same routine.
+            repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
+            break;
         case GGML_TYPE_Q6_K:
             repack_q6k_host((const block_q6_K *) blocks, dst, ne0, ne1);
             break;
@@ -428,5 +447,45 @@ void repack_view_cache_purge(int device, const void * base, size_t size) {
         } else {
             ++it;
         }
+    }
+}
+
+
+// Host reference quantizer: fp32 -> block_q8_1_u4 (scheme B, per-32 asymmetric
+// uint4). Vectorized reference impl: one pass for min/max, one pass to pack the
+// nibble pairs. k must be a multiple of 32. NOT dispatched anywhere yet
+// (milestone 2 wires it into mul_mat_vec_repacked_nc / the GEMM path).
+void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    GGML_ASSERT(k % 32 == 0);
+
+    block_q8_1_u4 * GGML_RESTRICT y = (block_q8_1_u4 *) vy;
+    const int nb = (int) (k / 32);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * GGML_RESTRICT xb = x + ib * 32;
+
+        float mn = xb[0], mx = xb[0];
+        for (int i = 1; i < 32; ++i) {
+            mn = mn < xb[i] ? mn : xb[i];
+            mx = mx > xb[i] ? mx : xb[i];
+        }
+
+        const float d  = (mx - mn) / 15.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        uint8_t * GGML_RESTRICT q = y[ib].qs;
+        // De-interleaved byte order mirroring canonical Q4_0 weights
+        // (ggml-quants.c:137-141): byte j = {value j low, value j+16 high},
+        // so sdot8 against the repacked weight pairs value i with value i.
+        for (int i = 0; i < 16; ++i) {
+            int q0 = (int) roundf((xb[i]     - mn) * id);
+            int q1 = (int) roundf((xb[i + 16] - mn) * id);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            q[i] = (uint8_t) (q0 | (q1 << 4));   // byte j = {j low, j+16 high}
+        }
+
+        y[ib].d4 = (ggml_half) d;
+        y[ib].m  = (ggml_half) mn;
     }
 }
