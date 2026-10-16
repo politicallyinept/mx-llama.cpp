@@ -1528,12 +1528,12 @@ static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING
     { "gelu_fast",         LLM_FFN_GEGLU     },
     { "gelu_accurate",     LLM_FFN_GEGLU     },
     { "gelu_python_tanh",  LLM_FFN_GEGLU     },
-    { "geglu",             LLM_FFN_GEGLU     },
-    { "silu",              LLM_FFN_SWIGLU    },
-    { "swish",             LLM_FFN_SWIGLU    },
-    { "swiglu",            LLM_FFN_SWIGLU    },
-    { "relu",              LLM_FFN_RELU      },
-    { "reglu",             LLM_FFN_REGLU     },
+    { "geglu",  LLM_FFN_GEGLU  },
+    { "silu",   LLM_FFN_SWIGLU },
+    { "swish",  LLM_FFN_SWIGLU },
+    { "swiglu", LLM_FFN_SWIGLU },
+    { "relu",   LLM_FFN_RELU   },
+    { "reglu",  LLM_FFN_REGLU  },
 };
 
 // transformers names, "gelu" is the exact (erf) variant
