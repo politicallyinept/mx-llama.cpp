@@ -6,6 +6,7 @@
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../mmid.cuh"
+#include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
 
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
@@ -41,6 +42,44 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     const size_t expert_stride = repack_gcn_nbytes(src0->type, ne00, ne01);
     const uint32_t dst_s1 = dst->nb[1] / sizeof(float);
 
+    // W4A4 milestone 4: MoE decode through the dp8a u4-activation kernels.
+    // Same gate as the dense milestone-3 wiring (function-local static, fork
+    // pattern). Q4_0 is NOT in the MoE fusion admission set
+    // (ggml_cuda_repack_mmv_id_fusion_supported: base Q8_0/MXFP4 + kq
+    // Q4_K/Q5_K/Q6_K/IQ4_NL), so a Q4_0 MoE model takes the UNFUSED paths
+    // at every decode width -- the fused id1_fused / *_fused epilogues are
+    // never reached for Q4_0 and stay untouched. Unset gate = stock q8_1.
+    // BATCH-GATE MODE 3 (mirrors the dense gate in q8_repack/mul-mat.cu):
+    // W4A4 only when the batch has multiple tokens (n_tokens > 1, i.e.
+    // prefill/batch); single-token decode (n_tokens == 1) falls back to the
+    // stock q8_1 repack path — W4A4 is ~+7% prefill but -5.4% decode on
+    // MoE models because the SUMW recompute per block never amortizes at
+    // one token. Modes 1/2 stay always-on.
+    //
+    // VALUE SEMANTICS MATCH THE DENSE GATE (q8_repack/mul-mat.cu): unset/0 = stock, 1/2 =
+    // always-on, 3 = batch-gated, 4 = SUPERSET of 1 (per-32 Q4_0 u4 always-on,
+    // same as mode 1, plus the Q4_1 u4 path which is DENSE-ONLY and never
+    // engages here). This used to test `getenv(...) != nullptr`, so the
+    // documented OFF value GGML_CUDA_W4A4_DOT8=0 enabled this path (mode 0 passed both the
+    // "set at all" test and the `!= 3` test).
+    static const int w4a4_mode = [] {
+        const char * e = getenv("GGML_CUDA_W4A4_DOT8");
+        const int mode = e != nullptr ? atoi(e) : 0;
+        if (mode != 0) {
+            GGML_LOG_WARN("CUDA w4a4 (MoE): GGML_CUDA_W4A4_DOT8=%d gate ACTIVE (mode 3 = batch-gated, n_tokens>1; mode 4 = superset of mode 1 for Q4_0, Q4_1 u4 is DENSE-ONLY and never engages MoE)\n", mode);
+        }
+        return mode;
+    }();
+    // Lever 2 (GGML_CUDA_W4A4_SKIP): same prefix exclusion as the dense path.
+    // Mode 4 joins the always-on set (superset of mode 1): the Q4_0 half of
+    // gate 4 runs the same per-32 u4act here as at mode 1. The Q4_1 half never
+    // engages: this predicate is Q4_0-only and the U4Q41 MoE variants are
+    // asserted out (dense-only).
+    const bool u4act = ((w4a4_mode == 1 || w4a4_mode == 2 || w4a4_mode == 3 || w4a4_mode == 4)
+            && (w4a4_mode != 3 || n_tokens > 1))
+        && src0->type == GGML_TYPE_Q4_0
+        && !ggml_cuda_w4a4_skip(src0->name);
+
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> ids_dst (ctx.pool(), n_assign);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
@@ -68,10 +107,26 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     // 32-wide tile per active expert. Weight loads go through rp_traits, so
     // every repacked type takes this path.
     if (n_tokens > 1 && n_tokens <= MMQ_RP_Q8_MOE_MMV_MAX_TOKENS) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
-        block_q8_1 * src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
-            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
-            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        ggml_cuda_pool_alloc<block_q8_1>    src1_q8_1_own;
+        ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
+        block_q8_1 * src1_q8_1_d = nullptr;
+        if (u4act) {
+            // ALLOC MATH mirrors the dense milestone-3 wiring: block_q8_1_u4
+            // is 20 B vs block_q8_1's 36 B but the BLOCK COUNT is identical
+            // (ne10_padded/32 per token column = x_stride), so xs keeps its
+            // "blocks per token column" meaning and the kernels'
+            // `ids_src1[a] * xs` / `c*xs + sb` indexing is unchanged.
+            // Bypasses the q8_1 activation cache (variant 0 is the q8_1
+            // layout; u4 blocks must not share those entries).
+            src1_u4_own.alloc(ctx.pool(), (size_t) (n_cols * x_stride));
+            quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
+                ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded, n_cols, 1, 1, stream);
+            src1_q8_1_d = reinterpret_cast<block_q8_1 *>(src1_u4_own.get());
+        } else {
+            src1_q8_1_d = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+                ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+                (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        }
 
         // Four rows per block, two waves. Five geometries were measured at
         // the verify widths and all landed within five percent; this was best.
@@ -91,6 +146,29 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_IQ4_NL:
                 mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_IQ4_NL><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
+            case GGML_TYPE_Q4_0:
+                if (u4act) {
+                    mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0, true><<<grid, 128, 0, stream>>>(
+                        w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                        expert_stride, (uint32_t) x_stride, dst_s1);
+                } else {
+                    mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0><<<grid, 128, 0, stream>>>(
+                        w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                        expert_stride, (uint32_t) x_stride, dst_s1);
+                }
+                break;
+            case GGML_TYPE_Q4_1:
+                // Q4_1 (q41-u4-probe): stock repack decode on the MoE path. The
+                // u4 (dp8a) variant is dense-only (HAS_IDS && U4Q41 asserted out);
+                // DOT8=4 engages the MoE u4act predicate only for Q4_0 (superset
+                // of mode 1) — never for Q4_1 weights.
+                mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_1><<<grid, 128, 0, stream>>>(
                     w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
                     expert_stride, (uint32_t) x_stride, dst_s1);
@@ -125,10 +203,22 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
     }
 
     if (n_tokens == 1) {
-        ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
-        const block_q8_1 * xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
-            ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
-            (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        ggml_cuda_pool_alloc<block_q8_1>    src1_q8_1_own;
+        ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
+        const block_q8_1 * xq = nullptr;
+        if (u4act) {
+            // Same token-major u4 layout as the narrow-batch arm above; the
+            // kernel reads `xq + (a % nchannels_y) * xs_id` which indexes
+            // the same per-column block runs.
+            src1_u4_own.alloc(ctx.pool(), (size_t) (n_cols * x_stride));
+            quantize_mmq_q8_1_u4_cuda((const float *) src1->data, src1_u4_own.get(),
+                ne10, s11, s11 * n_cols, s11 * n_cols, ne10_padded, n_cols, 1, 1, stream);
+            xq = reinterpret_cast<const block_q8_1 *>(src1_u4_own.get());
+        } else {
+            xq = repack_quantize_src1_q8_1(ctx, src0, src1, ne10,
+                ne10_padded, s11, s11 * n_cols, s11 * n_cols, n_cols, 1, 1,
+                (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
+        }
         const uint32_t nchannels_y = (uint32_t) src1->ne[1];
         const uint32_t xs_id       = (uint32_t) x_stride;
         switch (src0->type) {
@@ -158,6 +248,27 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_IQ4_NL: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_IQ4_NL, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
+            case GGML_TYPE_Q4_0: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                if (u4act) {
+                    mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16, false, true><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        (const int32_t *) ids->data, nchannels_y, expert_stride,
+                        xs_id, dst_s1);
+                } else {
+                    mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        (const int32_t *) ids->data, nchannels_y, expert_stride,
+                        xs_id, dst_s1);
+                }
+            } break;
+            case GGML_TYPE_Q4_1: {
+                const dim3 grid((ne01 + 63) / 64, n_assign, 1);
+                mul_mat_vec_rp<GGML_TYPE_Q4_1, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
                     (const int32_t *) ids->data, nchannels_y, expert_stride,
                     xs_id, dst_s1);
@@ -284,6 +395,85 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
                 if (is_mx) {
                 mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_IQ4_NL><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;        case GGML_TYPE_Q4_0: {
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q8_0><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            }
+        } break;
+        case GGML_TYPE_Q4_1: {
+            // Q4_1 (q41-u4-probe): stock repack decode on the MoE tiled path
+            // (the u4 variant is dense-only; see the narrow-batch arm above).
+            const bool is_mx = true;
+            if (use_w32) {
+                const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_w32 (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_w32(ctx.pool(), max_tiles_w32);
+                repack_tile_off<BN_W32><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(), ne02);
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles_w32, 1);
+                if (is_mx) {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q4_1><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                } else {
+                mmq_gemm_repacked_w32<true, 1, MMQ_RP_Q8_NROW_LANES * 2, GGML_TYPE_Q8_0><<<grid, dim3(32, MMQ_RP_Q8_NROW_LANES * 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off_w32.get(), tile_meta_w32.get(),
+                    (uint32_t) ne02, expert_stride, dst_s1);
+                }
+            } else {
+                const int64_t max_tiles = n_assign / BN_ID + ne02;
+                ggml_cuda_pool_alloc<int32_t>           tile_off (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta>  tile_meta(ctx.pool(), max_tiles);
+                repack_tile_off<BN_ID><<<1, 1, 0, stream>>>(expert_bounds.get(), tile_off.get(), tile_meta.get(), ne02);
+                // Loose grid.y bound, the kernel's blockIdx.y >= tile_off[n_expert] guard skips slack.
+                const dim3 grid((ne01 + MMQ_RP_Q8_BM - 1) / MMQ_RP_Q8_BM, max_tiles, 1);
+                if (is_mx) {
+                mmq_gemm_repacked<true, MMQ_RP_Q8_TN, MMQ_RP_Q8_NROW_LANES, GGML_TYPE_Q4_1><<<grid, dim3(64, MMQ_RP_Q8_NROW_LANES), 0, stream>>>(
                     w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, (uint32_t) n_cols,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), tile_off.get(), tile_meta.get(),
                     (uint32_t) ne02, expert_stride, dst_s1);
@@ -561,6 +751,13 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
                     expert_stride, (uint32_t) x_stride, dst_s1,
                     w_gate, x_bias, gate_bias, fusion->glu_op);
+                break;
+            case GGML_TYPE_Q4_0:
+                // Q4_0 is NOT in the MoE fusion admission set
+                // (ggml_cuda_repack_mmv_id_fusion_supported), so this arm is unreachable.
+                // Fail loud instead of dispatching: a fused Q4_0 step has no U4ACT variant
+                // and would read a 20 B block_q8_1_u4 pool through the q8_1 epilogue.
+                GGML_ABORT("Q4_0 is not admitted to the MoE fused repack path");
                 break;
             case GGML_TYPE_Q5_K:
                 mul_mat_vec_repacked_id1_fused<4, 4, 1, GGML_TYPE_Q5_K><<<grid_nc, 256, 0, stream>>>(

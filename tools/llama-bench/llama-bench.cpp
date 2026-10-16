@@ -151,7 +151,10 @@ static std::vector<ggml_backend_dev_t> parse_devices_arg(const std::string & val
         return devices;
     }
 
-    auto dev_names = string_split<std::string>(trimmed, '/');
+    // comma-separated list of devices sharing one model instance (split / tensor
+    // mode), same convention as the common parser's parse_device_list() used by
+    // llama-server and friends
+    auto dev_names = string_split<std::string>(trimmed, ',');
     if (dev_names.size() == 1 && string_strip(dev_names[0]) == "none") {
         devices.push_back(nullptr);
         return devices;
@@ -479,7 +482,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
-    printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
+    printf("  -dev, --device <dev0,dev1/dev2,dev3/...>          comma = devices for one instance, slash = cross-product (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
@@ -681,7 +684,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                auto combos = string_split<std::string>(argv[i], split_delim);
+                // slash-separated list of device-set combinations (cross-product
+                // with the other benchmark axes); each element is a comma-separated
+                // device list for a single model instance
+                auto combos = string_split<std::string>(argv[i], '/');
                 for (const auto & combo : combos) {
                     try {
                         params.devices.push_back(parse_devices_arg(combo));

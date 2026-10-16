@@ -395,7 +395,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
             if (!params.probabilistic) {
                 dp.result_q = nullptr;
-            }
+        }
 
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
@@ -2020,7 +2020,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             // h_tgt_in (deferred prefill) already holds the right rows, otherwise the synchronizing getter returns this batch's rows.
-            const float * h_tgt = h_tgt_in ? h_tgt_in : llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = h_tgt_in ? h_tgt_in : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const auto & t = batch_in.tokens[k];
@@ -2258,7 +2258,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // a reset reseeds the chain, which breaks probabilistic drafting
             if (!dp.result_q) {
-                common_sampler_reset(smpls[seq_id].get());
+            common_sampler_reset(smpls[seq_id].get());
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
@@ -2380,7 +2380,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
                     i_last[seq_id] = idx;
                 }
-            }
+                }
 
             if (batch.size() == 0) {
                 break;
