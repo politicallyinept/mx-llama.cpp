@@ -252,6 +252,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q5_1:
                 break;
+            case GGML_TYPE_Q4_0: {
+                // Opt-in like ggml_cuda_repack_tensor_supported: env-gated so
+                // the buft-selection gate and the dispatch gate stay in sync.
+                static const bool s_q4_0 = [] {
+                    const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+                    return e != nullptr && atoi(e) != 0;
+                }();
+                if (!s_q4_0) return false;
+            } break;
             default:
                 return false;
         }
@@ -523,14 +532,14 @@ static bool ggml_backend_meta_buffer_type_is_host(ggml_backend_buffer_type_t buf
 }
 
 static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_iface = {
-    /* .get_name            = */ ggml_backend_meta_buffer_type_get_name,
-    /* .alloc_buffer        = */ ggml_backend_meta_buffer_type_alloc_buffer,
+    /* .get_name         = */ ggml_backend_meta_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_meta_buffer_type_alloc_buffer,
     /* .alloc_buffer_n      = */ ggml_backend_meta_buffer_type_alloc_buffer_n,
-    /* .get_alignment       = */ ggml_backend_meta_buffer_type_get_alignment,
-    /* .get_max_size        = */ ggml_backend_meta_buffer_type_get_max_size,
-    /* .get_alloc_size      = */ ggml_backend_meta_buffer_type_get_alloc_size,
+    /* .get_alignment    = */ ggml_backend_meta_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_meta_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_meta_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
-    /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
+    /* .is_host          = */ ggml_backend_meta_buffer_type_is_host,
 };
 
 bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
@@ -1286,7 +1295,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     // full-tensor view created with ggml_view_tensor, transparent for the split state
                     split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
                 } else {
-                    split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
                 }
             } break;
             case GGML_OP_DUP: {
@@ -1640,9 +1649,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         if (!ggml_backend_meta_is_host_view(tensor)) {
             // name the tensor rather than aborting on a bare line number, this fires under -tps when a node ends up outside the meta buffer
             GGML_LOG_ERROR("%s: tensor '%s' (op %s) is not in a meta buffer, it is in '%s'%c",
-                    __func__, tensor->name, ggml_op_name(tensor->op),
+                __func__, tensor->name, ggml_op_name(tensor->op),
                     tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "(null)", 10);
-        }
+    }
         GGML_ASSERT(ggml_backend_meta_is_host_view(tensor));
 
         // the view is not allocated in the meta buffer, it is not split across the sub-devices
@@ -4499,22 +4508,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
             if (ggml_nelements(node) > 0) {
-                ggml_tensor * node_zero = get_node_aux(node);
+            ggml_tensor * node_zero = get_node_aux(node);
                 node_zero->op = GGML_OP_FILL;
                 node_zero->src[0] = node; // only used for the shape, the data is not read
-                ggml_set_op_params_f32(node_zero, 0, 0.0f);
-                node_zero->data = node->data;
-                node_zero->buffer = node->buffer;
-                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
-                step_cgraphs[k] = get_cgraph_aux();
-                step_cgraphs[k]->nodes[0] = node_zero;
-                step_cgraphs[k]->n_nodes = 1;
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
+            step_cgraphs[k] = get_cgraph_aux();
+            step_cgraphs[k]->nodes[0] = node_zero;
+            step_cgraphs[k]->n_nodes = 1;
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, step_cgraphs[k]);
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
             }
+        }
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 

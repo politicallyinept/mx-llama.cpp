@@ -234,12 +234,12 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
     }
 
     // pre-norm state for MTP; set even when extraction is off
-    cb(cur, "h_nextn", -1);
-    res->t_h_nextn = cur;
+        cb(cur, "h_nextn", -1);
+        res->t_h_nextn = cur;
 
     if (crop_after_nextn(inp_out_ids)) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
-    }
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
 
     cur = build_norm(cur,
             model.output_norm, NULL,

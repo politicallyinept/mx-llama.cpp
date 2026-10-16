@@ -2,6 +2,7 @@
 // repack routine, and the persistent per-view cache shared by dense and MoE paths.
 #include "repack.cuh"
 #include "repack-common.cuh"
+#include "ggml-cuda.h"   // GGML_LOG_WARN for the gate-engagement markers
 
 #include <cstdlib>
 
@@ -15,11 +16,44 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     if ((ggml_n_dims(t) != 2 && ggml_n_dims(t) != 3) || !ggml_is_contiguous(t)) {
         return false;
     }
+    // Q4_0 admission is opt-in: GGML_CUDA_REPACK_Q4_0=1. Unset/0 keeps the
+    // stock canonical-kernel path for Q4_0 exactly as before.
+    static const bool s_q4_0 = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0 gate ACTIVE: Q4_0 admitted to the gfx906 repack path\n");
+        }
+        return on;
+    }();
+    // Q4_1 admission is opt-in on the W4A4 gate: GGML_CUDA_W4A4_DOT8=4 admits
+    // Q4_1 to the repack pool AND selects the u4 (dp8a) decode. A Q4_1 tensor
+    // with the gate unset is NOT admitted at all (this returns false), so it
+    // never lands in repacked layout and silently runs a wrong fast path — the
+    // buffer falls back to the canonical stock path for it, byte-identical to
+    // pre-branch behavior.
+    // MIRROR RULE (peer review): admission must always mirror the decode
+    // predicates in q8_repack/mul-mat.cu. Gate 4 is a SUPERSET (per-32 Q4_0 u4
+    // + Q4_1 u4): Q4_0 admission is unchanged (GGML_CUDA_REPACK_Q4_0, modes
+    // 1-4 all use the same repacked Q4_0 layout), Q4_1 admission stays
+    // DOT8==4-only. A tensor that is admitted is decoded by exactly the path
+    // its type selects; a tensor that is not admitted never reaches a u4 path.
+    static const bool s_q4_1 = [] {
+        const char * e = getenv("GGML_CUDA_W4A4_DOT8");
+        const bool on = e != nullptr && atoi(e) == 4;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_W4A4_DOT8=4 gate ACTIVE: Q4_1 admitted to the gfx906 repack path (u4 dp8a decode)\n");
+        }
+        return on;
+    }();
     switch (t->type) {
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ4_NL: {
             return t->ne[0] % 32 == 0;
+        }
+        case GGML_TYPE_Q4_0: {
+            return s_q4_0 && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q4_K:
@@ -30,6 +64,13 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         case GGML_TYPE_Q5_1: {
             // 32-value blocks, multi-plane like the K-quants, so no view splice either
             return t->ne[0] % 32 == 0 && t->view_src == nullptr;
+        }
+        case GGML_TYPE_Q4_1: {
+            // Gated on GGML_CUDA_W4A4_DOT8=4 (s_q4_1 above). 32-value blocks,
+            // two-plane (nibble rows + half2 {d,m} plane) like Q5_1, so no view
+            // splice either. With the gate unset this returns false: the tensor
+            // is not repacked at all and runs the canonical stock path.
+            return s_q4_1 && t->ne[0] % 32 == 0 && t->view_src == nullptr;
         }
         default:             return false;
     }
@@ -303,6 +344,28 @@ void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0
     }
 }
 
+// Host repack of one Q4_1 matrix: the canonical nibble bytes (already in plane
+// order: byte i = value i | value (16+i) << 4, Q4_0's byte order) and the half2
+// {d, m} per 32-value block. Q5_1's converter minus the fifth-bit plane.
+void repack_q41_host(const block_q4_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
+    GGML_ASSERT(ne0 % 32 == 0);
+    const int64_t n_sub  = ne0 / 32;
+    const int64_t qs_str = repack_qs_row_stride(GGML_TYPE_Q4_1, ne0);
+    const size_t  doff   = (size_t) ne1 * qs_str;
+
+    memset(dst, 0, doff + (size_t) ne1 * n_sub * 4);
+
+    for (int64_t row = 0; row < ne1; row++) {
+        const block_q4_1 * brow = blocks + row * n_sub;
+        for (int64_t sb = 0; sb < n_sub; sb++) {
+            const block_q4_1 * b = &brow[sb];
+            const size_t wi = (size_t) row * n_sub + sb;
+            memcpy(dst + (size_t) row * qs_str + (size_t) sb * 16, b->qs, 16);
+            memcpy(dst + doff + wi * 4, &b->dm, 4);
+        }
+    }
+}
+
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1) {
     switch (type) {
         case GGML_TYPE_Q8_0:
@@ -312,6 +375,11 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             repack_mxfp4_host((const block_mxfp4 *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_IQ4_NL:
+            repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_0:
+            // block_q4_0 is byte-identical to block_iq4_nl (f16 d + 16 nibble
+            // bytes), so the converter is the same routine.
             repack_iq4nl_host((const block_iq4_nl *) blocks, dst, ne0, ne1);
             break;
         case GGML_TYPE_Q6_K:
@@ -325,6 +393,9 @@ void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64
             break;
         case GGML_TYPE_Q5_1:
             repack_q51_host((const block_q5_1 *) blocks, dst, ne0, ne1);
+            break;
+        case GGML_TYPE_Q4_1:
+            repack_q41_host((const block_q4_1 *) blocks, dst, ne0, ne1);
             break;
         default:
             GGML_ABORT("unsupported repack type");
@@ -360,7 +431,7 @@ const uint8_t * repack_view_get_cached(
         const ggml_tensor * view, const ggml_tensor * base,
         cudaStream_t stream) {
     // the K-quant multi-plane layouts have no view splice: supports() refuses their views
-    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && base->type != GGML_TYPE_Q5_1 && "repack: multi-plane views are not spliced");
+    GGML_ASSERT(base->type != GGML_TYPE_Q6_K && base->type != GGML_TYPE_Q4_K && base->type != GGML_TYPE_Q5_K && base->type != GGML_TYPE_Q5_1 && base->type != GGML_TYPE_Q4_1 && "repack: multi-plane views are not spliced");
     const int64_t ne0_v = view->ne[0];
     const int64_t ne1_v = view->ne[1];
     const int64_t ne2_v = view->ne[2];
@@ -428,5 +499,45 @@ void repack_view_cache_purge(int device, const void * base, size_t size) {
         } else {
             ++it;
         }
+    }
+}
+
+
+// Host reference quantizer: fp32 -> block_q8_1_u4 (scheme B, per-32 asymmetric
+// uint4). Vectorized reference impl: one pass for min/max, one pass to pack the
+// nibble pairs. k must be a multiple of 32. NOT dispatched anywhere yet
+// (milestone 2 wires it into mul_mat_vec_repacked_nc / the GEMM path).
+void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+    GGML_ASSERT(k % 32 == 0);
+
+    block_q8_1_u4 * GGML_RESTRICT y = (block_q8_1_u4 *) vy;
+    const int nb = (int) (k / 32);
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float * GGML_RESTRICT xb = x + ib * 32;
+
+        float mn = xb[0], mx = xb[0];
+        for (int i = 1; i < 32; ++i) {
+            mn = mn < xb[i] ? mn : xb[i];
+            mx = mx > xb[i] ? mx : xb[i];
+        }
+
+        const float d  = (mx - mn) / 15.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+        uint8_t * GGML_RESTRICT q = y[ib].qs;
+        // De-interleaved byte order mirroring canonical Q4_0 weights
+        // (ggml-quants.c:137-141): byte j = {value j low, value j+16 high},
+        // so sdot8 against the repacked weight pairs value i with value i.
+        for (int i = 0; i < 16; ++i) {
+            int q0 = (int) roundf((xb[i]     - mn) * id);
+            int q1 = (int) roundf((xb[i + 16] - mn) * id);
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
+            q[i] = (uint8_t) (q0 | (q1 << 4));   // byte j = {j low, j+16 high}
+        }
+
+        y[ib].d4 = (ggml_half) d;
+        y[ib].m  = (ggml_half) mn;
     }
 }

@@ -131,6 +131,12 @@ struct CustomARContext {
     bool prefer_small_twoshot = false;
     bool logged_small_twoshot = false;
 
+    // MTP lossless guard state (GGML_TP_AR_MTP_SAFE=1/2): element count of
+    // the last AR served by the custom path, and the sticky lock flag. See
+    // tp_custom_ar_mtp_safe_transition() for the rationale.
+    int64_t last_ne = -1;
+    bool    mtp_safe_locked = false;
+
     // Physical CUDA/HIP device id for each rank. The single-stage TP case has
     // dev_ids[r] == r, but multi-stage TP (vLLM-style TP x PP) gives each stage
     // a non-contiguous slice of the device set, so dev_ids[r] != r in general.
@@ -147,6 +153,26 @@ void tp_custom_ar_init(CustomARContext * ctx, int nranks, const int * dev_ids = 
 
 // Destroy: free signal buffers and rank data.
 void tp_custom_ar_destroy(CustomARContext * ctx);
+
+// MTP lossless guard (GGML_TP_AR_MTP_SAFE=1/2). Returns true when the
+// caller must avoid the custom AllReduce path for an AR of `n_elements`.
+//
+// Evidence (2026-09-25 re-verification, Qwen3.6-27B Native-MTP, 3x MI50,
+// build-w4a4 post-M4-fix 2e8499bb6): greedy MTP output diverges from the
+// byte-identical no-MTP control under EVERY custom-AR knob combination
+// (twoshot on/off, skip_xbar on/off, broadcast+barrier), while the same
+// comparison is byte-identical with GGML_ENABLE_CUSTOM_AR=0 and in
+// -sm layer mode. The trigger is speculative decoding alternating AR
+// batch widths (draft batch vs verify batch): the custom kernels' staging
+// layout, parity double-buffering and shared per-block signal counters are
+// only proven safe for a single steady width per context, because captured
+// graphs replay asynchronously and a width transition lets calls from the
+// two widths interleave on the same staging/signal state. A per-width
+// staging pool was tried and is NOT sufficient (the shared signal/flag
+// state still pairs mismatched-width calls), so the guard is a sticky lock:
+// the first observed width transition routes this context permanently to
+// the regular AllReduce path. =2 logs the transition.
+bool tp_custom_ar_mtp_safe_transition(CustomARContext * ctx, int64_t n_elements);
 
 // Launch the AllReduce on all devices. Returns false without launching when
 // the custom staging allocation cannot be satisfied.
