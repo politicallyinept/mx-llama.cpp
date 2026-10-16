@@ -97,6 +97,10 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 break;
             case GGML_TYPE_Q4_0:
                 mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q4_0><<<grid, 128, 0, stream>>>(
+                    w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(), (uint32_t) ne02,
+                    expert_stride, (uint32_t) x_stride, dst_s1);
+                break;
             case GGML_TYPE_Q5_1:
                 mul_mat_vec_repacked_id1<4, 2, 2, GGML_TYPE_Q5_1><<<grid, 128, 0, stream>>>(
                     w, src1_q8_1_d, dst_d, (uint32_t) ne00, (uint32_t) ne01,
@@ -167,6 +171,10 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
             case GGML_TYPE_Q4_0: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q4_0, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (const int32_t *) ids->data, nchannels_y, expert_stride,
+                    xs_id, dst_s1);
+            } break;
             case GGML_TYPE_Q5_1: {
                 const dim3 grid((ne01 + 63) / 64, n_assign, 1);
                 mul_mat_vec_rp<GGML_TYPE_Q5_1, 64, 16, true, 16><<<grid, 1024, 0, stream>>>(

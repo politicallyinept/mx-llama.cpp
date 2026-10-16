@@ -516,7 +516,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 #endif
 }
 
-template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL>
+template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, int KSPLIT = 1>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -525,6 +525,9 @@ static __device__ void mmq_gemm_repacked_impl(
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
+    // GGML_RP_KSPLIT: K-sliced GEMM variant. Dense only (the partial-buffer
+    // epilogue has no ids scatter); KSPLIT == 1 is the stock single-pass form.
+    static_assert(KSPLIT == 1 || !HAS_IDS, "K-split GEMM is dense-only");
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
     const int t  = threadIdx.x + threadIdx.y * blockDim.x;
     const int tx = threadIdx.x;
@@ -548,13 +551,26 @@ static __device__ void mmq_gemm_repacked_impl(
     }
 
     const uint32_t n_sub = ne0 >> 5;
+    // GGML_RP_KSPLIT: grid.z slices the K range into KSPLIT contiguous slabs
+    // of kb_slice 32-value blocks (a multiple of MMQ_RP_Q8_BK so a full slice
+    // keeps the BK-aligned pipeline shape). KSPLIT == 1 folds to the stock
+    // [0, n_sub) range at compile time -- zero codegen change when off.
+    const uint32_t kb_slice = KSPLIT > 1
+        ? ((n_sub + KSPLIT - 1) / KSPLIT + (MMQ_RP_Q8_BK - 1)) / MMQ_RP_Q8_BK * MMQ_RP_Q8_BK
+        : n_sub;
+    const uint32_t sb_lo = KSPLIT > 1 ? blockIdx.z * kb_slice : 0u;
+    const uint32_t sb_hi = KSPLIT > 1
+        ? (sb_lo + kb_slice < n_sub ? sb_lo + kb_slice : n_sub) : n_sub;
     // All layout knowledge lives in rp_traits<WT>: geometry constants built
     // once, sub-block fetches through load_w. The LDS scale array stays
     // the trait's slot_t - traits::scale() decodes the raw slot.
     const typename rp_traits<WT>::geom wg(ne0, ne1);
     const block_q8_1_mmq_h * __restrict__ xmmq = reinterpret_cast<const block_q8_1_mmq_h *>(xq);
 
-    const block_q8_1_mmq_h * x_group = xmmq;
+    // The mmq group index is sb/BK; a slice starts mid-pool at sb_lo/BK groups.
+    const block_q8_1_mmq_h * x_group = KSPLIT > 1
+        ? xmmq + (size_t) (sb_lo / MMQ_RP_Q8_BK) * n_tok
+        : xmmq;
 
     // Raw-register types (MXFP4) prefetch one uint4 of packed nibbles per
     // sub-block - half the live registers of the expanded pair, which spilled
@@ -605,8 +621,11 @@ static __device__ void mmq_gemm_repacked_impl(
     } else {
         full_n = tok0 + BN <= n_tok;
     }
-    const uint32_t n_main = n_sub & ~(MMQ_RP_Q8_BK - 1u);
-    const bool full_k = n_main == n_sub;
+    const uint32_t slice_len = sb_hi - sb_lo;
+    const uint32_t n_main = slice_len & ~(MMQ_RP_Q8_BK - 1u);
+    // slice_len > 0: a tail slice can be empty when kb_slice rounds up; the
+    // checked path then stages nothing and the block writes a zero plane.
+    const bool full_k = n_main == slice_len && slice_len > 0;
     const bool full_tile = full_m && full_n && full_k &&
                            (NTHREADS <= X_ELM) && (NTHREADS <= W_ELM);
 
@@ -624,7 +643,7 @@ static __device__ void mmq_gemm_repacked_impl(
             const int      lk   = e % MMQ_RP_Q8_BK;
             const uint32_t sb   = sb0 + lk;
             const uint32_t wrow = row0 + lr;
-            if (wrow < ne1 && sb < n_sub) {
+            if (wrow < ne1 && sb < sb_hi) {
                 if constexpr (RAW_REG) {
                     rp_traits<WT>::load_w_raw(wbase, wg, wrow, sb, pw_lo[i], pw_d[i]);
                 } else {
@@ -660,7 +679,7 @@ static __device__ void mmq_gemm_repacked_impl(
                 xval = a < a_end;
                 xcol = xval ? sCol[lr] : 0;
             }
-            if (xval && sb < n_sub) {
+            if (xval && sb < sb_hi) {
                 if constexpr (rp_traits<WT>::affine) {
                     px[i] = rp_x_sub_from_mmq_group_ds(x_grp, xcol, lk, px_s[i]);
                 } else {
@@ -862,14 +881,14 @@ static __device__ void mmq_gemm_repacked_impl(
 
     // Pipelined K loop: store current slab -> sync -> prefetch next slab -> compute -> sync.
     if (full_tile) {
-        prefetch_w_full(0);
-        prefetch_x_full(0, x_group);
+        prefetch_w_full(sb_lo);
+        prefetch_x_full(sb_lo, x_group);
 
-        for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_Q8_BK) {
+        for (uint32_t sb0 = sb_lo; sb0 < sb_hi; sb0 += MMQ_RP_Q8_BK) {
             store_stage();
             __syncthreads();
 
-            if (sb0 + MMQ_RP_Q8_BK < n_sub) {
+            if (sb0 + MMQ_RP_Q8_BK < sb_hi) {
                 x_group += n_tok;
                 prefetch_w_full(sb0 + MMQ_RP_Q8_BK);
                 prefetch_x_full(sb0 + MMQ_RP_Q8_BK, x_group);
@@ -879,14 +898,14 @@ static __device__ void mmq_gemm_repacked_impl(
             __syncthreads();
         }
     } else {
-        prefetch_w_checked(0);
-        prefetch_x_checked(0, x_group);
+        prefetch_w_checked(sb_lo);
+        prefetch_x_checked(sb_lo, x_group);
 
-        for (uint32_t sb0 = 0; sb0 < n_sub; sb0 += MMQ_RP_Q8_BK) {
+        for (uint32_t sb0 = sb_lo; sb0 < sb_hi; sb0 += MMQ_RP_Q8_BK) {
             store_stage();
             __syncthreads();
 
-            if (sb0 + MMQ_RP_Q8_BK < n_sub) {
+            if (sb0 + MMQ_RP_Q8_BK < sb_hi) {
                 x_group += n_tok;
                 prefetch_w_checked(sb0 + MMQ_RP_Q8_BK);
                 prefetch_x_checked(sb0 + MMQ_RP_Q8_BK, x_group);
@@ -899,9 +918,15 @@ static __device__ void mmq_gemm_repacked_impl(
 
     // Epilogue: write accumulators to y (float4 when the row stride is aligned;
     // MoE scatters each column through ids_dst to its destination token).
+    // KSPLIT > 1: y points at the fp32 partial scratch, [KSPLIT][n_tok][ne1]
+    // row-major; this block writes its z plane, the fixed-order reduce kernel
+    // sums the planes afterwards. Output pitch becomes ne1 (always 4-aligned
+    // for the gated shapes, but vec_ok re-checks it).
+    float * const  y_out  = KSPLIT > 1 ? y + (size_t) blockIdx.z * n_tok * ne1 : y;
+    const uint32_t out_s1 = KSPLIT > 1 ? ne1 : dst_s1;
     const uint32_t rbase  = row0 + ty * NROW;
     const int      nvalid = min((int) ne1 - (int) rbase, NROW);
-    const bool     vec_ok = (dst_s1 & 3) == 0;
+    const bool     vec_ok = (out_s1 & 3) == 0;
     if (nvalid > 0) {
 #pragma unroll
         for (int n = 0; n < TN_; n++) {
@@ -918,7 +943,7 @@ static __device__ void mmq_gemm_repacked_impl(
                 if (tok >= n_tok) {
                     continue;
                 }
-                dst = y + (size_t) tok * dst_s1 + rbase;
+                dst = y_out + (size_t) tok * out_s1 + rbase;
             }
             static_assert(NROW % 4 == 0, "float4 epilogue needs NROW % 4 == 0");
 #pragma unroll
@@ -1216,7 +1241,7 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 #endif
 }
 
-template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0>
+template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, int KSPLIT = 1>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1226,11 +1251,38 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, KSPLIT>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+// GGML_RP_KSPLIT reduce: sum the KSPLIT fp32 partial planes (laid out
+// [z][tok][row], row pitch ne1) into dst in FIXED z order -- deterministic,
+// no atomics. One thread per (tok, row) output element.
+template <int KSPLIT>
+static __global__ void mmq_gemm_repacked_ksplit_reduce(
+        const float * __restrict__ part, float * __restrict__ y,
+        const uint32_t ne1, const uint32_t n_tok, const uint32_t dst_s1) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    const size_t plane = (size_t) n_tok * ne1;
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= plane) {
+        return;
+    }
+    float s = 0.0f;
+#pragma unroll
+    for (int z = 0; z < KSPLIT; ++z) {
+        s += part[(size_t) z * plane + i];
+    }
+    const uint32_t tok = (uint32_t) (i / ne1);
+    const uint32_t row = (uint32_t) (i % ne1);
+    y[(size_t) tok * dst_s1 + row] = s;
+#else
+    GGML_UNUSED_VARS(part, y, ne1, n_tok, dst_s1);
     NO_DEVICE_CODE;
 #endif
 }
