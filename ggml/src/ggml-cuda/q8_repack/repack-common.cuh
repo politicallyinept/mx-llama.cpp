@@ -42,7 +42,13 @@ static __host__ __device__ inline T repack_qs_stride(const T ne0) {
 // (ne0/2 B) and 1 B e8m0 scales per sub-block. Both share the de-alias bump.
 template <typename T>
 static __host__ __device__ inline T repack_qs_row_stride(const ggml_type type, const T ne0) {
-    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1) ? ne0 / 2 : ne0);
+    // MUST list every nibble-packed type admitted by ggml_cuda_repack_tensor_supported()
+    // (2 values per byte => qs row stride ne0/2). Keep this predicate in sync with
+    // repack_gcn_nbytes(): the Q4_0 admission once REPLACED the Q5_1 entry here instead of
+    // UNIONing it, which desynced this row stride from the allocation size for Q5_1.
+    // Q4_1 (q41-u4-probe) is UNIONed in the same way: canonical nibble bytes are
+    // byte-order-identical to Q4_0's, so its qs row is ne0/2 like every other entry.
+    return repack_qs_stride((type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) ? ne0 / 2 : ne0);
 }
 template <typename T>
 static __host__ __device__ inline T repack_scale_row_bytes(const ggml_type type, const T ne0) {
@@ -64,6 +70,11 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // IQ4_NL: the MXFP4 nibble plane with a 2-byte f16 scale plane, 18 B/block = canonical size, VRAM-neutral like the other two.
         case GGML_TYPE_IQ4_NL:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
+        // Q4_0: IQ4_NL's twin layout (block_q4_0 is byte-identical to block_iq4_nl),
+        // but affine decode: x = d*(q-8), the -8 term folded through the DS4
+        // activation sum like Q4_K's min. Env-gated: GGML_CUDA_REPACK_Q4_0.
+        case GGML_TYPE_Q4_0:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 2);
         // Q6_K: de-aliased low-nibble rows, then a highs plane [8 B/32], an int8 scale-pair plane [2 B/32] and an f16 d plane [2 B/256]: canonical 6.5625 bpw.
         case GGML_TYPE_Q6_K:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 10 + (size_t)((ne0 / 32 + 7) / 8) * 2);
@@ -76,13 +87,18 @@ static inline size_t repack_gcn_nbytes(const ggml_type type, const int64_t ne0, 
         // Q5_1: de-aliased nibble rows, a 4-byte fifth-bit plane and a half2 {d, m} plane per 32-value block: canonical 6 bpw.
         case GGML_TYPE_Q5_1:
             return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 8);
+        // Q4_1 (q41-u4-probe): de-aliased nibble rows plus a half2 {d, m} plane per
+        // 32-value block (Q5_1's planes minus the fifth-bit plane): canonical 5 bpw,
+        // VRAM-neutral like the other nibble types.
+        case GGML_TYPE_Q4_1:
+            return (size_t) ne1 * ((size_t) repack_qs_stride(ne0 / 2) + (size_t)(ne0 / 32) * 4);
         default:             GGML_ABORT("unsupported repack type");
     }
 }
 
 // Bytes per sub-block in the qs plane, and uint4 loads needed to fetch one.
 static __host__ __device__ inline int repack_qs_bytes(const ggml_type type) {
-    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1) ? 16 : 32;
+    return (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q5_1 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) ? 16 : 32;
 }
 
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
@@ -178,6 +194,55 @@ static_assert(sizeof(block_q8_1_mmq_ds_h) == sizeof(block_q8_1_mmq),
               "Unexpected block_q8_1_mmq_ds_h size");
 static_assert(offsetof(block_q8_1_mmq_ds_h, qs) == offsetof(block_q8_1_mmq, qs),
               "block_q8_1_mmq_ds_h qs offset mismatch");
+// Per-32 asymmetric uint4 activation block (scheme B, docs/w4a4-activation-study.md):
+// d4 = (max - min) / 15, value = qs_nibble * d4 + m (m = min). 32 nibbles pack
+// into 16 bytes in the same little-endian nibble-pair order as ggml_cuda_dp8a
+// operands (byte k = {2k, 2k+1}), so a block feeds 4 dp8a instrs directly.
+struct block_q8_1_u4 {
+    uint8_t   qs[16];  // 32 unsigned 4-bit values, little-endian nibble order
+    ggml_half d4;      // scale: (max - min) / 15
+    ggml_half m;       // offset: min
+};
+static_assert(sizeof(block_q8_1_u4) == 20, "block_q8_1_u4 must be 20 bytes");
+
+// C1/B8 milestone M1 port: per-8 asymmetric uint4 activation block (scheme B8,
+// docs/design-w4a4-per8.md §3, sealed in docs/w4a4-per8-m1.md). 32 bytes /
+// 32 values, uint4-alignable (2x16B) — simpler LDS/stride staging than the 20 B
+// per-32 u4 above.
+// Layout: uint4 word k (k=0..3) = values 8k..8k+7 (one per-8 sub-block per word).
+// Byte j of word k (little-endian) = { val 8k+2j (LOW nibble), val 8k+2j+1 (HIGH) }.
+// Nibbles are SIGNED two's-complement: a = (q - 8) & 0xF, matching the shipped
+// dp8a convention (block_q8_1_u4 stores the same signed nibble form).
+struct block_q8_1_u4p {
+    uint8_t   qs[16];  // 32 signed nibbles, 8 per word, word k = sub-block k
+    ggml_half d4[4];   // per-sub-block scale: (max_k - min_k) / 15
+    ggml_half m[4];    // per-sub-block min (q=0 maps to m; a_signed = -8)
+};
+static_assert(sizeof(block_q8_1_u4p) == 32, "block_q8_1_u4p must be 32 bytes");
+
+// Phase-2 per-16 activation block (gate 3, GGML_CUDA_W4A4_DOT8=3): TWO per-16
+// sub-blocks per 32 values, one fp16 {d4,m} pair per sub-block. 28 B per 32
+// values (u4 per-32 = 20 B, u4p per-8 = 32 B). Nibble order is the canonical
+// Q4_0 weight order (byte j = {val j low, val j+16 high}, SIGNED (q-8)&0xF
+// nibbles), so the sub-blocks are the value PAIRS {4k..4k+3, 16+4k..16+4k+3}
+// (k=0..1) — the same pairing the per-8 u4p uses, halved. The 28 B stride
+// keeps every block 4-byte aligned but NOT 16-byte aligned: qs is assembled as
+// four u32 words and the scale pair as two u32 words (the 20 B per-32 u4
+// precedent); never reinterpret_cast<uint4*> on a 28 B-strided pointer.
+struct __attribute__((aligned(4))) block_q8_1_u4x16 {
+    uint8_t   qs[16];   // 32 signed nibbles, canonical Q4_0 byte order
+    ggml_half d4[2];    // per-sub-block scale: (max_k - min_k) / 15
+    ggml_half m[2];     // per-sub-block min
+    uint8_t   pad[2];   // explicit tail: alignment-4 rounds 26 -> 28 B; the u32
+                        // scale-pair loads at offsets 16/20/24 need 4-byte alignment
+};
+static_assert(sizeof(block_q8_1_u4x16) == 28, "block_q8_1_u4x16 must be 28 bytes");
+static_assert(alignof(block_q8_1_u4x16) == 4, "block_q8_1_u4x16 must be 4-byte aligned");
+
+// Host reference quantizer (fp32 -> block_q8_1_u4), defined in repack-common.cu.
+// NOT wired into any dispatch yet - milestone 2 hooks it into the repacked paths.
+void quantize_row_q8_1_u4(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k);
+
 
 struct sXq_row_q8 {
     uint4 q[MMQ_RP_Q8_BK][2];
@@ -272,6 +337,68 @@ __device__ __forceinline__ rp_x_sub rp_x_sub_from_mmq_group_ds(
     const float2 ds = __half22float2(m.ds4[lk]);
     out.d = ds.x;
     s     = ds.y;
+    return out;
+}
+
+// W4A4 G2: fetch one 32-value u4 activation sub-block straight from the
+// token-major block_q8_1_u4 pool (quantize_mmq_q8_1_u4_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block). The block_q8_1_mmq 4-block grouping is
+// bypassed entirely: one block per (token, 32 values), so the caller indexes
+// blocks[tok * nkb + sb] with nkb = ne0_padded/32. The 20 B stride keeps
+// every block 4-byte aligned but is NOT 16-byte aligned, so qs is assembled
+// as four u32 words -- never reinterpret_cast<uint4*> on a 20 B-strided
+// pointer (misaligned; the decode kernel reads u32s for the same reason).
+// out.d carries d4 and s carries m; q1 is zero (unused under U4ACT -- the
+// dot8 path consumes one uint4 per 32-value block, no lo/hi half split).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4_from_blocks(
+        const block_q8_1_u4 * __restrict__ blocks, const uint32_t idx, float & s) {
+    const block_q8_1_u4 & b = blocks[idx];
+    const uint32_t      * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+    rp_x_sub out;
+    out.q0 = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+    out.q1 = make_uint4(0, 0, 0, 0);
+    out.d  = __half2float(b.d4);
+    s      = __half2float(b.m);
+    return out;
+}
+
+// C1/B8 M4: fetch one 32-value u4p activation sub-block straight from the
+// token-major block_q8_1_u4p pool (quantize_mmq_q8_1_u4p_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block, nkb = ne0/32). The 32 B stride keeps every
+// block 16 B aligned, so BOTH the qs nibbles and the d4[4]/m[4] fp16 quad load
+// as full uint4s (unlike the 20 B per-32 u4, which needed 4x u32 for qs).
+// q0 = the 32 signed two's-complement nibbles (4 words, one per-8 sub-block
+// each); q1 = the 8 fp16 scales packed as {d4_0,d4_1},{d4_2,d4_3},{m_0,m_1},
+// {m_2,m_3} — the d4[4]+m[4] array is 16 B contiguous at offset 16. out.d is
+// unused under U4P8 (the per-8 scales ride q1, not the per-32 sXd/sXs tiles).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4p_from_blocks(
+        const block_q8_1_u4p * __restrict__ blocks, const uint32_t idx) {
+    const block_q8_1_u4p & b = blocks[idx];
+    rp_x_sub out;
+    out.q0 = *reinterpret_cast<const uint4 *>(b.qs);
+    out.q1 = *reinterpret_cast<const uint4 *>(b.d4);
+    out.d  = 0.0f;
+    return out;
+}
+
+// Phase-2 gate 3: fetch one 32-value per-16 activation block from the
+// token-major block_q8_1_u4x16 pool (quantize_mmq_q8_1_u4x16_cuda output,
+// ib = (z*ne1 + x)*nkb + k_block, nkb = ne0/32). The 28 B stride keeps every
+// block 4 B aligned but NOT 16 B aligned, so BOTH the qs nibbles and the
+// d4[2]/m[2] pair are assembled as u32 words (the 20 B per-32 u4 precedent) —
+// never a uint4 load on a 28 B-strided pointer. q0 = the 32 signed
+// two's-complement nibbles (4 words); q1 = the fp16 scales as
+// {d4_0,d4_1},{m_0,m_1} (the per-16 twin of rp_x_sub_u4p_from_blocks' quad).
+// out.d is unused (the per-16 scales ride q1, not the per-32 sXd/sXs tiles).
+__device__ __forceinline__ rp_x_sub rp_x_sub_u4x16_from_blocks(
+        const block_q8_1_u4x16 * __restrict__ blocks, const uint32_t idx) {
+    const block_q8_1_u4x16 & b = blocks[idx];
+    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(b.qs);
+    const uint32_t * s32 = reinterpret_cast<const uint32_t *>(b.d4);
+    rp_x_sub out;
+    out.q0 = make_uint4(q32[0], q32[1], q32[2], q32[3]);
+    out.q1 = make_uint4(s32[0], s32[1], 0u, 0u);
+    out.d  = 0.0f;
     return out;
 }
 
@@ -394,6 +521,117 @@ template <> struct rp_traits<GGML_TYPE_IQ4_NL> {
     }
     static __device__ __forceinline__ void expand_raw(const uint4 raw, uint4 & lo, uint4 & hi) {
         rp_iq4nl_expand(raw, lo, hi);
+    }
+#endif
+};
+
+// Q4_0: IQ4_NL's twin repack layout (de-aliased nibble rows + f16 scale plane,
+// byte-identical converter), but affine decode: value = d*(nib - 8), so the
+// dot is d*(nib . x) - 8*d*(sum x). The mmq_get_q8_1_ds_layout table already
+// maps Q4_0 to DS4, so both the batched mat-vec (block_q8_1.ds.y) and the GEMM
+// (DS4 slot) activation sums arrive without further setup. scale2 returns
+// {d, 8*d} for the affine epilogue's dlo*dx*idot - dhi*sum form.
+template <> struct rp_traits<GGML_TYPE_Q4_0> {
+    using slot_t = uint16_t;   // f16 scale
+    static constexpr bool split_scales = false;
+    static constexpr bool affine       = true;
+    // W4A4: this type supports the u4-activation (dp8a) decode variant. Only
+    // consumed when the U4ACT template variant is selected by the env gate
+    // (GGML_CUDA_W4A4_DOT8); the default q8_1-activation path ignores it.
+    static constexpr bool u4_act      = true;
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   dplane_off;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_0, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5), dplane_off((size_t) ne1 * rs) {}
+    };
+    static constexpr bool raw_lds = false;
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        const uint4  pk = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        lo = make_uint4(pk.x & 0x0F0F0F0Fu, pk.y & 0x0F0F0F0Fu,
+                        pk.z & 0x0F0F0F0Fu, pk.w & 0x0F0F0F0Fu);
+        hi = make_uint4((pk.x >> 4) & 0x0F0F0F0Fu, (pk.y >> 4) & 0x0F0F0F0Fu,
+                        (pk.z >> 4) & 0x0F0F0F0Fu, (pk.w >> 4) & 0x0F0F0F0Fu);
+        d = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    // W4A4 milestone 2b: raw (unmasked) packed nibble pair for the dp8a path.
+    // One uint4 = 16 B = one 32-value block, byte-identical to the canonical
+    // Q4_0 qs bytes (excess-8 codes, interleaved pairs).
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint16_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = reinterpret_cast<const uint16_t *>(wbase + g.dplane_off)[(size_t) wrow * g.n_sub + sb];
+    }
+    static __device__ __forceinline__ float scale(const uint16_t s) {
+        return __half2float(*reinterpret_cast<const __half *>(&s));
+    }
+    static __device__ __forceinline__ float2 scale2(const uint16_t s) {
+        const float d = __half2float(*reinterpret_cast<const __half *>(&s));
+        return make_float2(d, 8.0f * d);
+    }
+#endif
+};
+
+// Q4_1 (q41-u4-probe): the 32-value affine block x = d*q + m with q an UNSIGNED
+// int4 nibble, one half2 {d, m} per block — Q5_1's layout minus the fifth-bit
+// plane (the canonical block_q4_1 keeps nibbles as byte i = value i | value
+// (16+i) << 4, exactly Q4_0's byte order, so the nibble plane is a copy).
+// Stock (q8_1-activation) decode uses the shipped affine epilogue
+// dlo*dx*idot - dhi*sx with scale2 = {d, -m} (the Q5_1 twin). The u4 (dp8a)
+// decode is NOT expressible through scale2: the weight nibbles are XOR-8'd to
+// two's complement at prefetch while the activation nibbles stay raw, so the
+// Q4_1 u4 epilogue carries BOTH cross terms — see the U4Q41 branches in
+// repack-kernels.cuh (derived literally from the shipped Q4_0 u4 branch and
+// the shipped Q4_K affine branch; sealed in math_seal_q41.cc).
+template <> struct rp_traits<GGML_TYPE_Q4_1> {
+    using slot_t = uint32_t;   // half2 {d, m} bits
+    static constexpr bool split_scales = false;
+    static constexpr bool affine       = true;
+    static constexpr bool raw_lds      = false;
+    struct geom {
+        uint32_t rs, rs_u4, n_sub;
+        size_t   doff;
+        __host__ __device__ geom(uint32_t ne0, uint32_t ne1)
+            : rs(repack_qs_row_stride(GGML_TYPE_Q4_1, ne0)), rs_u4(rs >> 4),
+              n_sub(ne0 >> 5),
+              doff((size_t) ne1 * rs) {}
+    };
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    static __device__ __forceinline__ void load_w(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & lo, uint4 & hi, uint32_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        const uint4  pk = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        lo = make_uint4(pk.x & 0x0F0F0F0Fu, pk.y & 0x0F0F0F0Fu,
+                        pk.z & 0x0F0F0F0Fu, pk.w & 0x0F0F0F0Fu);
+        hi = make_uint4((pk.x >> 4) & 0x0F0F0F0Fu, (pk.y >> 4) & 0x0F0F0F0Fu,
+                        (pk.z >> 4) & 0x0F0F0F0Fu, (pk.w >> 4) & 0x0F0F0F0Fu);
+        d = *reinterpret_cast<const uint32_t *>(wbase + g.doff + ((size_t) wrow * g.n_sub + sb) * 4);
+    }
+    // dp8a path: raw packed nibble uint4 (byte-order-identical to canonical
+    // Q4_1 qs, same contract as rp_traits<Q4_0>::load_w_raw).
+    static __device__ __forceinline__ void load_w_raw(const uint8_t * __restrict__ wbase,
+            const geom & g, uint32_t wrow, uint32_t sb, uint4 & raw, uint32_t & d) {
+        const uint4 * qsp = reinterpret_cast<const uint4 *>(wbase);
+        raw = rp_ldcs_u4(qsp + (size_t) wrow * g.rs_u4 + sb);
+        d   = *reinterpret_cast<const uint32_t *>(wbase + g.doff + ((size_t) wrow * g.n_sub + sb) * 4);
+    }
+    static __device__ __forceinline__ float scale(const uint32_t slot) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2 *>(&slot));
+        return dm.x;
+    }
+    // {d, -m}: the stock affine epilogue does dlo*dx*idot - dhi*sum (Q5_1's form).
+    static __device__ __forceinline__ float2 scale2(const uint32_t slot) {
+        const float2 dm = __half22float2(*reinterpret_cast<const half2 *>(&slot));
+        return make_float2(dm.x, -dm.y);
+    }
+    // u4 (dp8a) path: the raw {d, m} pair (the u4 epilogue needs +m, not -m).
+    static __device__ __forceinline__ float2 dm(const uint32_t slot) {
+        return __half22float2(*reinterpret_cast<const half2 *>(&slot));
     }
 #endif
 };
@@ -601,7 +839,10 @@ template <> struct rp_traits<GGML_TYPE_Q5_1> {
 };
 
 // One entry per supported repack type - generates the dispatch switches.
-#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q5_1)
+// Q4_1 is gated: it joins the pool only under GGML_CUDA_W4A4_DOT8=4 (see
+// ggml_cuda_repack_tensor_supported), same opt-in discipline as Q4_0's
+// GGML_CUDA_REPACK_Q4_0.
+#define RP_FOREACH_TYPE(X)     X(GGML_TYPE_Q8_0)          X(GGML_TYPE_MXFP4)          X(GGML_TYPE_IQ4_NL)          X(GGML_TYPE_Q6_K)          X(GGML_TYPE_Q4_K)          X(GGML_TYPE_Q5_K)          X(GGML_TYPE_Q4_0)          X(GGML_TYPE_Q5_1)          X(GGML_TYPE_Q4_1)
 void repack_q8_0_host(const block_q8_0 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_mxfp4_host(const block_mxfp4 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_iq4nl_host(const block_iq4_nl * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
@@ -609,6 +850,7 @@ void repack_q6k_host(const block_q6_K * blocks, uint8_t * dst, const int64_t ne0
 void repack_q4k_host(const block_q4_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_q5k_host(const block_q5_K * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_q51_host(const block_q5_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
+void repack_q41_host(const block_q4_1 * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 void repack_host(ggml_type type, const void * blocks, uint8_t * dst, const int64_t ne0, const int64_t ne1);
 
 const uint8_t * repack_view_get_cached(

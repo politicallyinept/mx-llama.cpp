@@ -182,8 +182,8 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
+    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
+    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
     return res;
@@ -211,15 +211,15 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
             default: GGML_ABORT("unsupported rope section order");
         }
 
-        std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
+            std::vector<llama_pos> pos_data(n_tokens*n_pos_per_embd);
         for (int64_t i = 0; i < n_tokens; ++i) {
             const bool is_embd = ubatch->is_mixed() ? ubatch->type[i] != 0 : true;
             for (int64_t s = 0; s < 4; ++s) {
                 const int64_t slot = is_embd ? slot_of_section[s] : s;
                 pos_data[s*n_tokens + i] = ubatch->pos[slot*n_tokens + i];
             }
-        }
-        ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
+            }
+            ggml_backend_tensor_set(pos, pos_data.data(), 0, pos_data.size()*ggml_element_size(pos));
     }
 }
 
@@ -504,7 +504,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
 
-    res &= s_copy_main->ne[0] == params.ubatch.n_seqs;
+    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -641,10 +641,10 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // the idxs are left unallocated when the KV cache is bypassed during training
     if (self_k_idxs && self_k_idxs->buffer) {
-        mctx->set_input_k_idxs(self_k_idxs, ubatch);
+    mctx->set_input_k_idxs(self_k_idxs, ubatch);
     }
     if (self_v_idxs && self_v_idxs->buffer) {
-        mctx->set_input_v_idxs(self_v_idxs, ubatch);
+    mctx->set_input_v_idxs(self_v_idxs, ubatch);
     }
 
     // The mask is left unallocated when a graph only stores K/V without attending:
@@ -1298,7 +1298,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1340,7 +1340,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -1427,7 +1427,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
-    res &= inp_rs->s_copy_main->ne[0] == params.ubatch.n_seqs;
+    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
@@ -2656,14 +2656,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     // construct the input tensors
     {
-        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
-        cb(inp->tokens, "inp_tokens", -1);
-        ggml_set_input(inp->tokens);
-        res->t_inp_tokens = inp->tokens;
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    cb(inp->tokens, "inp_tokens", -1);
+    ggml_set_input(inp->tokens);
+    res->t_inp_tokens = inp->tokens;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
-        cb(inp->embd, "inp_embd", -1);
-        ggml_set_input(inp->embd);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    cb(inp->embd, "inp_embd", -1);
+    ggml_set_input(inp->embd);
 
         if (has_mixed) {
             inp->mixed_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tok_rows);
@@ -3298,13 +3298,13 @@ ggml_tensor * llm_graph_context::build_attn(
         k = k_cur;
         v = v_cur;
     } else {
-        {
-            const auto & k_idxs = inp->get_k_idxs();
-            const auto & v_idxs = inp->get_v_idxs();
+    {
+        const auto & k_idxs = inp->get_k_idxs();
+        const auto & v_idxs = inp->get_v_idxs();
 
-            build_cpy_k(mctx_cur, k_cur, k_idxs, il);
-            build_cpy_v(mctx_cur, v_cur, v_idxs, il);
-        }
+        build_cpy_k(mctx_cur, k_cur, k_idxs, il);
+        build_cpy_v(mctx_cur, v_cur, v_idxs, il);
+    }
 
         k = build_get_k(mctx_cur, il);
         v = build_get_v(mctx_cur, il);
@@ -4307,7 +4307,7 @@ void llm_graph_context::build_sampling() const {
         for (uint32_t i = 0; i < cparams.n_outputs_max_per_seq; ++i) {
             const bool     active = i < rows.size();
             const uint32_t row    = active ? rows[i] : 0;
-            const int      i_out  = active ? 1       : 0;
+        const int i_out   = active ? 1          : 0;
 
             ggml_tensor * logits_seq = ggml_view_1d(ctx0, logits_t, logits_t->ne[0], row * logits_t->nb[1]);
             ggml_format_name(logits_seq, "logits_seq_%d_%u", seq_id, i);

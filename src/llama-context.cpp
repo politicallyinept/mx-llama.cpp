@@ -294,8 +294,8 @@ llama_context::llama_context(
         }
     }
 
-    cparams.op_offload     = params.op_offload;
-    cparams.kv_unified     = params.kv_unified;
+    cparams.op_offload = params.op_offload;
+    cparams.kv_unified = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
 
     // initialized later
@@ -4271,8 +4271,8 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     }
 
     // the training graph is different, need to reserve again
-    sched_need_reserve = true;
-    sched_reserve();
+        sched_need_reserve = true;
+        sched_reserve();
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;

@@ -1031,14 +1031,14 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
-    /* .get_name            = */ ggml_backend_cuda_buffer_type_get_name,
-    /* .alloc_buffer        = */ ggml_backend_cuda_buffer_type_alloc_buffer,
+    /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
+    /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer,
     /* .alloc_buffer_n      = */ NULL,
-    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
-    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
-    /* .is_host             = */ NULL,
+    /* .is_host          = */ NULL,
 };
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
@@ -1293,6 +1293,16 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         input_ptrs[i]  = (float *) tensors[i]->data;
         output_ptrs[i] = (float *) tensors[i]->data;
         streams[i]     = cuda_ctx->stream();
+    }
+
+    // MTP lossless guard (GGML_TP_AR_MTP_SAFE=1/2): when speculative
+    // decoding alternates batch widths, the custom AR staging/parity/signal
+    // state is not lossless (see tp_custom_ar_mtp_safe_transition). On the
+    // first width transition the guard locks the custom path off for this
+    // context and we fall through to the regular AllReduce path. No-op
+    // unless the env var is set.
+    if (ggml_cuda_tp::tp_custom_ar_mtp_safe_transition(&comm_ctx->custom_ar, ne)) {
+        return false;
     }
 
     if (!ggml_cuda_tp::tp_custom_ar_prepare(
@@ -1558,8 +1568,8 @@ static void ggml_backend_cuda_comm_init_internal(ggml_backend_cuda_comm_context 
     // Clear sticky CUDA error from the failed init.
     (void) cudaGetLastError();
     if (ggml_cuda_has_internal_allreduce) {
-        GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
-                      "falling back to meta-backend butterfly\n");
+    GGML_LOG_WARN("internal AllReduce init failed (n_devices != 2?); "
+                  "falling back to meta-backend butterfly\n");
     } else {
         // Nothing failed -- this backend has no internal AllReduce to begin with.
         GGML_LOG_DEBUG("%s: internal AllReduce is not built for this backend; "
@@ -1672,9 +1682,9 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     if (rc == ncclSuccess) {
         const char * why = nullptr;
         if (ggml_backend_cuda_comm_nccl_probe(ret, &why)) {
-            ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
-            return;
-        }
+        ret->try_allreduce = ggml_backend_cuda_comm_try_allreduce_nccl;
+        return;
+    }
         for (ncclComm_t comm : ret->comms) {
             (void) ncclCommAbort(comm); // the comms are in an error state, Destroy can hang
         }
@@ -2054,14 +2064,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_host = {
         /* .iface    = */ {
-            /* .get_name            = */ ggml_backend_cuda_host_buffer_type_name,
-            /* .alloc_buffer        = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
+            /* .get_name         = */ ggml_backend_cuda_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
             /* .alloc_buffer_n      = */ NULL,
-            /* .get_alignment       = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-            /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .get_alloc_size_n    = */ NULL,
-            /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
         /* .context  = */ nullptr,
@@ -2616,7 +2626,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
-    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int cc      = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     use_mul_mat_vec_f = use_mul_mat_vec_f && ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, is_mul_mat_id ? src1->ne[2] : src1->ne[1]);
 
@@ -6122,12 +6132,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_moe_weighted_reduction_enabled() &&
                     ggml_cuda_match_moe_weighted_reduction(cgraph, i, match, /* for_alloc_deps = */ true)) {
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
-                if (match.expert_scale != nullptr) {
-                    params->add_alloc_dep(
-                        params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
-                }
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+                    if (match.expert_scale != nullptr) {
+                        params->add_alloc_dep(
+                            params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+                    }
                 i += match.node_count - 1;
             }
 
