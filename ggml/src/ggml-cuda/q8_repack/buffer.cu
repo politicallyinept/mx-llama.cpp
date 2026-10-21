@@ -199,6 +199,41 @@ static __global__ void repack_iq4nl_kernel(
     }
 }
 
+// Device-side Q4_0 repack (GGML_CUDA_W4A4_SUMW): IQ4_NL's converter plus the
+// SUMW plane write - one int16 per 32-value block at
+// dst + e*dst_stride + sw_off + (row*n_blocks + blk)*2, holding
+// (int16_t)((int) nib_sum - 256) computed SIGNED (milestone-3b class: the
+// unsigned subtraction wraps for the ~half of blocks whose nibble sum < 256).
+// Same formula as the host converter rp_sumw_fill_plane (seal: seal_sumw_plane.cc).
+static __global__ void repack_q40_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_blocks, const int64_t qs_str,
+        const int64_t qs_len, const int64_t sw_off,
+        const int64_t src_stride, const int64_t dst_stride,
+        const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t blk = i % n_blocks;
+        const int64_t row = (i / n_blocks) % ne1;
+        const int64_t e   = i / (n_blocks * ne1);
+
+        uint8_t * d_qs = dst + e * dst_stride + row * qs_str + blk * 16;
+        uint8_t * d_d  = dst + e * dst_stride + qs_len + (row * n_blocks + blk) * 2;
+
+        const uint8_t * sb = src + e * src_stride + (row * n_blocks + blk) * 18;
+        uint32_t nib = 0;
+#pragma unroll
+        for (int k = 0; k < 16; k++) {
+            d_qs[k] = sb[2 + k];
+            nib += (uint32_t) (sb[2 + k] & 0xFu) + (uint32_t) (sb[2 + k] >> 4);
+        }
+        d_d[0] = sb[0];
+        d_d[1] = sb[1];
+        const int16_t sw = (int16_t) ((int) nib - 256);
+        memcpy(dst + e * dst_stride + sw_off + (row * n_blocks + blk) * 2, &sw, 2);
+    }
+}
+
 // Device-side Q6_K repack, one thread per 32-value sub-block: the host converter's de-interleave, lows on the de-aliased row stride, highs, scale pair, and the f16 d plane written by the sub-block that owns k == 0 of its super-block.
 static __global__ void repack_q6k_kernel(
         const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
@@ -320,6 +355,35 @@ static __global__ void repack_q51_kernel(
     }
 }
 
+// Device-side Q4_1 repack (q41-u4-probe), one thread per 32-value block: the
+// canonical nibble bytes and the half2 {d, m} are copied into their planes —
+// repack_q51_kernel minus the fifth-bit word.
+static __global__ void repack_q41_kernel(
+        const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
+        const int64_t ne1, const int64_t n_sub, const int64_t qs_str,
+        const int64_t doff,
+        const int64_t src_stride, const int64_t dst_stride, const int64_t total) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+         i < total; i += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t sb  = i % n_sub;
+        const int64_t row = (i / n_sub) % ne1;
+        const int64_t e   = i / (n_sub * ne1);
+        const block_q4_1 * b = reinterpret_cast<const block_q4_1 *>(src + e * src_stride) + row * n_sub + sb;
+        uint8_t * base = dst + e * dst_stride;
+        const int64_t wi = row * n_sub + sb;
+        uint8_t * lows = base + row * qs_str + sb * 16;
+#pragma unroll
+        for (int j = 0; j < 16; j++) {
+            lows[j] = b->qs[j];
+        }
+        const uint8_t * bp = reinterpret_cast<const uint8_t *>(b);
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            base[doff + wi * 4 + j] = bp[j];
+        }
+    }
+}
+
 // Device-side Q5_K repack, one thread per 32-value sub-block: Q4_K's nibble pick plus the fifth-bit word gathered from qh, the scale record and {d, dmin} by k == 0.
 static __global__ void repack_q5k_kernel(
         const uint8_t * __restrict__ src, uint8_t * __restrict__ dst,
@@ -429,6 +493,21 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
                 break;
+            case GGML_TYPE_Q4_0:
+                // Byte-identical layout to IQ4_NL: reuse the converter kernel,
+                // or the SUMW variant when GGML_CUDA_W4A4_SUMW allocated the
+                // third plane (repack_gcn_nbytes grew the record to match).
+                if (repack_sumw_plane_on()) {
+                    const int64_t sw_off = ne1 * qs_str + ne1 * n_blocks * 2;
+                    repack_q40_kernel<<<grid, block, 0, stream>>>(
+                        st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                        ne1 * qs_str, sw_off, (int64_t) src_str, (int64_t) dst_str, n_out);
+                } else {
+                    repack_iq4nl_kernel<<<grid, block, 0, stream>>>(
+                        st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                        ne1 * qs_str, (int64_t) src_str, (int64_t) dst_str, n_out);
+                }
+                break;
             case GGML_TYPE_Q6_K: {
                 const int64_t nds  = (n_blocks + 7) / 8;
                 const int64_t hoff = ne1 * qs_str;
@@ -461,6 +540,12 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                 repack_q51_kernel<<<grid, block, 0, stream>>>(
                     st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
                     hoff, doff, (int64_t) src_str, (int64_t) dst_str, n_out);
+            } break;
+            case GGML_TYPE_Q4_1: {
+                const int64_t doff = ne1 * qs_str;
+                repack_q41_kernel<<<grid, block, 0, stream>>>(
+                    st.scratch, (uint8_t *) tensor->data, ne1, n_blocks, qs_str,
+                    doff, (int64_t) src_str, (int64_t) dst_str, n_out);
             } break;
             default:
                 GGML_ABORT("unsupported repack type for async upload");

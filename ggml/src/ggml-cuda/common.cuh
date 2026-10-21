@@ -752,6 +752,26 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 #endif // defined(GGML_USE_HIP)
 }
 
+// ggml_cuda_dp8a: 8-way signed int4 dot product (v_dot8_i32_i4 on gfx906).
+// Operand layout: each uint32 packs 8 signed nibbles; byte k holds the nibble
+// pair {2k, 2k+1} little-endian (low nibble = element 2k, high nibble = 2k+1).
+// gfx906-only: later AMD ISAs dropped the 8-way int4 dot, so mirror the dp4a
+// guards and keep the scalar nibble fallback for every other target.
+static __device__ __forceinline__ int ggml_cuda_dp8a(const int a, const int b, int c) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    return __builtin_amdgcn_sdot8(a, b, c, false);
+#else
+    const uint32_t ua = (uint32_t) a;
+    const uint32_t ub = (uint32_t) b;
+    for (int i = 0; i < 8; ++i) {
+        const int va = (int) (ua << (28 - 4*i)) >> 28;  // sign-extend nibble i
+        const int vb = (int) (ub << (28 - 4*i)) >> 28;
+        c += va * vb;
+    }
+    return c;
+#endif // defined(GGML_USE_HIP) && defined(__gfx906__)
+}
+
 static __device__ __forceinline__ void ggml_cuda_mad(float & acc, const float v, const float u) {
     acc += v*u;
 }

@@ -252,6 +252,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q5_1:
                 break;
+            case GGML_TYPE_Q4_0: {
+                // Opt-in like ggml_cuda_repack_tensor_supported: env-gated so
+                // the buft-selection gate and the dispatch gate stay in sync.
+                static const bool s_q4_0 = [] {
+                    const char * e = getenv("GGML_CUDA_REPACK_Q4_0");
+                    return e != nullptr && atoi(e) != 0;
+                }();
+                if (!s_q4_0) return false;
+            } break;
             default:
                 return false;
         }

@@ -28,6 +28,30 @@ void quantize_mmq_q8_1_cuda(
         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
 
+// W4A4 milestone 2a: fp32 -> block_q8_1_u4 (per-32 asymmetric uint4, signed
+// nibbles for dp8a). Unwired: no dispatch calls this yet.
+void quantize_mmq_q8_1_u4_cuda(
+        const float * x, void * vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream,
+        const char * src0_name = nullptr);
+
+// C1/B8 milestone M3: fp32 -> block_q8_1_u4p (per-8 asymmetric uint4, scheme
+// B8, canonical Q4_0 nibble order). Wired to the narrow-batch nc path under
+// GGML_CUDA_W4A4_DOT8=2.
+void quantize_mmq_q8_1_u4p_cuda(
+        const float * x, void * vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
+// Phase-2 gate 3: fp32 -> block_q8_1_u4x16 (per-16 asymmetric uint4, scheme
+// B16, canonical Q4_0 nibble order, word-pair sub-blocks). Wired to the GEMM
+// path under GGML_CUDA_W4A4_DOT8=3.
+void quantize_mmq_q8_1_u4x16_cuda(
+        const float * x, void * vy,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,

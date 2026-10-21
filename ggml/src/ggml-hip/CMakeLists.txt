@@ -61,6 +61,10 @@ file(GLOB   GGML_HEADERS_ROCM "../ggml-cuda/*.cuh" "../ggml-cuda/q8_repack/*.cuh
 list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu" "../ggml-cuda/q8_repack/*.cu")
+# W4A4 step2: the q8_repack *_test.cu harnesses carry their own main() and must
+# not be linked into the backend library (duplicate symbol: main when both the
+# u4 and u4p8 harnesses exist). Build them standalone with hipcc/clang++ instead.
+list(FILTER GGML_SOURCES_ROCM EXCLUDE REGEX ".*q8_repack/.*_test\\.cu$")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")

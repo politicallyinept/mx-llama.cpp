@@ -1295,6 +1295,16 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
         streams[i]     = cuda_ctx->stream();
     }
 
+    // MTP lossless guard (GGML_TP_AR_MTP_SAFE=1/2): when speculative
+    // decoding alternates batch widths, the custom AR staging/parity/signal
+    // state is not lossless (see tp_custom_ar_mtp_safe_transition). On the
+    // first width transition the guard locks the custom path off for this
+    // context and we fall through to the regular AllReduce path. No-op
+    // unless the env var is set.
+    if (ggml_cuda_tp::tp_custom_ar_mtp_safe_transition(&comm_ctx->custom_ar, ne)) {
+        return false;
+    }
+
     if (!ggml_cuda_tp::tp_custom_ar_prepare(
             &comm_ctx->custom_ar, input_ptrs, output_ptrs, ne, (int)n_backends, streams,
             &comm_ctx->ar_plan)) {
