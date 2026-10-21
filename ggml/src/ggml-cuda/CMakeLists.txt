@@ -115,6 +115,10 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu" "q8_repack/*.cu")
+    # W4A4: the q8_repack *_test.cu harnesses carry their own main() and must not
+    # be linked into the backend library (duplicate main; mirrors the ggml-hip
+    # filter). Build them standalone with nvcc/hipcc instead.
+    list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX ".*q8_repack/.*_test\\.cu$")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")

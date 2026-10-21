@@ -153,3 +153,11 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Local benchmark corpus (fetched by scripts/get-wikitext-2.sh)
+/scripts/wikitext-2-raw/
+
+# CPU-seal build outputs (generated + compiled by seals/build_seal.sh; the
+# sources seal_sumw_plane.cc are the committed ground truth)
+/seals/seal_gen.h
+/seals/seal_sumw_plane
