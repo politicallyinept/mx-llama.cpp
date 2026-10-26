@@ -3,6 +3,8 @@
 #include "topk-moe.cuh"
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 
 // Kernel config struct - passed by value to CUDA kernel
@@ -386,6 +388,176 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
     }
 }
 
+// CV split-k top-k router port: the warp kernel above is latency bound on gfx906 (n_expert_used rounds of argmax,
+// each with dependent shuffle pairs through LDS, on half a wave). Here each lane sorts its NE/64 probabilities in
+// registers, then n_expert_used rounds take the wave maximum of the list heads with DPP moves (no LDS) and pop the
+// winner; ties go to the lowest expert index as in the argmax rounds. The softmax sum and the weight sum are
+// accumulated exactly like the reference warp kernel (32-lane partials over experts L + 32 i in order i, then the
+// same butterfly), so ids and weights are bit-identical to the reference reduction order.
+#ifdef GGML_USE_HIP
+// width-parameterized warp reductions (the fork's common.cuh helpers have no width template parameter)
+template <int width>
+static __device__ __forceinline__ float topk_warp_reduce_sum(float x) {
+#pragma unroll
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        x += __shfl_xor_sync(0xffffffff, x, offset, width);
+    }
+    return x;
+}
+
+template <int width>
+static __device__ __forceinline__ float topk_warp_reduce_max(float x) {
+#pragma unroll
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        x = fmaxf(x, __shfl_xor_sync(0xffffffff, x, offset, width));
+    }
+    return x;
+}
+
+template <int ctrl, int row_mask = 0xF>
+static __device__ __forceinline__ uint32_t topk_dpp(const uint32_t v) {
+    return (uint32_t) __builtin_amdgcn_update_dpp((int) v, (int) v, ctrl, row_mask, 0xF, false);
+}
+
+// wave-wide unsigned max / min (result in every lane)
+template <bool MAX>
+static __device__ __forceinline__ uint32_t topk_wave_reduce(uint32_t v) {
+    const auto op = [](uint32_t a, uint32_t b) { return MAX ? max(a, b) : min(a, b); };
+    v = op(v, topk_dpp<0xB1>(v));        // quad_perm [1,0,3,2]
+    v = op(v, topk_dpp<0x4E>(v));        // quad_perm [2,3,0,1]
+    v = op(v, topk_dpp<0x141>(v));       // row_half_mirror
+    v = op(v, topk_dpp<0x140>(v));       // row_mirror: every lane has its row's result
+    v = op(v, topk_dpp<0x142, 0xA>(v));  // row_bcast15
+    v = op(v, topk_dpp<0x143, 0xC>(v));  // row_bcast31: lane 63 has the wave's result
+    return (uint32_t) __builtin_amdgcn_readlane((int) v, 63);
+}
+
+template <int NE>
+__launch_bounds__(64)
+static __global__ void topk_moe_sorted_gcn(const float * __restrict__ logits, float * __restrict__ weights, int32_t * __restrict__ ids,
+                                           const int n_expert_used, const float clamp_val, const float scale_val, const bool with_norm) {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__GFX9__) // selected on GCN only: other targets compile an empty kernel
+    constexpr int NL = 32;       // lanes of the reference warp kernel
+    constexpr int J  = NE/64;    // values per lane
+    const int row  = blockIdx.x;
+    const int lane = threadIdx.x;
+    __shared__ float sp[NE];
+    __shared__ float sel_p[64];
+    __shared__ int   sel_e[64];
+    __shared__ float red;
+
+    float v[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        v[j] = logits[(int64_t) row*NE + lane + 64*j];
+    }
+    float m = v[0];
+#pragma unroll
+    for (int j = 1; j < J; ++j) {
+        m = fmaxf(m, v[j]);
+    }
+    m = topk_warp_reduce_max<64>(m);
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        v[j] = expf(v[j] - m);
+        sp[lane + 64*j] = v[j];
+    }
+    __syncthreads();
+    // reference: lane L < 32 sums experts L + 32 i for i = 0 .. NE/32 - 1 in order, then a 32-lane butterfly
+    if (lane < NL) {
+        float s = 0.0f;
+#pragma unroll
+        for (int i = 0; i < NE/NL; ++i) {
+            s += sp[lane + NL*i];
+        }
+        s = topk_warp_reduce_sum<NL>(s);
+        if (lane == 0) {
+            red = s;
+        }
+    }
+    __syncthreads();
+    const float inv_sum = 1.0f / red;
+    uint32_t key[J];
+    int      ex[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        float p = v[j] * inv_sum;
+        if (__isnanf(p)) {
+            p = -FLT_MAX;
+        }
+        const uint32_t u = __float_as_uint(p);
+        key[j] = u & 0x80000000u ? ~u : u | 0x80000000u; // larger float -> larger key, never 0
+        ex[j]  = lane + 64*j;
+    }
+    // odd-even transposition sort, descending key (equal keys keep the lower expert first: e grows with j)
+#pragma unroll
+    for (int pass = 0; pass < J; ++pass) {
+#pragma unroll
+        for (int j = pass & 1; j + 1 < J; j += 2) {
+            if (key[j + 1] > key[j]) {
+                const uint32_t tk = key[j]; key[j] = key[j + 1]; key[j + 1] = tk;
+                const int      te = ex[j];  ex[j]  = ex[j + 1];  ex[j + 1]  = te;
+            }
+        }
+    }
+    for (int r = 0; r < n_expert_used; ++r) {
+        const uint32_t mk = topk_wave_reduce<true>(key[0]);
+        const uint64_t tied = __ballot(key[0] == mk);
+        int win;
+        if (__popcll(tied) == 1) {
+            win = __ffsll((unsigned long long) tied) - 1;
+        } else {
+            const uint32_t me = topk_wave_reduce<false>(key[0] == mk ? (uint32_t) ex[0] : 0xFFFFFFFFu);
+            win = __ffsll((unsigned long long) __ballot(key[0] == mk && (uint32_t) ex[0] == me)) - 1;
+        }
+        if (lane == win) {
+            const uint32_t k = key[0];
+            sel_p[r] = __uint_as_float(k & 0x80000000u ? k & 0x7FFFFFFFu : ~k);
+            sel_e[r] = ex[0];
+#pragma unroll
+            for (int j = 0; j + 1 < J; ++j) {
+                key[j] = key[j + 1];
+                ex[j]  = ex[j + 1];
+            }
+            key[J - 1] = 0;
+            ex[J - 1]  = 0x7FFFFFFF;
+        }
+    }
+    __syncthreads();
+    if (lane < n_expert_used) {
+        ids[(int64_t) row*NE + lane] = sel_e[lane];
+    }
+    if (lane < NL) {
+        float inv = 1.0f;
+        if (with_norm) {
+            float s = 0.0f;
+            for (int q = 0; q < n_expert_used; ++q) {
+                if (sel_e[q] % NL == lane) {
+                    s += sel_p[q];
+                }
+            }
+            s = topk_warp_reduce_sum<NL>(s);
+            s = fmaxf(s, clamp_val);
+            inv = 1.0f / s;
+        }
+        for (int q = lane; q < n_expert_used; q += NL) {
+            weights[(int64_t) row*n_expert_used + q] = (with_norm ? sel_p[q]*inv : sel_p[q]) * scale_val;
+        }
+    }
+#endif // gfx9 device code
+}
+
+// one-line engagement witness for the tail-kernel ports (GGML_CUDA_TAIL_TRACE=1)
+static void topk_moe_rank_trace(const int n_experts, const int n_expert_used, const int n_rows) {
+    static const bool trace = [] { const char * e = getenv("GGML_CUDA_TAIL_TRACE"); return e && atoi(e) != 0; }();
+    static bool fired = false;
+    if (trace && !fired) {
+        fired = true;
+        fprintf(stderr, "[topk_moe_sorted_gcn] n_experts=%d n_expert_used=%d n_rows=%d\n", n_experts, n_expert_used, n_rows);
+    }
+}
+#endif // GGML_USE_HIP
+
 void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             logits,
                            ggml_tensor *                   weights,
@@ -424,6 +596,23 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+
+#ifdef GGML_USE_HIP
+    static const bool rank_env = [] { const char * e = getenv("GGML_CUDA_TOPK_MOE_RANK"); return !e || atoi(e) != 0; }();
+    if (rank_env && !bias && !config.use_sigmoid && !config.use_sqrt_softplus && !config.delayed_softmax &&
+            n_expert_used <= 64 && GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ctx.device].cc) &&
+            (n_experts == 128 || n_experts == 256 || n_experts == 512)) {
+        cudaStream_t stream = ctx.stream();
+        topk_moe_rank_trace(n_experts, n_expert_used, n_rows);
+        switch (n_experts) {
+            case 128: topk_moe_sorted_gcn<128><<<n_rows, 64, 0, stream>>>(logits_d, weights_d, ids_d, n_expert_used, clamp_val, scale_val, with_norm); break;
+            case 256: topk_moe_sorted_gcn<256><<<n_rows, 64, 0, stream>>>(logits_d, weights_d, ids_d, n_expert_used, clamp_val, scale_val, with_norm); break;
+            default:  topk_moe_sorted_gcn<512><<<n_rows, 64, 0, stream>>>(logits_d, weights_d, ids_d, n_expert_used, clamp_val, scale_val, with_norm); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif // GGML_USE_HIP
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
