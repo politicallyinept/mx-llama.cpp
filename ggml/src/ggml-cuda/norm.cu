@@ -1,5 +1,7 @@
 #include "norm.cuh"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 
 template <int block_size, bool clamped = false>
 static __global__ void norm_f32(
@@ -396,6 +398,67 @@ static void group_norm_f32_cuda(
     }
 }
 
+// narrow contiguous rows (e.g. 128-wide per-head norms): one warp per row, float4 lanes, weight broadcast along the
+// row only. The generic kernel uses a 256-thread block per row, so such rows idle half the block and pay a
+// block-level reduction each.
+// src rows may be strided (s1/s2/s3 in floats, n1/n2 rows per channel/sample); dst rows are contiguous
+template <bool do_mul>
+static __global__ void rms_norm_f32_narrow(const float * __restrict__ x, float * __restrict__ dst,
+                                           const float * __restrict__ mul, const int ncols, const int64_t nrows_total,
+                                           const float eps, const float post_scale,
+                                           const int64_t n1, const int64_t n2, const int64_t s1, const int64_t s2, const int64_t s3) {
+    const int64_t row = (int64_t) blockIdx.x*(blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= nrows_total) {
+        return;
+    }
+    const int64_t i1 = row % n1, i2 = (row / n1) % n2, i3 = row / (n1*n2);
+    const float4 * xr = (const float4 *) (x + i1*s1 + i2*s2 + i3*s3);
+    float4 v[4];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = lane + k*WARP_SIZE;
+        if (j < ncols/4) {
+            v[k] = xr[j];
+            ss += v[k].x*v[k].x + v[k].y*v[k].y + v[k].z*v[k].z + v[k].w*v[k].w;
+        }
+    }
+    ss = warp_reduce_sum(ss);
+    const float r = rsqrtf(ss/ncols + eps) * post_scale;
+    float4 * dr = (float4 *) (dst + row*ncols);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int j = lane + k*WARP_SIZE;
+        if (j < ncols/4) {
+            float4 o = make_float4(v[k].x*r, v[k].y*r, v[k].z*r, v[k].w*r);
+            if constexpr (do_mul) {
+                const float4 m = ((const float4 *) mul)[j];
+                o.x *= m.x; o.y *= m.y; o.z *= m.z; o.w *= m.w;
+            }
+            dr[j] = o;
+        }
+    }
+}
+
+static bool rms_norm_narrow_ok(const int ncols, const int nrows, const int nchannels, const int64_t stride_row,
+                               const int64_t stride_channel, const int64_t stride_sample, const float * x, const float * dst) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_RMS_NORM_NARROW"); return !e || atoi(e) != 0; }();
+    return enabled && ncols % 4 == 0 && ncols <= 4*4*WARP_SIZE && ncols <= 512 && stride_row == ncols &&
+        stride_channel == (int64_t) ncols*nrows && stride_sample == stride_channel*nchannels &&
+        ((uintptr_t) x) % 16 == 0 && ((uintptr_t) dst) % 16 == 0;
+}
+
+// one-line engagement witness for the tail-kernel ports (GGML_CUDA_TAIL_TRACE=1)
+static void rms_norm_narrow_trace(const char * path, const int ncols, const int64_t nrows_total) {
+    static const bool trace = [] { const char * e = getenv("GGML_CUDA_TAIL_TRACE"); return e && atoi(e) != 0; }();
+    static bool fired = false;
+    if (trace && !fired) {
+        fired = true;
+        fprintf(stderr, "[rms_norm_narrow] path=%s ncols=%d nrows_total=%lld\n", path, ncols, (long long) nrows_total);
+    }
+}
+
 template <bool do_scale = false>
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
@@ -457,6 +520,20 @@ static void rms_norm_mul_f32_cuda(const float *  x,
                                   const uint32_t add_nsamples,
                                   const float    eps,
                                   cudaStream_t   stream) {
+    if (add == nullptr && rms_norm_narrow_ok(ncols, nrows, nchannels, stride_row, stride_channel, stride_sample, x, dst) &&
+            (mul == nullptr || (mul_ncols == (uint32_t) ncols && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
+                                ((uintptr_t) mul) % 16 == 0))) {
+        const int64_t nrows_total = (int64_t) nrows*nchannels*nsamples;
+        const int rows_per_block = 256 / WARP_SIZE;
+        const int64_t nblocks = (nrows_total + rows_per_block - 1) / rows_per_block;
+        rms_norm_narrow_trace(mul ? "mul" : "plain", ncols, nrows_total);
+        if (mul) {
+            rms_norm_f32_narrow<true><<<nblocks, 256, 0, stream>>>(x, dst, mul, ncols, nrows_total, eps, 1.0f, nrows_total, 1, ncols, 0, 0);
+        } else {
+            rms_norm_f32_narrow<false><<<nblocks, 256, 0, stream>>>(x, dst, nullptr, ncols, nrows_total, eps, 1.0f, nrows_total, 1, ncols, 0, 0);
+        }
+        return;
+    }
     const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
     // clamped grids need the channel/sample loops in the kernel, the common case must not pay for them
     const bool clamped_grid = nchannels > UINT16_MAX || nsamples > UINT16_MAX;
@@ -623,6 +700,14 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    if (rms_norm_narrow_ok(ne00, ne01, ne02, s01, s02, s03, src0_d, dst_d)) {
+        const int64_t nrows_total = ne01*ne02*ne03;
+        const int rows_per_block = 256 / WARP_SIZE;
+        rms_norm_narrow_trace("rms_norm", ne00, nrows_total);
+        rms_norm_f32_narrow<false><<<(nrows_total + rows_per_block - 1) / rows_per_block, 256, 0, stream>>>(
+            src0_d, dst_d, nullptr, ne00, nrows_total, eps, 1.0f, nrows_total, 1, ne00, 0, 0);
+        return;
+    }
     rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
 
@@ -650,6 +735,19 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
+    // narrow fast path (CV rms_norm_scale_narrow): strided source rows are fine (e.g. per-head views of a wider
+    // row); each row must be contiguous and 16B-aligned, the scale is applied as the kernel's post_scale
+    static const bool narrow_enabled = [] { const char * e = getenv("GGML_CUDA_RMS_NORM_NARROW"); return !e || atoi(e) != 0; }();
+    if (narrow_enabled && ne00 % 4 == 0 && ne00 <= 512 && ne00 <= 16*WARP_SIZE && s01 % 4 == 0 && s02 % 4 == 0 && s03 % 4 == 0 &&
+            ((uintptr_t) src0_d) % 16 == 0 && ((uintptr_t) dst_d) % 16 == 0) {
+        const int64_t nrows_total = ne01*ne02*ne03;
+        const int rows_per_block = 256 / WARP_SIZE;
+        rms_norm_narrow_trace("scale_fused", ne00, nrows_total);
+        rms_norm_f32_narrow<false><<<(nrows_total + rows_per_block - 1) / rows_per_block, 256, 0, stream>>>(
+            src0_d, dst_d, nullptr, ne00, nrows_total, eps, scale, ne01, ne02, s01, s02, s03);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
