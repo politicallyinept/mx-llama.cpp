@@ -31,6 +31,7 @@
 #include "ggml-cuda/gcn-kq-matvec.cuh"
 #include "ggml-cuda/mm-tile-f.cuh"
 #include "ggml-cuda/gdn-fuse.cuh"
+#include "ggml-cuda/she-fuse.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2890,7 +2891,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
+    // CV port (gcn-f16-matvec.cu): GCN dense F32 matvec for router-class f32 weights (65..8192 rows, 1..4 tokens).
+    // Env gate GGML_CUDA_SHE_FUSE, default OFF (CV default ON).
+    if (ggml_cuda_gcn_f32_matvec(ctx, src0, src1, dst)) {
+        return;
+    }
     if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11)) {
+        if (ggml_cuda_she_fuse_trace() && src0->type == GGML_TYPE_F32) {
+            fprintf(stderr, "[she-fuse] mul_mat_vec_f f32 M=%d K=%d N=%d\n", (int) src0->ne[1], (int) src0->ne[0], (int) ne11);
+        }
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
@@ -4953,6 +4962,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             (void) s_ab_witness;
             ggml_cuda_gdn_ab_dec(*cuda_ctx, node, cgraph->nodes[i + 2], cgraph->nodes[i + 6], cgraph->nodes[i + 4], cgraph->nodes[i + 8]);
             return 8;
+        }
+    }
+
+    // Shared-expert gate tail (CV hc-dec.cu port): MUL_MAT(1-row gate) -> SIGMOID -> MUL(shexp) -> ADD(moe) in one
+    // kernel. Env gate GGML_CUDA_SHE_FUSE, default OFF (CV default ON).
+    if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes && node->src[0]->ne[1] == 1 &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 3]->op == GGML_OP_ADD) {
+        static const enum ggml_op she_ops[4] = { GGML_OP_MUL_MAT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+        const int she_outs[1] = { i + 3 };
+        if (ggml_can_fuse_subgraph(cgraph, i, 4, she_ops, she_outs, 1) &&
+                ggml_cuda_shexp_gate_add_supported(node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3])) {
+            static const bool s_she_witness = [] { fprintf(stderr, "[she-fuse] shared-expert gate-tail fusion ACTIVE\n"); return true; }();
+            (void) s_she_witness;
+            ggml_cuda_shexp_gate_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 3]);
+            return 3;
         }
     }
 
