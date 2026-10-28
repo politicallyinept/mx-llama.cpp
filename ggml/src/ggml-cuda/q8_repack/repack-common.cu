@@ -87,16 +87,27 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return off;
     }();
-    // A/B INSTRUMENT (attention-kq4-decomp 2026-10-24): GGML_CUDA_REPACK_Q8_0=0
-    // keeps Q8_0 tensors in canonical layout (never repacked), so the stock path
-    // handles them. Evidence: on Qwen3.8-27B TP2 the repacked Q8_0 prefill GEMM
-    // runs ~2.4x slower than stock mul_mat_q on the GDN projection shards
-    // (rocprofv3: 324 us/call vs 135 us/call, same 1152 calls). Default ON.
+    // Q8_0 admission is OPT-IN: GGML_CUDA_REPACK_Q8_0=1. Unset/0 keeps Q8_0
+    // tensors in canonical layout (never repacked), so the stock path handles
+    // them. Flipped from default-ON by the q8rp-mmv lane (2026-10-26) on the
+    // decode-diag rank-3 finding: on UD-Q4_K_XL tp1 the repacked q8_0 mmv is
+    // net-NEGATIVE for decode - llama-bench tg256 with the fork gate bundle:
+    // repack-on 91.91 t/s vs Q8_0-canonical 95.37 t/s (+3.8%), and the same
+    // gate recovered prefill on Qwen3.8-27B TP2 (repacked Q8_0 GEMM ~2.4x
+    // slower than stock mul_mat_q on the GDN projection shards: 324 us/call
+    // vs 135 us/call, same 1152 calls). On bartowski Q4_0 tp1 the Q8_0 repack
+    // is decode-neutral (93.36 vs 93.22), so nothing regresses: the Q4_0 u4
+    // win there comes from GGML_CUDA_REPACK_Q4_0 admission, untouched here.
+    // The repack is a layout repack of the 8-bit weights (dp4a-friendly row +
+    // scale-plane layout), numerically neutral: greedy temp-0 byte-compare vs
+    // the default-on build passes on both UD-Q4_K_XL and bartowski Q4_0, and
+    // GGML_CUDA_REPACK_Q8_0=1 on this build reproduces the default-on output
+    // byte-for-byte.
     static const bool s_q8_0 = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
-        const bool on = !(e != nullptr && atoi(e) == 0);
-        if (!on) {
-            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0=0 gate ACTIVE: Q8_0 stays canonical (stock path)\n");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate ACTIVE: Q8_0 admitted to the gfx906 repack path (opt-in)\n");
         }
         return on;
     }();

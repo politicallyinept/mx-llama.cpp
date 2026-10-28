@@ -943,7 +943,7 @@ static const char * fdg_unsupported(const ggml_tensor * dst, const int min_t, co
 }
 
 bool ggml_cuda_flash_attn_ext_dense_gcn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static const int mode   = fdg_env("GGML_CUDA_FA_DENSE_GCN",       0); // port: default OFF (CV default is 1)
+    static const int mode   = fdg_env("GGML_CUDA_FA_DENSE_GCN",       1); // default ON (matches CV)
     static const int min_t  = fdg_env("GGML_CUDA_FA_DENSE_GCN_MIN_T", 64);
     static const int nseg_e = fdg_env("GGML_CUDA_FA_DENSE_GCN_NSEG",  0);
     static const int var    = fdg_env("GGML_CUDA_FA_DENSE_GCN_VAR",   0);
