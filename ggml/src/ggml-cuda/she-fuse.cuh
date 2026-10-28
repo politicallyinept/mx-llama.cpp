@@ -3,7 +3,7 @@
 #include "common.cuh"
 
 // Shared-expert / dense-f32 decode fusion (ported from CV hc-dec.cu + gcn-f16-matvec.cu).
-// Env gate GGML_CUDA_SHE_FUSE (default OFF here, ON in CV). Trace knob GGML_CUDA_SHE_FUSE_TRACE=1 prints every
+// Env gate GGML_CUDA_SHE_FUSE (default ON since adoption 2026-10-27; =0 disables). Trace knob GGML_CUDA_SHE_FUSE_TRACE=1 prints every
 // fusion firing plus every remaining f32 mul_mat_vec_f launch (kernel-count-drop witness).
 
 // shared-expert gate tail: MUL_MAT(1-row gate, x) -> SIGMOID -> MUL(shexp) -> ADD(moe) in one kernel (<= 8 tokens)
