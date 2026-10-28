@@ -1,6 +1,8 @@
 #include "concat.cuh"
 
+#include <algorithm>
 #include <stdint.h>
+#include <stdio.h>
 
 // contiguous kernels
 template <typename T, int dim>
@@ -196,8 +198,50 @@ static __global__ void __launch_bounds__(CONCAT_T_TILE*CONCAT_T_ROWS)
     }
 }
 
+// CV port (castagna-veloce concat.cu): dim-0 concat with short rows (dst->ne[0] <= 32), e.g. the recurrent conv
+// input concat (conv_state [3, C], x [n_tokens, C]) at decode / MTP verify: the row-per-block kernels launched C
+// blocks of 256 threads with 4..6 active (Qwen3.8-27B TP2, C = 5120: ~20 us at 1 token, ~38 us at 3 per GDN
+// layer). One thread per output element over a flat grid instead. Env gate GGML_CUDA_CONCAT_SMALL, default OFF
+// (set =1 to enable); pure copy/layout change, same values written, accumulation-order-neutral by construction.
+template <typename T>
+static __global__ void __launch_bounds__(256) concat_dim0_small(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int ne00, const int ne0, const int64_t ne1, const int64_t n,
+        const int64_t nb00, const int64_t nb01, const int64_t nb02,
+        const int64_t nb10, const int64_t nb11, const int64_t nb12,
+        const int64_t nb0,  const int64_t nb1,  const int64_t nb2) {
+    for (int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
+        const int     i0 = (int) (i % ne0);
+        const int64_t r  = i / ne0;
+        const int64_t i1 = r % ne1;
+        const int64_t i2 = r / ne1;
+        const char * s = i0 < ne00 ? src0 + i0*nb00 + i1*nb01 + i2*nb02 : src1 + (i0 - ne00)*nb10 + i1*nb11 + i2*nb12;
+        *(T *) (dst + i0*nb0 + i1*nb1 + i2*nb2) = *(const T *) s;
+    }
+}
+
+// one-line engagement witness for the tail-kernel ports (GGML_CUDA_TAIL_TRACE=1)
+static void concat_dim0_small_trace(const int64_t ne0, const int64_t ne1) {
+    static const bool trace = [] { const char * e = getenv("GGML_CUDA_TAIL_TRACE"); return e && atoi(e) != 0; }();
+    static bool fired = false;
+    if (trace && !fired) {
+        fired = true;
+        fprintf(stderr, "[concat_dim0_small] ne0=%lld ne1=%lld\n", (long long) ne0, (long long) ne1);
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    static const bool small_on = [] { const char * e = getenv("GGML_CUDA_CONCAT_SMALL"); return e && atoi(e) != 0; }();
+    if (small_on && dim == 0 && dst->ne[0] <= 32 && src0->ne[3] == 1 && src1->ne[3] == 1 && dst->ne[3] == 1) {
+        const int64_t n = ggml_nelements(dst);
+        const int nblk = (int) std::min<int64_t>((n + 255)/256, 1024);
+        concat_dim0_small_trace(dst->ne[0], dst->ne[1]);
+        concat_dim0_small<T><<<nblk, 256, 0, stream>>>((const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            (int) src0->ne[0], (int) dst->ne[0], dst->ne[1], n,
+            src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[0], src1->nb[1], src1->nb[2], dst->nb[0], dst->nb[1], dst->nb[2]);
+        return;
+    }
     // fast path: dim-0 concat of a contiguous src0 with a transposed src1 (3D, no 4th dim)
     static const bool no_fast = [] { const char * e = getenv("GGML_CONCAT_NO_TRANSPOSED"); return e && atoi(e) != 0; }();
     if (!no_fast && dim == 0 && src0->ne[3] == 1 && src1->ne[3] == 1 &&
