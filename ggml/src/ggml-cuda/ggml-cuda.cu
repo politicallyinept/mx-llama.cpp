@@ -2892,7 +2892,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
 
     // CV port (gcn-f16-matvec.cu): GCN dense F32 matvec for router-class f32 weights (65..8192 rows, 1..4 tokens).
-    // Env gate GGML_CUDA_SHE_FUSE, default OFF (CV default ON).
+    // Env gate GGML_CUDA_SHE_FUSE, default ON since adoption (set =0 to disable).
     if (ggml_cuda_gcn_f32_matvec(ctx, src0, src1, dst)) {
         return;
     }
@@ -4966,7 +4966,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // Shared-expert gate tail (CV hc-dec.cu port): MUL_MAT(1-row gate) -> SIGMOID -> MUL(shexp) -> ADD(moe) in one
-    // kernel. Env gate GGML_CUDA_SHE_FUSE, default OFF (CV default ON).
+    // kernel. Env gate GGML_CUDA_SHE_FUSE, default ON since adoption (set =0 to disable).
     if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes && node->src[0]->ne[1] == 1 &&
             cgraph->nodes[i + 1]->op == GGML_OP_UNARY && ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
             cgraph->nodes[i + 2]->op == GGML_OP_MUL && cgraph->nodes[i + 3]->op == GGML_OP_ADD) {
