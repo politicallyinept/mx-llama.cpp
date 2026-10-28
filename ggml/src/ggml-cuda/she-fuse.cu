@@ -1,8 +1,8 @@
 #include "she-fuse.cuh"
 
 // Ported from CV (castagna-veloce): hc-dec.cu shexp_gate_add + gcn-f16-matvec.cu gcn_f32_mv.
-// Env gate inverted vs CV: GGML_CUDA_SHE_FUSE defaults to 0 (OFF) here; CV defaults its two kernels ON
-// (GGML_CUDA_SHEXP_GATE_FUSE / GGML_CUDA_GCN_F32_MV). KS tuning knob GGML_CUDA_SHE_FUSE_KS (CV: GGML_CUDA_GCN_F32_MV_KS).
+// Adoption 2026-10-27: GGML_CUDA_SHE_FUSE now defaults to 1 (ON) here, matching CV defaults
+// (GGML_CUDA_SHEXP_GATE_FUSE / GGML_CUDA_GCN_F32_MV). GGML_CUDA_SHE_FUSE=0 still disables. KS tuning knob GGML_CUDA_SHE_FUSE_KS (CV: GGML_CUDA_GCN_F32_MV_KS).
 // GGML_CUDA_SHE_FUSE_TRACE=1 prints every fusion firing and every remaining f32 mul_mat_vec_f launch so the
 // per-step kernel-count drop can be witnessed without rocprofv3.
 
@@ -75,7 +75,7 @@ static bool shexp_overlap(const ggml_tensor * a, const ggml_tensor * b) {
 
 bool ggml_cuda_shexp_gate_add_supported(const ggml_tensor * mm, const ggml_tensor * sig, const ggml_tensor * mul,
                                         const ggml_tensor * add) {
-    static const int enabled = she_fuse_env("GGML_CUDA_SHE_FUSE", 0);
+    static const int enabled = she_fuse_env("GGML_CUDA_SHE_FUSE", 1);
     if (!enabled) {
         return false;
     }
@@ -192,7 +192,7 @@ static __global__ void gcn_f32_mv(const float * __restrict__ W, const float * __
 }
 
 bool ggml_cuda_gcn_f32_matvec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    static const int env    = she_fuse_env("GGML_CUDA_SHE_FUSE", 0);
+    static const int env    = she_fuse_env("GGML_CUDA_SHE_FUSE", 1);
     static const int env_ks = she_fuse_env("GGML_CUDA_SHE_FUSE_KS", 0);
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
