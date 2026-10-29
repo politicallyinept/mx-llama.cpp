@@ -977,3 +977,257 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+// ---- CV (castagna-veloce) port: fused decode attention q/k chain (attn_qk_fused) ----
+// RMS_NORM MUL ROPE x2 + SET_ROWS x2 (k and v cache rows) in one kernel; CV rope.cu verbatim except the env gate.
+
+struct attn_qk_args {
+    const float * q; int64_t q_s1, q_s2;          // q view: head / token strides (floats)
+    const float * k; int64_t k_s1, k_s2;
+    const float * v; int64_t v_s1, v_s2;
+    const float * wq; const float * wk;
+    float eps_q, eps_k;
+    float * q_out;                                // [hd, nqh, T] contiguous
+    half * ck; int64_t ck_row; const int64_t * k_idx;
+    half * cv; int64_t cv_row; const int64_t * v_idx;
+    const int32_t * pos;
+    int n_dims, n_offs, T, nqh, nkvh;
+    float theta_scale, freq_scale, ext_factor, attn_factor;
+    rope_corr_dims corr;
+    mrope_sections sec;
+    bool imrope;
+};
+
+template <int HD>
+static __global__ void __launch_bounds__(HD) attn_qk_fused(const attn_qk_args a) {
+    const int nh = a.nqh + a.nkvh;
+    const int t = blockIdx.x / nh, h = blockIdx.x % nh, c = threadIdx.x;
+    const bool isq = h < a.nqh;
+    const int hk = h - a.nqh;
+    const float x = isq ? a.q[t*a.q_s2 + h*a.q_s1 + c] : a.k[t*a.k_s2 + hk*a.k_s1 + c];
+    __shared__ float row[HD];
+    __shared__ float s_ss;
+    // byte-match rms_norm_f32_narrow (the fork's norm kernel for HD=256): lanes 0..63 each sum one float4
+    // (x*x + y*y + z*z + w*w), then a full-wave butterfly; HD/4 == WARP_SIZE on gfx906.
+    const float * xrow = isq ? a.q + t*a.q_s2 + h*a.q_s1 : a.k + t*a.k_s2 + hk*a.k_s1;
+    float p = 0.0f;
+    static_assert(HD/8 == WARP_SIZE, "narrow repro assumes 32 lanes x 2 float4");
+    if (c < HD/8) {
+        const float4 * xr = (const float4 *) xrow;
+        const float4 v0 = xr[c], v1 = xr[c + HD/8];
+        p += v0.x*v0.x + v0.y*v0.y + v0.z*v0.z + v0.w*v0.w;
+        p += v1.x*v1.x + v1.y*v1.y + v1.z*v1.z + v1.w*v1.w;
+    }
+    p = warp_reduce_sum(p);
+    if (c == 0) { s_ss = p; }
+    __syncthreads();
+    const float scale = rsqrtf(s_ss / HD + (isq ? a.eps_q : a.eps_k));
+    row[c] = (scale*x)*(isq ? a.wq[c] : a.wk[c]);
+    __syncthreads();
+    float out = row[c];
+    const int rel = c - a.n_offs;
+    if (rel >= 0 && rel < a.n_dims) {
+        const int half_dims = a.n_dims/2;
+        const int j = rel % half_dims;          // pair index; iw = 2*j
+        const bool first = rel < half_dims;
+        const float x0 = row[a.n_offs + j], x1 = row[a.n_offs + j + half_dims];
+        const float pw = powf(a.theta_scale, j / 1.0f);
+        const int sect_dims = a.sec.v[0] + a.sec.v[1] + a.sec.v[2] + a.sec.v[3];
+        const int sec_w = a.sec.v[1] + a.sec.v[0];
+        const int sector = j % sect_dims;
+        const int T = a.T;
+        float theta_base;
+        if (a.imrope) {
+            if (sector % 3 == 1 && sector < 3*a.sec.v[1]) {
+                theta_base = a.pos[t + T*1]*pw;
+            } else if (sector % 3 == 2 && sector < 3*a.sec.v[2]) {
+                theta_base = a.pos[t + T*2]*pw;
+            } else if (sector % 3 == 0 && sector < 3*a.sec.v[0]) {
+                theta_base = a.pos[t]*pw;
+            } else {
+                theta_base = a.pos[t + T*3]*pw;
+            }
+        } else {
+            if (sector < a.sec.v[0]) {
+                theta_base = a.pos[t]*pw;
+            } else if (sector < sec_w) {
+                theta_base = a.pos[t + T*1]*pw;
+            } else if (sector < sec_w + a.sec.v[2]) {
+                theta_base = a.pos[t + T*2]*pw;
+            } else {
+                theta_base = a.pos[t + T*3]*pw;
+            }
+        }
+        float cos_theta, sin_theta;
+        rope_yarn<true>(theta_base/1.0f, a.freq_scale, a.corr, 2*j, a.ext_factor, a.attn_factor, cos_theta, sin_theta);
+        out = first ? x0*cos_theta - x1*sin_theta : x0*sin_theta + x1*cos_theta;
+    }
+    if (isq) {
+        a.q_out[((int64_t) t*a.nqh + h)*HD + c] = out;
+    } else {
+        a.ck[a.k_idx[t]*a.ck_row + hk*HD + c] = __float2half(out);
+        a.cv[a.v_idx[t]*a.cv_row + hk*HD + c] = __float2half(a.v[t*a.v_s2 + hk*a.v_s1 + c]);
+    }
+}
+
+static bool attn_qk_is_view(const ggml_tensor * t) {
+    return t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+           t->op == GGML_OP_TRANSPOSE;
+}
+static const ggml_tensor * attn_qk_base(const ggml_tensor * t) {
+    while (t && attn_qk_is_view(t) && t->src[0]) { t = t->src[0]; }
+    return t;
+}
+
+int ggml_cuda_attn_qk_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
+                            bool (*compute_middle)(ggml_backend_cuda_context & ctx, ggml_tensor * t)) {
+    // Gate GGML_CUDA_ATTN_QK_FUSED=1, default OFF (CV default is ON under GGML_CUDA_ATTN_QK_FUSE).
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_ATTN_QK_FUSED"); return !(e && atoi(e) != 0); }();
+    if (off) {
+        return 0;
+    }
+    // the next 8 compute nodes (views skipped): RMS_NORM MUL ROPE RMS_NORM MUL ROPE SET_ROWS SET_ROWS; the k / v
+    // projections (MUL_MAT of the layer input) may sit between the q rope and the k norm: they are computed first
+    int idx[8];
+    int middle[4];
+    int n = 0, nm = 0, j = i;
+    for (; j < cgraph->n_nodes && n < 8; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (attn_qk_is_view(t)) {
+            continue;
+        }
+        if (n == 3 && t->op == GGML_OP_MUL_MAT && nm < 4) {
+            middle[nm++] = j;
+            continue;
+        }
+        idx[n++] = j;
+    }
+    if (n < 8) {
+        return 0;
+    }
+    ggml_tensor * const * nd = cgraph->nodes;
+    const ggml_tensor * rq = nd[idx[0]], * mq = nd[idx[1]], * pq = nd[idx[2]], * rk = nd[idx[3]], * mk = nd[idx[4]],
+                      * pk = nd[idx[5]], * sk = nd[idx[6]], * sv = nd[idx[7]];
+    const ggml_op ops[8] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE,
+                             GGML_OP_SET_ROWS, GGML_OP_SET_ROWS };
+    for (int q = 0; q < 8; ++q) {
+        if (nd[idx[q]]->op != ops[q]) {
+            return 0;
+        }
+    }
+    const auto other = [](const ggml_tensor * m, const ggml_tensor * x) { return m->src[0] == x ? m->src[1] : m->src[0]; };
+    const ggml_tensor * q = rq->src[0], * k = rk->src[0], * wq = other(mq, rq), * wk = other(mk, rk);
+    const int HD = 256;
+    const int64_t T = q->ne[2];
+    const bool ok =
+        (mq->src[0] == rq || mq->src[1] == rq) && (mk->src[0] == rk || mk->src[1] == rk) &&
+        pq->src[0] == mq && pk->src[0] == mk && pq->src[2] == nullptr && pk->src[2] == nullptr &&
+        q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && q->ne[0] == HD && k->ne[0] == HD && q->nb[0] == sizeof(float) &&
+        ((uintptr_t) q->data) % 16 == 0 && ((uintptr_t) k->data) % 16 == 0 && q->nb[1] % 4 == 0 && q->nb[2] % 4 == 0 &&
+        k->nb[1] % 4 == 0 && k->nb[2] % 4 == 0 &&
+        k->nb[0] == sizeof(float) && k->ne[2] == T && T >= 1 && T <= 16 && q->ne[3] == 1 && k->ne[3] == 1 &&
+        wq->type == GGML_TYPE_F32 && wk->type == GGML_TYPE_F32 && ggml_nelements(wq) == HD && ggml_nelements(wk) == HD &&
+        ggml_is_contiguous(wq) && ggml_is_contiguous(wk) &&
+        pq->type == GGML_TYPE_F32 && ggml_is_contiguous(pq) && ggml_are_same_shape(pq, q) &&
+        pq->src[1] == pk->src[1] && pq->src[1]->type == GGML_TYPE_I32 && pq->src[1]->ne[0] == 4*T &&
+        memcmp(pq->op_params, pk->op_params, sizeof(int32_t)*16) == 0 &&
+        // K: rope output (through views) into the k cache rows; V rows into the v cache
+        // (SET_ROWS: src[0] the rows, src[1] the indices, the node itself the view of the cache it writes)
+        attn_qk_base(sk->src[0]) == pk && sk->type == GGML_TYPE_F16 && sk->src[1]->type == GGML_TYPE_I64 &&
+        sv->type == GGML_TYPE_F16 && sv->src[1]->type == GGML_TYPE_I64 && sv->src[0]->type == GGML_TYPE_F32 &&
+        sk->nb[0] == sizeof(half) && sv->nb[0] == sizeof(half) &&
+        sk->src[0]->ne[0] == k->ne[0]*k->ne[1] && sv->src[0]->ne[0] == k->ne[0]*k->ne[1] &&
+        ggml_is_contiguous(sk->src[0]) && ggml_is_contiguous(sv->src[0]) &&
+        ggml_nelements(sk->src[1]) == T && ggml_nelements(sv->src[1]) == T &&
+        sk->ne[0] == k->ne[0]*k->ne[1] && sv->ne[0] == k->ne[0]*k->ne[1] &&
+        // intermediates read only inside the chain
+        ggml_node_get_use_count(cgraph, idx[0]) == 1 && ggml_node_get_use_count(cgraph, idx[1]) == 1 &&
+        ggml_node_get_use_count(cgraph, idx[3]) == 1 && ggml_node_get_use_count(cgraph, idx[4]) == 1 &&
+        !(rq->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mq->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+        !(rk->flags & GGML_TENSOR_FLAG_OUTPUT) && !(mk->flags & GGML_TENSOR_FLAG_OUTPUT) && !(pk->flags & GGML_TENSOR_FLAG_OUTPUT);
+    if (!ok) {
+        return 0;
+    }
+    const int mode = ((const int32_t *) pq->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION) {
+        return 0;
+    }
+    // K rope output is read only by its SET_ROWS (through views)
+    int users = 0;
+    for (int u = idx[5] + 1; u < cgraph->n_nodes; ++u) {
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const ggml_tensor * src = cgraph->nodes[u]->src[s];
+            if (src && attn_qk_base(src) == pk && cgraph->nodes[u] != sk && !attn_qk_is_view(cgraph->nodes[u])) {
+                users++;
+            }
+        }
+    }
+    if (users > 0) {
+        return 0;
+    }
+    attn_qk_args a = {};
+    a.q = (const float *) q->data; a.q_s1 = q->nb[1]/sizeof(float); a.q_s2 = q->nb[2]/sizeof(float);
+    a.k = (const float *) k->data; a.k_s1 = k->nb[1]/sizeof(float); a.k_s2 = k->nb[2]/sizeof(float);
+    const ggml_tensor * v = sv->src[0];
+    a.v = (const float *) v->data; a.v_s1 = HD; a.v_s2 = v->nb[1]/sizeof(float);
+    a.wq = (const float *) wq->data; a.wk = (const float *) wk->data;
+    memcpy(&a.eps_q, rq->op_params, sizeof(float));
+    memcpy(&a.eps_k, rk->op_params, sizeof(float));
+    a.q_out = (float *) pq->data;
+    a.ck = (half *) sk->data; a.ck_row = sk->nb[1]/sizeof(half); a.k_idx = (const int64_t *) sk->src[1]->data;
+    a.cv = (half *) sv->data; a.cv_row = sv->nb[1]/sizeof(half); a.v_idx = (const int64_t *) sv->src[1]->data;
+    a.pos = (const int32_t *) pq->src[1]->data;
+    a.T = (int) T; a.nqh = (int) q->ne[1]; a.nkvh = (int) k->ne[1];
+    const int32_t * op = (const int32_t *) pq->op_params;
+    a.n_dims = op[1];
+    a.n_offs = op[15];
+    const int n_ctx_orig = op[4];
+    float freq_base, beta_fast, beta_slow;
+    memcpy(&freq_base,     op + 5, sizeof(float));
+    memcpy(&a.freq_scale,  op + 6, sizeof(float));
+    memcpy(&a.ext_factor,  op + 7, sizeof(float));
+    memcpy(&a.attn_factor, op + 8, sizeof(float));
+    memcpy(&beta_fast,     op + 9, sizeof(float));
+    memcpy(&beta_slow,     op + 10, sizeof(float));
+    memcpy(&a.sec.v,       op + 11, sizeof(int)*4);
+    a.imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    a.theta_scale = powf(freq_base, -2.0f/a.n_dims);
+    ggml_rope_yarn_corr_dims(a.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, a.corr.v);
+    if (a.n_offs < 0 || a.n_offs + a.n_dims > HD || a.n_dims % 2 != 0) {
+        return 0;
+    }
+    // the middle projections read the layer input only (never the chain's nodes)
+    for (int m = 0; m < nm; ++m) {
+        const ggml_tensor * t = cgraph->nodes[middle[m]];
+        for (int s2 = 0; s2 < GGML_MAX_SRC; ++s2) {
+            for (int q2 = 0; q2 < 3; ++q2) {
+                if (t->src[s2] && attn_qk_base(t->src[s2]) == nd[idx[q2]]) {
+                    return 0;
+                }
+            }
+        }
+    }
+    // the skipped nodes free q's buffer early, so the allocator may have put the rope output or a middle projection over it
+    const auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data, * y0 = (const char *) y->data;
+        return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+    };
+    if (overlap(pq, q) || overlap(pq, k) || overlap(pq, v)) {
+        return 0;
+    }
+    for (int m = 0; m < nm; ++m) {
+        if (overlap(cgraph->nodes[middle[m]], q)) {
+            return 0;
+        }
+    }
+    for (int m = 0; m < nm; ++m) {
+        if (!compute_middle(ctx, cgraph->nodes[middle[m]])) {
+            return 0;
+        }
+    }
+    static const bool s_attn_qk_witness = [] { fprintf(stderr, "[attn-qk-fused] decode q/k chain fusion ACTIVE\n"); return true; }();
+    (void) s_attn_qk_witness;
+    attn_qk_fused<256><<<(unsigned) (T*(a.nqh + a.nkvh)), 256, 0, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+    return idx[7] - i;
+}
