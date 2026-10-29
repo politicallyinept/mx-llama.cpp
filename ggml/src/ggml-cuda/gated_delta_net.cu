@@ -662,9 +662,9 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 // decode kernel reads its state row from the cache itself (each warp reads its (head, column) region into
 // registers before writing the same region back, so the in-place cache update stays safe). The K>1 snapshot
 // path writes different regions than it reads and is excluded (decode is always K == 1).
-// Gate GGML_CUDA_GDN_STATE_ROWS_OK=1, default OFF.
+// Gate GGML_CUDA_GDN_STATE_ROWS_OK, default ON (set =0 in the env to disable).
 bool ggml_cuda_gdn_state_rows_ok(const ggml_tensor * get_rows, const ggml_tensor * gdn) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_ROWS_OK"); return e && atoi(e) != 0; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_ROWS_OK"); return !e || atoi(e) != 0; }();
     static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
     const ggml_tensor * v = gdn->src[2];
     const ggml_tensor * g = gdn->src[3];
