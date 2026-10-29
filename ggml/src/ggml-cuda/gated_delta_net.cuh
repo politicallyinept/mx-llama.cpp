@@ -12,3 +12,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// gate check for the recurrent-state GET_ROWS direct-read (graph matcher in ggml-cuda.cu):
+// the decode GDN reads its state row from the cache via the GET_ROWS ids. Gate GGML_CUDA_GDN_STATE_ROWS_OK, default OFF.
+bool ggml_cuda_gdn_state_rows_ok(const ggml_tensor * get_rows, const ggml_tensor * gdn);

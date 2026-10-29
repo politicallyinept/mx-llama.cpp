@@ -1536,6 +1536,10 @@ struct ggml_backend_cuda_context {
     // moe-vec port: arrival counters for the moe1 FFN / gemv1 epilogue kernels (see moe-vec.cu)
     int * moe1_counters = nullptr;
     int * gemv1_epi_counter = nullptr;
+    // tp1-decode-ports (CV gdn_state_rows): entries registered by the graph matcher when a decode GDN's
+    // recurrent-state GET_ROWS is skipped; the GDN kernel then reads its cache row directly via ids.
+    struct gdn_state_row { const ggml_tensor * gdn; const float * base; const int32_t * ids; };
+    std::vector<gdn_state_row> gdn_state_rows;
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
