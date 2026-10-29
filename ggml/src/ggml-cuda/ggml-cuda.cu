@@ -5048,7 +5048,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     ggml_tensor * node = cgraph->nodes[i];
 
     // GDN recurrent-state gather elimination (CV gdn_state_rows port): the decode GDN reads its state row from
-    // the cache directly via the GET_ROWS ids; the gather node is skipped. Gate GGML_CUDA_GDN_STATE_ROWS_OK, default OFF.
+    // the cache directly via the GET_ROWS ids; the gather node is skipped. Gate GGML_CUDA_GDN_STATE_ROWS_OK, default ON (=0 disables).
     if (node->op == GGML_OP_GET_ROWS && ggml_cuda_defer_gdn_state_rows(cuda_ctx, cgraph, i)) {
         return 1;
     }
