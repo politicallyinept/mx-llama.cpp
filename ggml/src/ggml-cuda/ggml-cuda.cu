@@ -4939,6 +4939,105 @@ static bool ggml_cuda_moe_weighted_reduction_enabled() {
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// CV port (ggml-cuda.cu 5621-5668): recurrent-state gather deferral helpers
+// A deferred GET_ROWS reads its row ids only when its consumer runs, but the allocator treats the GET_ROWS as their
+// last reader: it may place the outputs of the nodes in between (or of the consumer) over the ids' memory (gfx1151
+// server: q/k of the GDN over s_copy -> garbage row index -> aperture violation). A write over the ids by nodes
+// i+1..j rejects the deferral. (Writes elsewhere in the cache tensor are not checked: other rows, e.g. the rollback
+// snapshots, are written in between by design; a whole-tensor check rejected every MI50 deferral, -4% decode.)
+static bool ggml_cuda_deferred_rows_intact(const ggml_cgraph * cgraph, int i, int j) {
+    const ggml_tensor * g = cgraph->nodes[i];
+    const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+    };
+    for (int k = i + 1; k <= j; ++k) {
+        const ggml_tensor * t = cgraph->nodes[k];
+        if (ggml_op_is_empty(t->op) || t->data == nullptr) {
+            continue;
+        }
+        if (overlap(t, g->src[1])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// GET_ROWS of a recurrent state whose only consumer (through a RESHAPE) is a decode GDN that can read the cache row
+// itself: registers the GDN and returns true (the gather is not run)
+static bool ggml_cuda_defer_gdn_state_rows(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
+    static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
+    const ggml_tensor * g = cgraph->nodes[i];
+    if (g->op != GGML_OP_GET_ROWS || (g->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const auto consumes = [](const ggml_tensor * t, const ggml_tensor * x) {
+        if (!x) {
+            return false;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == x) {
+                return true;
+            }
+        }
+        return t->op == GGML_OP_VIEW && t->view_src == x;
+    };
+    const auto fwd = [](const ggml_tensor * t, const ggml_tensor * want) {
+        return t && ((t->op == GGML_OP_VIEW && t->view_src == want && t->view_offs == 0) ||
+                     (t->op == GGML_OP_RESHAPE && t->src[0] == want));
+    };
+    const int end = std::min(cgraph->n_nodes, i + 400);
+    // pass 1: the decode GDN whose src[5] resolves to g through <= 2 VIEW(offs=0)/RESHAPE hops
+    const ggml_tensor * gdn = nullptr, * m1 = nullptr, * m2 = nullptr;
+    int j_gdn = -1;
+    for (int j = i + 1; j < end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        const ggml_tensor * a = t->src[5];
+        if (a == g) {
+            gdn = t; j_gdn = j; break;
+        }
+        if (fwd(a, g)) {
+            gdn = t; m1 = a; j_gdn = j; break;
+        }
+        if (a && fwd(a->src[0], g)) {
+            gdn = t; m2 = a; m1 = a->src[0]; j_gdn = j; break;
+        }
+    }
+    if (!gdn) {
+        if (dbg) fprintf(stderr, "[gdn-state-rows] node %d %s: no GDN consumer in window\n", i, g->name);
+        return false;
+    }
+    int j_m1 = -1, j_m2 = -1;
+    for (int j = i + 1; j < j_gdn; ++j) {
+        if (cgraph->nodes[j] == m1) { j_m1 = j; }
+        if (cgraph->nodes[j] == m2) { j_m2 = j; }
+    }
+    // pass 2: every consumer of the gather / forwarders must be the chain or an empty node
+    // (the fork's build_rs also feeds a zero-sized extra-state view when n_rs == n_seqs)
+    for (int j = i + 1; j < end; ++j) {
+        if (j == j_gdn || j == j_m1 || j == j_m2) {
+            continue;
+        }
+        const ggml_tensor * t = cgraph->nodes[j];
+        const bool bad = (consumes(t, g) || consumes(t, m1) || consumes(t, m2)) && !ggml_is_empty(t);
+        if (bad) {
+            if (dbg) fprintf(stderr, "[gdn-state-rows] node %d: extra consumer %d %s ne[%lld,%lld,%lld,%lld]\n",
+                i, (int) t->op, t->name, (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
+            return false;
+        }
+    }
+    if (!ggml_cuda_gdn_state_rows_ok(g, gdn) || !ggml_cuda_deferred_rows_intact(cgraph, i, j_gdn)) {
+        return false;
+    }
+    static const bool s_gdn_rows_witness = [] { fprintf(stderr, "[gdn-state-rows] recurrent-state gather direct-read ACTIVE\n"); return true; }();
+    (void) s_gdn_rows_witness;
+    cuda_ctx->gdn_state_rows.push_back({gdn, (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data});
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4947,6 +5046,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // GDN recurrent-state gather elimination (CV gdn_state_rows port): the decode GDN reads its state row from
+    // the cache directly via the GET_ROWS ids; the gather node is skipped. Gate GGML_CUDA_GDN_STATE_ROWS_OK, default OFF.
+    if (node->op == GGML_OP_GET_ROWS && ggml_cuda_defer_gdn_state_rows(cuda_ctx, cgraph, i)) {
+        return 1;
+    }
+    // decode attention q/k chain: q/k norm + rope + k/v cache rows in one kernel (CV attn_qk_fused port).
+    // Gate GGML_CUDA_ATTN_QK_FUSED, default OFF.
+    if (node->op == GGML_OP_RMS_NORM && node->ne[0] == 256) {
+        const int n = ggml_cuda_attn_qk_fused(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (n > 0) {
+            return n;
+        }
+    }
 
     // GDN decode gate chain (CV hc-dec.cu port): MUL_MAT(alpha) -> RESHAPE -> ADD -> SOFTPLUS -> MUL -> RESHAPE and
     // MUL_MAT(beta) -> RESHAPE -> SIGMOID in one kernel. Env gate GGML_CUDA_GDN_AB_DEC, default OFF (CV default ON).
@@ -6181,6 +6294,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // entries are only valid within one graph evaluation
     cuda_ctx->q8_1_cache_reset();
+    cuda_ctx->gdn_state_rows.clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
