@@ -32,7 +32,7 @@
 bool ggml_cuda_repack_q4_0_tiled_on() {
     static const bool s_on = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q4_0_TILED");
-        const bool on = e == nullptr || atoi(e) != 0;
+        const bool on = e != nullptr && atoi(e) != 0;  // anchor3b: default OFF (drift ladder 2026-10-30: 62x q40 long-pp KL regression)
         if (on) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0_TILED gate ACTIVE: repacked Q4_0 GEMMs run the gfx906 tiled gcn_u4_gemm (128x64 tiles, LDS-staged). Tile order changes FP rounding vs the generic MMQ loop: seal hashes shift, re-seal required\n");
         }
