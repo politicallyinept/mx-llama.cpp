@@ -99,10 +99,12 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // is decode-neutral (93.36 vs 93.22), so nothing regresses: the Q4_0 u4
     // win there comes from GGML_CUDA_REPACK_Q4_0 admission, untouched here.
     // The repack is a layout repack of the 8-bit weights (dp4a-friendly row +
-    // scale-plane layout), numerically neutral: greedy temp-0 byte-compare vs
-    // the default-on build passes on both UD-Q4_K_XL and bartowski Q4_0, and
-    // GGML_CUDA_REPACK_Q8_0=1 on this build reproduces the default-on output
-    // byte-for-byte.
+    // scale-plane layout): greedy temp-0 byte-compare vs the default-on build
+    // passed on both UD-Q4_K_XL and bartowski Q4_0, and GGML_CUDA_REPACK_Q8_0=1
+    // on this build reproduces the default-on output byte-for-byte. The
+    // q40-longpp bisect (2026-10-28) later REFUTED full neutrality: the repack
+    // path is deterministic but not bit-identical to stock - see the
+    // STOCK_ACC gate below for the divergence map and the neutral fallback.
     static const bool s_q8_0 = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
         const bool on = e != nullptr && atoi(e) != 0;
@@ -111,9 +113,55 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return on;
     }();
+    // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC=1 pins
+    // Q8_0 matmuls to STOCK accumulation order. Default OFF (unset) keeps the
+    // repack path exactly as sealed.
+    //
+    // Divergence map (adopt-gdn-rows): the weight repack itself is lossless -
+    // block_q8_0 carries a ggml_half d (ggml-common.h:253) and both planes are
+    // a byte-for-byte permutation of the canonical blocks (repack_q8_0_kernel,
+    // q8_repack/buffer.cu:127-148) - and both engines feed the same q8_1
+    // activation quantization, so the drift is purely fp32 accumulation order:
+    //  * decode MMV: stock mul_mat_vec_q assigns (block, quarter) pairs across
+    //    the whole block thread space (mmvq.cu:727-731: kbx = tid/(qi/vdr),
+    //    kqs = vdr*(tid%(qi/vdr))) and applies the d*dx scale per 8-value
+    //    chunk (vec_dot_q8_0_q8_1, vecdotq.cuh:852-865, VDR_Q8_0_Q8_1_MMVQ=2),
+    //    then sums cross-warp partials in shared memory and a 32-lane shfl
+    //    tree (mmvq.cu:793-807). The repacked MMV applies the scale per
+    //    16-value half-block across 64 lanes (repack-kernels.cuh:299,346) and
+    //    reduces with a 64-lane DPP tree (repack-kernels.cuh:439).
+    //  * prefill GEMM: stock mul_mat_q splits K across the tile's tx lanes
+    //    (per-lane partial sums, shared reduce at tile end,
+    //    mmq-vec-dot.cuh:137-148); the repacked GEMM accumulates the full K
+    //    serially per thread into acc[r][n] (repack-kernels.cuh:1784).
+    // Different chunk granularity + lane partition + reduce tree => different
+    // fp32 rounding => greedy divergence (q8n1r KL 0.0035 vs T0; the
+    // q40-longpp r02 flip attributed to a2f211cb0).
+    //
+    // A bit-identical in-kernel restyle must reproduce stock's exact launch
+    // geometry (the mmvq nwarps/rows_per_block tables are internal to
+    // mmvq.cu) and MMQ's tx K-split - a re-derivation of both stock kernels
+    // on the repacked layout, not a restyle. Until that lands this gate is
+    // the numerics-neutral fallback: the stock kernels cannot read the
+    // two-plane layout, so admission is the only point where a stock-kernel
+    // fallback is possible. With the gate ON, Q8_0 tensors stay canonical:
+    // the repack buft degrades cleanly for un-admitted tensors (canonical
+    // get_alloc_size + plain memcpy upload, buffer.cu:611,740) and
+    // should_fire() stays false, so Q8_0 matmuls run the stock kernels
+    // bit-identically to a stock build while every other repacked type
+    // (Q4_0/Q4_1/K-quant/MXFP4) keeps its speed. Same kernel count per
+    // matmul as stock - no extra passes.
+    static const bool s_q8_0_stock_acc = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q8_0_STOCK_ACC");
+        const bool on = e != nullptr && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_STOCK_ACC gate ACTIVE: Q8_0 stays canonical, stock accumulation (repack suppressed for Q8_0)\n");
+        }
+        return on;
+    }();
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
-            return s_q8_0 && t->ne[0] % 32 == 0;
+            return s_q8_0 && !s_q8_0_stock_acc && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ4_NL: {
