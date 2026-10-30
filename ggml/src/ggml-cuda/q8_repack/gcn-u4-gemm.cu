@@ -14,7 +14,8 @@
 // blocks per gfx906 CU (64-lane waves), LDS 31744 B/block <= 32 KiB.
 //
 // Weight side: repacked Q4_0 = de-aliased nibble rows (16 B per 32-value
-// block, byte i = value i | value(16+i) << 4, excess-8 codes) + an f16 scale
+// block, canonical interleaved pairs: byte i = value 2i | value(2i+1) << 4,
+// excess-8 codes) + an f16 scale
 // plane (rp_traits<Q4_0> layout). Nibbles are expanded to int8 at LDS store
 // (the generic GEMM's expanded-staging lesson: expand-at-consume measured -40%).
 // Activation side: the existing block_q8_1_mmq DS4 pool (quantize_mmq_q8_1 with
@@ -124,17 +125,18 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
     int rb[9];   // ds4 slot + 8 qs dwords
     auto fetch = [&](const int step) {
         const int sb0 = step * GU4_KB + 2 * la_h;
+        const uint16_t * const wds = wd + step * GU4_KB;   // scales MUST track the step
         if (sb0 + 1 < n_sub) {
             const uint4 p0 = rp_ldcs_u4(wa + (size_t) step * GU4_KB);
             const uint4 p1 = rp_ldcs_u4(wa + (size_t) step * GU4_KB + 1);
             ra[0] = p0.x; ra[1] = p0.y; ra[2] = p0.z; ra[3] = p0.w;
             ra[4] = p1.x; ra[5] = p1.y; ra[6] = p1.z; ra[7] = p1.w;
-            ra[8] = (int) (((uint32_t) wd[1] << 16) | (uint32_t) wd[0]);
+            ra[8] = (int) (((uint32_t) wds[1] << 16) | (uint32_t) wds[0]);
         } else if (sb0 < n_sub) {
             const uint4 p0 = rp_ldcs_u4(wa + (size_t) step * GU4_KB);
             ra[0] = p0.x; ra[1] = p0.y; ra[2] = p0.z; ra[3] = p0.w;
             ra[4] = 0; ra[5] = 0; ra[6] = 0; ra[7] = 0;
-            ra[8] = (int) (uint32_t) wd[0];
+            ra[8] = (int) (uint32_t) wds[0];
         } else {
 #pragma unroll
             for (int i = 0; i < 9; ++i) {
@@ -157,9 +159,12 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         }
     };
     auto store = [&]() {
-        // nibble expand: byte i = value i (low) | value(16+i) (high); dwords
-        // 0..3 = values 0..15, dwords 4..7 = values 16..31 — the same dword
-        // order as the activation qs, so dp4a pairs align.
+        // nibble expand: canonical Q4_0 interleaved pairs — byte i holds value
+        // 2i (low nibble) | value(2i+1) (high nibble). After masking, weight
+        // dwords 0..3 carry the EVEN-index values (dword kk = v(8kk), v(8kk+2),
+        // v(8kk+4), v(8kk+6)) and dwords 4..7 the ODD-index values. The
+        // activation bytes are permuted below to match that order so every
+        // dp4a pairs each weight value with its own activation value.
         const int kb0 = 2 * la_h;
         aq[kb0    ][la_row][0] = ra[0] & 0x0F0F0F0F;
         aq[kb0    ][la_row][1] = ra[1] & 0x0F0F0F0F;
@@ -179,14 +184,17 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         aq[kb0 + 1][la_row][7] = (ra[7] >> 4) & 0x0F0F0F0F;
         ad[kb0    ][la_row] = __half2float(__ushort_as_half((unsigned short) (ra[8] & 0xFFFF)));
         ad[kb0 + 1][la_row] = __half2float(__ushort_as_half((unsigned short) ((uint32_t) ra[8] >> 16)));
-        bq[lb_kb][lb_col][0] = rb[1];
-        bq[lb_kb][lb_col][1] = rb[2];
-        bq[lb_kb][lb_col][2] = rb[3];
-        bq[lb_kb][lb_col][3] = rb[4];
-        bq[lb_kb][lb_col][4] = rb[5];
-        bq[lb_kb][lb_col][5] = rb[6];
-        bq[lb_kb][lb_col][6] = rb[7];
-        bq[lb_kb][lb_col][7] = rb[8];
+        // Activation byte permute to match the scrambled weight dword order
+        // (rb[1..8] = activation dwords q0..q7 = x0..x31): dword 0 = x0,x2,x4,x6;
+        // dword 1 = x8,x10,x12,x14; ... dword 4 = x1,x3,x5,x7; ...
+        bq[lb_kb][lb_col][0] = __byte_perm(rb[1], rb[2], 0x6420);
+        bq[lb_kb][lb_col][1] = __byte_perm(rb[3], rb[4], 0x6420);
+        bq[lb_kb][lb_col][2] = __byte_perm(rb[5], rb[6], 0x6420);
+        bq[lb_kb][lb_col][3] = __byte_perm(rb[7], rb[8], 0x6420);
+        bq[lb_kb][lb_col][4] = __byte_perm(rb[1], rb[2], 0x7531);
+        bq[lb_kb][lb_col][5] = __byte_perm(rb[3], rb[4], 0x7531);
+        bq[lb_kb][lb_col][6] = __byte_perm(rb[5], rb[6], 0x7531);
+        bq[lb_kb][lb_col][7] = __byte_perm(rb[7], rb[8], 0x7531);
         bd[lb_kb][lb_col] = __half22float2(*reinterpret_cast<const half2 *>(&rb[0]));
     };
 
