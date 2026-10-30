@@ -24,7 +24,7 @@
 
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"   // repack_tile_meta
-#include "../ggml-cuda.h"       // GGML_LOG_WARN for the gate-engagement marker
+#include "ggml-cuda.h"         // GGML_LOG_WARN for the gate-engagement marker
 
 #include <cstdlib>
 
