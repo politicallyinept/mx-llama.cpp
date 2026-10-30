@@ -3,6 +3,7 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"
+#include "gcn-u4-gemm.cuh"   // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED tiled GEMM
 #include "w4a4-profile.h"   // GGML_CUDA_W4A4_PROFILE: resolved int4-knob presets
 #include "../quantize.cuh"
 #include "../mmq.cuh"
@@ -778,6 +779,14 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     // Multi-token: 64-wide GEMM for large batches, 32-wide for small ones.
     const int nrl  = MMQ_RP_Q8_NROW_LANES;
     const int mmq_bm = MMQ_RP_Q8_BM;
+    // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED — the tiled gcn_u4_gemm replaces
+    // the generic MMQ loop for the STOCK q8_1-activation Q4_0 path (both the
+    // 64-wide and the w32 arm, and it outranks GGML_RP_KSPLIT). The u4act/u4p8/
+    // u4x16/u4q41 dot8 variants keep their own kernels. Tile order changes FP
+    // rounding vs the generic loop: enabling the gate requires a re-seal.
+    const bool tiled = ggml_cuda_repack_q4_0_tiled_on()
+                     && !u4act && !u4p8 && !u4x16 && !u4q41;
+    const int  n_groups_t = (int) (GGML_PAD(ne00, MATRIX_ROW_PADDING) / (4 * QK8_1));
     if (ne11 >= 128) {
         const int bn = 64 * MMQ_RP_Q8_TN;
         const dim3 grid((ne01 + mmq_bm - 1) / mmq_bm,
@@ -799,6 +808,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
+                if (tiled) {
+                    ggml_cuda_gcn_u4_gemm_dense(w, (const block_q8_1_mmq_ds_h *) xq, dst_d,
+                        (int) ne01, (int) ne11, (int) ne00, n_groups_t, (uint32_t) ne01, stream);
+                    break;
+                }
                 // G3: under the u4act gate, the dot8 u4-activation GEMM.
                 // M4: under gate=2 (u4p8), the per-8 u4p dot8 GEMM instead.
                 if (u4x16) {
@@ -919,6 +933,11 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                     nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, (uint32_t) ne01);
                 break;
             case GGML_TYPE_Q4_0:
+                if (tiled) {
+                    ggml_cuda_gcn_u4_gemm_dense(w, (const block_q8_1_mmq_ds_h *) xq, dst_d,
+                        (int) ne01, (int) ne11, (int) ne00, n_groups_t, (uint32_t) ne01, stream);
+                    break;
+                }
                 // GGML_RP_KSPLIT: K-sliced w32 GEMM + fixed-order reduce.
                 // INTEGRATION (perf/w4a4-integrated): K-split now wraps the
                 // per-32 u4act AND the per-16 u4x16 read paths as well as the

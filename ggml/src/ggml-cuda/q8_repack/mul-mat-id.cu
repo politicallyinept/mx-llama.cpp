@@ -3,6 +3,7 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "repack-kernels.cuh"
+#include "gcn-u4-gemm.cuh"   // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED tiled GEMM
 #include "w4a4-profile.h"   // GGML_CUDA_W4A4_PROFILE: resolved int4-knob presets
 #include "../quantize.cuh"
 #include "../mmq.cuh"
@@ -453,6 +454,23 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 }
             }
         } break;        case GGML_TYPE_Q4_0: {
+            // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED — tiled gcn_u4_gemm with
+            // 64-wide expert tiles (repack_tile_off<64>). Tile order changes FP
+            // rounding vs the generic MMQ loop: enabling the gate requires a
+            // re-seal of the Q4_0 MoE path.
+            if (ggml_cuda_repack_q4_0_tiled_on()) {
+                const int64_t max_tiles = n_assign / 64 + ne02;
+                ggml_cuda_pool_alloc<int32_t>          tile_off_t (ctx.pool(), ne02 + 1);
+                ggml_cuda_pool_alloc<repack_tile_meta> tile_meta_t(ctx.pool(), max_tiles);
+                repack_tile_off<64><<<1, 1, 0, stream>>>(expert_bounds.get(),
+                    tile_off_t.get(), tile_meta_t.get(), ne02);
+                ggml_cuda_gcn_u4_gemm_moe(w, (const block_q8_1_mmq_ds_h *) xq, dst_d,
+                    (int) ne01, (int) ne00, (int) n_groups, dst_s1,
+                    ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+                    tile_off_t.get(), tile_meta_t.get(), (uint32_t) ne02,
+                    expert_stride, (int) max_tiles, stream);
+                break;
+            }
             const bool is_mx = true;
             if (use_w32) {
                 const int64_t max_tiles_w32 = n_assign / BN_W32 + ne02;
