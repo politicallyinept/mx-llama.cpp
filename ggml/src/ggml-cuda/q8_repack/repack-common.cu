@@ -113,9 +113,9 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return on;
     }();
-    // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC=1 pins
-    // Q8_0 matmuls to STOCK accumulation order. Default OFF (unset) keeps the
-    // repack path exactly as sealed.
+    // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC pins
+    // Q8_0 matmuls to STOCK accumulation order. Default ON (anchor3 consolidation,
+    // 6/6 baseline match proven 2026-10-30); set =0 to restore the repacked Q8_0 path.
     //
     // Divergence map (adopt-gdn-rows): the weight repack itself is lossless -
     // block_q8_0 carries a ggml_half d (ggml-common.h:253) and both planes are
@@ -153,7 +153,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // matmul as stock - no extra passes.
     static const bool s_q8_0_stock_acc = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0_STOCK_ACC");
-        const bool on = e != nullptr && atoi(e) != 0;
+        const bool on = e == nullptr || atoi(e) != 0;
         if (on) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_STOCK_ACC gate ACTIVE: Q8_0 stays canonical, stock accumulation (repack suppressed for Q8_0)\n");
         }
