@@ -40,8 +40,6 @@ bool ggml_cuda_repack_q4_0_tiled_on() {
     return s_on;
 }
 
-#if defined(GGML_USE_HIP) && defined(__gfx906__)
-
 static constexpr int GU4_BM  = 128; // weight rows per block
 static constexpr int GU4_BN  = 64;  // tokens per block
 static constexpr int GU4_NT  = 256;
@@ -61,6 +59,7 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_off,
         const repack_tile_meta * __restrict__ tile_meta, const uint32_t n_expert) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     int a_base = 0, ncols = 0;
     if constexpr (MOE) {
         if ((int) blockIdx.y >= tile_off[n_expert]) {
@@ -274,6 +273,11 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
             }
         }
     }
+#else
+    GGML_UNUSED_VARS(wbase, xmmq, dst, M, N, K, n_groups, dst_s1, expert_stride,
+        ids_src1, ids_dst, expert_bounds, tile_off, tile_meta, n_expert);
+    NO_DEVICE_CODE;
+#endif // gfx906 device body
 }
 
 void ggml_cuda_gcn_u4_gemm_dense(const uint8_t * wbase, const block_q8_1_mmq_ds_h * xmmq,
@@ -294,18 +298,3 @@ void ggml_cuda_gcn_u4_gemm_moe(const uint8_t * wbase, const block_q8_1_mmq_ds_h 
             dst_s1, expert_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
             n_expert);
 }
-
-#else  // !HIP-gfx906
-
-void ggml_cuda_gcn_u4_gemm_dense(const uint8_t *, const block_q8_1_mmq_ds_h *, float *,
-        int, int, int, int, uint32_t, cudaStream_t) {
-    GGML_ABORT("gcn_u4_gemm is gfx906-only");
-}
-
-void ggml_cuda_gcn_u4_gemm_moe(const uint8_t *, const block_q8_1_mmq_ds_h *, float *,
-        int, int, int, uint32_t, const int32_t *, const int32_t *, const int32_t *,
-        const int32_t *, const repack_tile_meta *, uint32_t, size_t, int, cudaStream_t) {
-    GGML_ABORT("gcn_u4_gemm is gfx906-only");
-}
-
-#endif
