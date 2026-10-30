@@ -2,7 +2,7 @@
 // Port of the gcn_q8_gemm / gcn_kq4_gemm tiling pattern (gcn-q8-gemm.cu) to the
 // repacked-u4 buffer layout: 256-thread blocks, 128 weight rows x 64 tokens,
 // 8x4 register tile per thread, LDS staging with 9-dword row padding, register
-// prefetch of the next K step. Gate: GGML_CUDA_REPACK_Q4_0_TILED (default ON; set =0 to disable).
+// prefetch of the next K step. Gate: GGML_CUDA_REPACK_Q4_0_TILED (default OFF; set =1 to enable).
 //
 // NUMERICS: the tile order and the per-block epilogue association differ from
 // the generic mmq_gemm_repacked loop (fma contraction of d*(dx*s - 8*sx)), so
@@ -16,7 +16,7 @@
 struct repack_tile_meta;
 struct block_q8_1_mmq_ds_h;
 
-// Gate: GGML_CUDA_REPACK_Q4_0_TILED (default ON; set =0 to disable). When on, the repacked Q4_0
+// Gate: GGML_CUDA_REPACK_Q4_0_TILED (default OFF; set =1 to enable). When on, the repacked Q4_0
 // dense and MoE-id tiled GEMMs run gcn_u4_gemm instead of the generic MMQ loop.
 bool ggml_cuda_repack_q4_0_tiled_on();
 
