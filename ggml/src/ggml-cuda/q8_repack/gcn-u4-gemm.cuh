@@ -27,8 +27,9 @@ void ggml_cuda_gcn_u4_gemm_dense(const uint8_t * wbase, const block_q8_1_mmq_ds_
         cudaStream_t stream);
 
 // MoE (MUL_MAT_ID): tiles from repack_tile_off<64>; grid.y walks the tiles.
+// n_cols = total token count of the xq pool (its group stride).
 void ggml_cuda_gcn_u4_gemm_moe(const uint8_t * wbase, const block_q8_1_mmq_ds_h * xmmq,
         float * dst, int M, int K, int n_groups, uint32_t dst_s1,
         const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * expert_bounds,
         const int32_t * tile_off, const repack_tile_meta * tile_meta, uint32_t n_expert,
-        size_t expert_stride, int max_tiles, cudaStream_t stream);
+        size_t expert_stride, int max_tiles, int n_cols, cudaStream_t stream);
