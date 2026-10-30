@@ -935,6 +935,12 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Enqueue the state capture without a host-side sync: metadata is written to dst
+// immediately, the tensor data is captured asynchronously (stream-ordered D2H into
+// pinned staging, copied into dst when the capture drains). The captured buffer
+// must not be read until the context has been synchronized.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

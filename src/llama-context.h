@@ -14,6 +14,8 @@
 
 #include <array>
 #include <map>
+#include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -492,6 +494,22 @@ private:
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+
+public:
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC captures: pinned host staging slots and the pending reads
+    struct state_async_slot {
+        ggml_backend_buffer_ptr pinned; // pinned host staging the tensors are read into, in stream order
+        std::map<ggml_backend_t, ggml_backend_event_t> events;
+        struct read { const uint8_t * src; uint8_t * dst; size_t size; };
+        std::vector<read> reads;
+        std::thread worker;             // waits for the reads, then copies staging -> dst
+        bool busy = false;
+        ~state_async_slot();
+    };
+    std::vector<std::unique_ptr<state_async_slot>> state_async_slots;
+    void state_async_finish();
+    ggml_backend_t state_async_backend(ggml_backend_buffer_type_t buft) const;
+private:
 
     bool has_evaluated_once = false;
 

@@ -142,6 +142,19 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
+// Tier-3.1 fix #1: async checkpoint capture (env GGML_CUDA_ASYNC_CKPT, default OFF).
+// When ON, create_checkpoint() enqueues the recurrent-state capture without a host-side
+// sync; the sync is deferred to the next llama_synchronize (the logits read). The extra
+// syncs below only guard checkpoint erase/copy sites that could race with an in-flight
+// capture; they are no-ops when the gate is OFF.
+static bool srv_ckpt_async_enabled() {
+    static const bool enabled = [] () {
+        const char * env = getenv("GGML_CUDA_ASYNC_CKPT");
+        return env && atoi(env) != 0;
+    } ();
+    return enabled;
+}
+
 struct server_batch {
     common_batch view; // the rendered sub-batch [off, off + n_tokens), see render()
 
@@ -319,6 +332,10 @@ struct server_slot {
             return false;
         }
 
+        if (srv_ckpt_async_enabled()) {
+            llama_synchronize(ctx_tgt); // complete async checkpoint captures before the prompt (and its checkpoints) is copied
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -351,6 +368,10 @@ struct server_slot {
 
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        if (srv_ckpt_async_enabled()) {
+            llama_synchronize(ctx_tgt); // pending async checkpoint captures write into prompt.checkpoints
+        }
 
         mem.seq_rm(id, -1, -1);
 
@@ -594,6 +615,10 @@ struct server_slot {
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            if (srv_ckpt_async_enabled()) {
+                llama_synchronize(ctx_tgt); // a cancelled prompt may still have async checkpoint captures in flight
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -2559,6 +2584,21 @@ private:
 
         const int id_task = slot.task->id;
 
+        // a checkpoint that is about to be erased (evicted from a full list, or superseded at
+        // the same position) must have completed its async capture first - otherwise the
+        // capture worker would write into freed memory
+        if (srv_ckpt_async_enabled()) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const auto & cps = slot.prompt.checkpoints;
+            bool at_risk = !cps.empty() && cps.size() + 1 >= (size_t) params_base.n_ctx_checkpoints && cps.front().id_task == id_task;
+            for (const auto & c : cps) {
+                at_risk = at_risk || (c.id_task == id_task && c.n_tokens == n_tokens_new);
+            }
+            if (at_risk) {
+                llama_synchronize(ctx_tgt);
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2610,7 +2650,9 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // async capture: the prompt keeps flowing through the pipeline instead of draining for the state read
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY
+                | (srv_ckpt_async_enabled() ? LLAMA_STATE_SEQ_FLAGS_ASYNC : 0));
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
@@ -3816,6 +3858,9 @@ private:
 
                             {
                                 // erase any checkpoints with pos_max > pos_next
+                                if (srv_ckpt_async_enabled()) {
+                                    llama_synchronize(ctx_tgt); // (complete any async checkpoint capture first)
+                                }
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {

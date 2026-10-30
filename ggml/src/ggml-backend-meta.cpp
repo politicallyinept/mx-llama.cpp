@@ -3507,8 +3507,73 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
     GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
-    GGML_ASSERT(split_state.n_segments == 1);
-    GGML_ASSERT(split_state.nr[0]      == 1);
+
+    if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
+        // Multi-segment split (e.g. the TP-split recurrent state planes on adopt-gdn-rows):
+        // mirror of the multi-segment path in ggml_backend_meta_buffer_get_tensor, with the
+        // per-segment strided 2D reads dispatched async instead of blocking. Byte-identical
+        // values to the synchronous get, stream-ordered after the queued compute.
+        GGML_ASSERT(split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS);
+        GGML_ASSERT(split_state.nr[0] != 0);
+        GGML_ASSERT(tensor->ne[3] == 1);
+
+        size_t offset_data = 0;
+        std::vector<size_t> simple_offsets(n_backends, 0);
+        if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            GGML_ASSERT(tensor->ne[2] == 1);
+
+            const size_t row_stride = tensor->nb[1];
+            GGML_ASSERT(offset % row_stride == 0);
+            GGML_ASSERT(size   % row_stride == 0);
+            const int64_t row_start = offset / row_stride;
+            const int64_t row_count = size   / row_stride;
+            GGML_ASSERT(row_start + row_count <= tensor->ne[1]);
+
+            const int64_t blck_size = ggml_blck_size(tensor->type);
+            for (size_t s = 0; s < split_state.n_segments; s++) {
+                for (size_t r = 0; r < split_state.nr[s]; r++) {
+                    for (size_t j = 0; j < n_backends; j++) {
+                        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                        GGML_ASSERT(split_state.ne[s*n_backends + j] % blck_size == 0);
+                        const size_t nbytes = split_state.ne[s*n_backends + j]/blck_size * tensor->nb[0];
+                        ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_data,
+                            simple_offsets[j] + row_start * simple_tensor->nb[1], nbytes,
+                            row_count, simple_tensor->nb[1], tensor->nb[1]);
+                        offset_data       += nbytes;
+                        simple_offsets[j] += nbytes;
+                    }
+                }
+            }
+            GGML_ASSERT(offset_data*row_count == size);
+            return;
+        }
+        GGML_ASSERT(split_state.axis == GGML_BACKEND_SPLIT_AXIS_1);
+
+        const size_t row_stride = tensor->nb[2];
+        GGML_ASSERT(offset % row_stride == 0);
+        GGML_ASSERT(size   % row_stride == 0);
+        const int64_t row_start = offset / row_stride;
+        const int64_t row_count = size   / row_stride;
+        GGML_ASSERT(row_start + row_count <= tensor->ne[2]);
+
+        for (size_t s = 0; s < split_state.n_segments; s++) {
+            for (size_t r = 0; r < split_state.nr[s]; r++) {
+                for (size_t j = 0; j < n_backends; j++) {
+                    ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    const size_t nbytes = split_state.ne[s*n_backends + j] * tensor->nb[1];
+                    ggml_backend_tensor_get_2d_async(simple_backend, simple_tensor, (char *) data + offset_data,
+                        simple_offsets[j] + row_start * simple_tensor->nb[2], nbytes,
+                        row_count, simple_tensor->nb[2], tensor->nb[2]);
+                    offset_data       += nbytes;
+                    simple_offsets[j] += nbytes;
+                }
+            }
+        }
+        GGML_ASSERT(offset_data*row_count == size);
+        return;
+    }
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
