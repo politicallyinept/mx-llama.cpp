@@ -992,6 +992,7 @@ struct attn_qk_args {
     half * cv; int64_t cv_row; const int64_t * v_idx;
     const int32_t * pos;
     int n_dims, n_offs, T, nqh, nkvh;
+    int norm_narrow;  // bit0: q norm uses the narrow tree, bit1: k norm does
     float theta_scale, freq_scale, ext_factor, attn_factor;
     rope_corr_dims corr;
     mrope_sections sec;
@@ -1007,21 +1008,39 @@ static __global__ void __launch_bounds__(HD) attn_qk_fused(const attn_qk_args a)
     const float x = isq ? a.q[t*a.q_s2 + h*a.q_s1 + c] : a.k[t*a.k_s2 + hk*a.k_s1 + c];
     __shared__ float row[HD];
     __shared__ float s_ss;
-    // byte-match rms_norm_f32_narrow (the fork's norm kernel for HD=256): lanes 0..63 each sum one float4
-    // (x*x + y*y + z*z + w*w), then a full-wave butterfly; HD/4 == WARP_SIZE on gfx906.
-    const float * xrow = isq ? a.q + t*a.q_s2 + h*a.q_s1 : a.k + t*a.k_s2 + hk*a.k_s1;
-    float p = 0.0f;
-    static_assert(HD/8 == WARP_SIZE, "narrow repro assumes 32 lanes x 2 float4");
-    if (c < HD/8) {
-        const float4 * xr = (const float4 *) xrow;
-        const float4 v0 = xr[c], v1 = xr[c + HD/8];
-        p += v0.x*v0.x + v0.y*v0.y + v0.z*v0.z + v0.w*v0.w;
-        p += v1.x*v1.x + v1.y*v1.y + v1.z*v1.z + v1.w*v1.w;
+    __shared__ float s_red[HD/WARP_SIZE];
+    // byte-match whichever reference norm kernel the fork actually runs for this side:
+    // rms_norm_f32_narrow (32 lanes x 2 float4 + warp butterfly) when rms_norm_narrow_ok accepts the
+    // layout (contiguous per-head rows, e.g. the nextn draft's q/k), else the generic
+    // rms_norm_f32<256> block_reduce (warp butterfly + 8-warp shared combine, the main model's
+    // strided qkv views). The matcher computes the same predicate and sets a.norm_narrow per side.
+    float ss;
+    if (a.norm_narrow & (isq ? 1 : 2)) {
+        const float * xrow = isq ? a.q + t*a.q_s2 + h*a.q_s1 : a.k + t*a.k_s2 + hk*a.k_s1;
+        float p = 0.0f;
+        static_assert(HD/8 == WARP_SIZE, "narrow repro assumes 32 lanes x 2 float4");
+        if (c < HD/8) {
+            const float4 * xr = (const float4 *) xrow;
+            const float4 v0 = xr[c], v1 = xr[c + HD/8];
+            p += v0.x*v0.x + v0.y*v0.y + v0.z*v0.z + v0.w*v0.w;
+            p += v1.x*v1.x + v1.y*v1.y + v1.z*v1.z + v1.w*v1.w;
+        }
+        p = warp_reduce_sum(p);
+        if (c == 0) { s_ss = p; }
+        __syncthreads();
+        ss = s_ss;
+    } else {
+        // byte-match rms_norm_f32<256>: it accumulates tmp += xi*xi in a (single-iteration) loop
+        // before block_reduce, which materializes the rounded square; passing x*x straight into
+        // block_reduce lets the compiler contract the square into the first butterfly add and
+        // flips 1 ULP on some rows.
+        float ss_partial = 0.0f;
+        for (int col = c; col < HD; col += HD) {
+            ss_partial += x * x;
+        }
+        ss = block_reduce<block_reduce_method::SUM, HD>(ss_partial, s_red);
     }
-    p = warp_reduce_sum(p);
-    if (c == 0) { s_ss = p; }
-    __syncthreads();
-    const float scale = rsqrtf(s_ss / HD + (isq ? a.eps_q : a.eps_k));
+    const float scale = rsqrtf(ss / HD + (isq ? a.eps_q : a.eps_k));
     row[c] = (scale*x)*(isq ? a.wq[c] : a.wk[c]);
     __syncthreads();
     float out = row[c];
@@ -1191,6 +1210,17 @@ int ggml_cuda_attn_qk_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     memcpy(&beta_slow,     op + 10, sizeof(float));
     memcpy(&a.sec.v,       op + 11, sizeof(int)*4);
     a.imrope = mode == GGML_ROPE_TYPE_IMROPE;
+    // same predicate as rms_norm_narrow_ok + the mul gate (wq/wk are [HD,1,1,1], 16B-aligned):
+    // the fork runs rms_norm_f32_narrow iff the q/k view rows are contiguous
+    // (stride_row == HD, stride_channel == HD*nrows, stride_sample == stride_channel*T).
+    static const bool s_narrow_env = [] { const char * e = getenv("GGML_CUDA_RMS_NORM_NARROW"); return !e || atoi(e) != 0; }();
+    const int64_t q_s1 = q->nb[1]/sizeof(float), q_s2 = q->nb[2]/sizeof(float), q_s3 = q->nb[3]/sizeof(float);
+    const int64_t k_s1 = k->nb[1]/sizeof(float), k_s2 = k->nb[2]/sizeof(float), k_s3 = k->nb[3]/sizeof(float);
+    const bool q_narrow = s_narrow_env && q_s1 == HD && q_s2 == (int64_t) HD * q->ne[1] && q_s3 == q_s2 * T &&
+        ((uintptr_t) pq->data) % 16 == 0 && ((uintptr_t) wq->data) % 16 == 0;
+    const bool k_narrow = s_narrow_env && k_s1 == HD && k_s2 == (int64_t) HD * k->ne[1] && k_s3 == k_s2 * T &&
+        ((uintptr_t) pk->data) % 16 == 0 && ((uintptr_t) wk->data) % 16 == 0;
+    a.norm_narrow = (q_narrow ? 1 : 0) | (k_narrow ? 2 : 0);
     a.theta_scale = powf(freq_base, -2.0f/a.n_dims);
     ggml_rope_yarn_corr_dims(a.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, a.corr.v);
     if (a.n_offs < 0 || a.n_offs + a.n_dims > HD || a.n_dims % 2 != 0) {
