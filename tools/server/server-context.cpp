@@ -142,7 +142,7 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
-// Tier-3.1 fix #1: async checkpoint capture (env GGML_CUDA_ASYNC_CKPT, default OFF).
+// Tier-3.1 fix #1: async checkpoint capture (env GGML_CUDA_ASYNC_CKPT, default ON; set =0 to disable).
 // When ON, create_checkpoint() enqueues the recurrent-state capture without a host-side
 // sync; the sync is deferred to the next llama_synchronize (the logits read). The extra
 // syncs below only guard checkpoint erase/copy sites that could race with an in-flight
@@ -150,7 +150,7 @@ struct server_slot; // forward declaration
 static bool srv_ckpt_async_enabled() {
     static const bool enabled = [] () {
         const char * env = getenv("GGML_CUDA_ASYNC_CKPT");
-        return env && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     } ();
     return enabled;
 }
