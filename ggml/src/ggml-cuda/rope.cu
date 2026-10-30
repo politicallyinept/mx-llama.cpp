@@ -1100,8 +1100,9 @@ static const ggml_tensor * attn_qk_base(const ggml_tensor * t) {
 
 int ggml_cuda_attn_qk_fused(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i,
                             bool (*compute_middle)(ggml_backend_cuda_context & ctx, ggml_tensor * t)) {
-    // Gate GGML_CUDA_ATTN_QK_FUSED=1, default OFF (CV default is ON under GGML_CUDA_ATTN_QK_FUSE).
-    static const bool off = [] { const char * e = getenv("GGML_CUDA_ATTN_QK_FUSED"); return !(e && atoi(e) != 0); }();
+    // Gate GGML_CUDA_ATTN_QK_FUSED, default ON (anchor-final flip, byte-clean 0/28; set =0 to disable).
+    // CV default is ON under GGML_CUDA_ATTN_QK_FUSE.
+    static const bool off = [] { const char * e = getenv("GGML_CUDA_ATTN_QK_FUSED"); return e != nullptr && atoi(e) == 0; }();
     if (off) {
         return 0;
     }
