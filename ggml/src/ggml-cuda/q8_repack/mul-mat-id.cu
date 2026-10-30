@@ -468,7 +468,7 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                     (int) ne01, (int) ne00, (int) n_groups, dst_s1,
                     ids_src1.get(), ids_dst.get(), expert_bounds.get(),
                     tile_off_t.get(), tile_meta_t.get(), (uint32_t) ne02,
-                    expert_stride, (int) max_tiles, stream);
+                    expert_stride, (int) max_tiles, (int) n_cols, stream);
                 break;
             }
             const bool is_mx = true;

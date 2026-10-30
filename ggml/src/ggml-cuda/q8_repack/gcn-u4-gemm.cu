@@ -109,7 +109,10 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         xvalid = col0 + lb_col < N;
         xrow   = min(col0 + lb_col, N - 1);
     }
-    const block_q8_1_mmq_ds_h * const yb = xmmq + (size_t) xrow * n_groups;
+    // The mmq q8_1 pool is GROUP-major: block (group g, token t) = xmmq[g*pool_s + t]
+    // (quantize_mmq_q8_1 writes dst[i*ne1 + col]; the generic GEMM strides x_group by
+    // n_tok). pool_s = token count of this slice: dense ne11, MoE n_cols (both in N).
+    const int pool_s = N;
 
     // ---- compute roles ------------------------------------------------------
     const int rg = tid % 16;   // rows rg + 16*i
@@ -138,7 +141,7 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
                 ra[i] = 0;
             }
         }
-        const block_q8_1_mmq_ds_h * gb = yb + step;
+        const block_q8_1_mmq_ds_h * const gb = xmmq + (size_t) step * pool_s + xrow;
         if (xvalid && step * GU4_KB + lb_kb < n_sub) {
             rb[0] = (int) *reinterpret_cast<const uint32_t *>(&gb->ds4[lb_kb]);
             const uint4 * pb = reinterpret_cast<const uint4 *>(gb->qs + lb_kb * QK8_1);
@@ -292,9 +295,9 @@ void ggml_cuda_gcn_u4_gemm_moe(const uint8_t * wbase, const block_q8_1_mmq_ds_h 
         float * dst, int M, int K, int n_groups, uint32_t dst_s1,
         const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * expert_bounds,
         const int32_t * tile_off, const repack_tile_meta * tile_meta, uint32_t n_expert,
-        size_t expert_stride, int max_tiles, cudaStream_t stream) {
+        size_t expert_stride, int max_tiles, int n_cols, cudaStream_t stream) {
     const dim3 grid((M + GU4_BM - 1) / GU4_BM, max_tiles, 1);
-    gcn_u4_gemm<true><<<grid, GU4_NT, 0, stream>>>(wbase, xmmq, dst, M, 0, K, n_groups,
+    gcn_u4_gemm<true><<<grid, GU4_NT, 0, stream>>>(wbase, xmmq, dst, M, n_cols, K, n_groups,
             dst_s1, expert_stride, ids_src1, ids_dst, expert_bounds, tile_off, tile_meta,
             n_expert);
 }
