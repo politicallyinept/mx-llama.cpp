@@ -920,6 +920,8 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    state_async_finish();
+
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -3906,6 +3908,163 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+// LLAMA_STATE_SEQ_FLAGS_ASYNC: metadata goes to dst at once, tensor data is copied host-async
+// (D2H into pinned staging) on the backend that owns the state, stream-ordered after the queued
+// prefill/decode work, and read into dst by a worker thread once the recorded events fire. The
+// host sync is thus deferred to state_async_finish(), called from llama_context::synchronize() -
+// i.e. just before the logits read, where the checkpoint values are actually needed. The values
+// are identical to the synchronous path: the capture is stream-ordered between the prefill writes
+// and any later state updates.
+class llama_io_write_async : public llama_io_write_i {
+public:
+    llama_io_write_async(uint8_t * p, size_t len, llama_context & lctx) : ptr(p), buf_size(len), lctx(lctx) {}
+
+    ~llama_io_write_async() {
+        size_t total = 0;
+        bool async_ok = true;
+        ggml_backend_buffer_type_t host_buft = nullptr;
+        for (const auto & w : winfos) {
+            total += GGML_PAD(w.size, 256);
+            ggml_backend_t backend = lctx.state_async_backend(ggml_backend_buffer_get_type(w.tensor->buffer));
+            async_ok = async_ok && backend != nullptr;
+            if (backend && !host_buft) {
+                host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+            }
+        }
+        async_ok = async_ok && host_buft != nullptr && total > 0;
+        if (!async_ok) {
+            // e.g. state in host memory: plain blocking read
+            lctx.synchronize();
+            for (const auto & w : winfos) {
+                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+            }
+            return;
+        }
+
+        // a free slot with enough staging, or a new one
+        llama_context::state_async_slot * slot = nullptr;
+        for (auto & sl : lctx.state_async_slots) {
+            if (!sl->busy && sl->pinned && ggml_backend_buffer_get_size(sl->pinned.get()) >= total) {
+                slot = sl.get();
+                break;
+            }
+        }
+        if (slot == nullptr) {
+            lctx.state_async_slots.push_back(std::make_unique<llama_context::state_async_slot>());
+            slot = lctx.state_async_slots.back().get();
+            slot->pinned.reset(ggml_backend_buft_alloc_buffer(host_buft, total));
+            GGML_ASSERT(slot->pinned && "failed to allocate async state staging");
+            LLAMA_LOG_INFO("%s: allocated async state staging '%s' %.3f MiB\n", __func__, ggml_backend_buft_name(host_buft), total/1024.0/1024.0);
+        }
+        slot->reads.clear();
+        slot->busy = true;
+
+        uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(slot->pinned.get());
+        size_t off = 0;
+        std::vector<ggml_backend_t> used;
+        for (const auto & w : winfos) {
+            ggml_backend_t backend = lctx.state_async_backend(ggml_backend_buffer_get_type(w.tensor->buffer));
+            ggml_backend_tensor_get_async(backend, w.tensor, base + off, w.offset, w.size);
+            slot->reads.push_back({base + off, w.ptr, w.size});
+            off += GGML_PAD(w.size, 256);
+            if (std::find(used.begin(), used.end(), backend) == used.end()) {
+                used.push_back(backend);
+            }
+        }
+        std::vector<ggml_backend_event_t> evs;
+        for (ggml_backend_t backend : used) {
+            auto & ev = slot->events[backend];
+            if (!ev) {
+                ev = ggml_backend_event_new(ggml_backend_get_device(backend));
+            }
+            ggml_backend_event_record(ev, backend);
+            evs.push_back(ev);
+        }
+        slot->worker = std::thread([slot, evs]() {
+            for (auto * ev : evs) {
+                ggml_backend_event_synchronize(ev);
+            }
+            for (const auto & r : slot->reads) {
+                memcpy(r.dst, r.src, r.size);
+            }
+        });
+    }
+
+    void write(const void * src, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        memcpy(ptr, src, size);
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (size > buf_size) {
+            throw std::runtime_error("unexpectedly reached end of buffer");
+        }
+        winfos.push_back({tensor, ptr, size, offset});
+        ptr += size;
+        size_written += size;
+        buf_size -= size;
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    uint8_t * ptr;
+    size_t buf_size = 0;
+    size_t size_written = 0;
+
+    struct write_info {
+        ggml_tensor * tensor;
+        uint8_t * ptr;
+        size_t size;
+        size_t offset;
+    };
+    std::vector<write_info> winfos;
+
+    llama_context & lctx;
+};
+
+ggml_backend_t llama_context::state_async_backend(ggml_backend_buffer_type_t buft) const {
+    if (ggml_backend_buft_is_host(buft)) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    for (const auto & b : backends) {
+        if (ggml_backend_get_device(b.get()) == dev && ggml_backend_supports_buft(b.get(), buft)) {
+            return b.get();
+        }
+    }
+    return nullptr;
+}
+
+llama_context::state_async_slot::~state_async_slot() {
+    if (worker.joinable()) {
+        worker.join();
+    }
+    for (auto & [b, ev] : events) {
+        ggml_backend_event_free(ev);
+    }
+}
+
+void llama_context::state_async_finish() {
+    for (auto & sl : state_async_slots) {
+        if (!sl->busy) {
+            continue;
+        }
+        if (sl->worker.joinable()) {
+            sl->worker.join();
+        }
+        sl->reads.clear();
+        sl->busy = false;
+    }
+}
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
@@ -3923,6 +4082,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     std::unique_ptr<llama_io_write_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
+    } else if (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) {
+        io = std::make_unique<llama_io_write_async>(dst, size, *this);
     } else {
         io = std::make_unique<llama_io_write_host>(dst, size);
     }
@@ -5116,7 +5277,9 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ASYNC)) {
+        ctx->synchronize();
+    }
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
