@@ -14,8 +14,8 @@
 // blocks per gfx906 CU (64-lane waves), LDS 31744 B/block <= 32 KiB.
 //
 // Weight side: repacked Q4_0 = de-aliased nibble rows (16 B per 32-value
-// block, canonical interleaved pairs: byte i = value 2i | value(2i+1) << 4,
-// excess-8 codes) + an f16 scale
+// block, canonical Q4_0 order: byte j = value j (low nibble) | value j+16
+// (high nibble), excess-8 codes) + an f16 scale
 // plane (rp_traits<Q4_0> layout). Nibbles are expanded to int8 at LDS store
 // (the generic GEMM's expanded-staging lesson: expand-at-consume measured -40%).
 // Activation side: the existing block_q8_1_mmq DS4 pool (quantize_mmq_q8_1 with
@@ -39,6 +39,15 @@ bool ggml_cuda_repack_q4_0_tiled_on() {
         return on;
     }();
     return s_on;
+}
+
+// DIAG (tier3-tiledfix, do-not-ship): raw env value for dense/MoE isolation.
+int ggml_cuda_repack_q4_0_tiled_variant() {
+    static const int s_v = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q4_0_TILED");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return s_v;
 }
 
 static constexpr int GU4_BM  = 128; // weight rows per block
@@ -159,12 +168,14 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         }
     };
     auto store = [&]() {
-        // nibble expand: canonical Q4_0 interleaved pairs — byte i holds value
-        // 2i (low nibble) | value(2i+1) (high nibble). After masking, weight
-        // dwords 0..3 carry the EVEN-index values (dword kk = v(8kk), v(8kk+2),
-        // v(8kk+4), v(8kk+6)) and dwords 4..7 the ODD-index values. The
-        // activation bytes are permuted below to match that order so every
-        // dp4a pairs each weight value with its own activation value.
+        // nibble expand: canonical Q4_0 order — byte j holds value j (low
+        // nibble) | value j+16 (high nibble). Weight dword slot kk therefore
+        // already carries NATURAL consecutive values 4kk..4kk+3: slots 0..3 =
+        // low nibbles of bytes 4kk..4kk+3 = values 4kk..4kk+3; slots 4..7 =
+        // high nibbles of bytes 4(kk-4)..4(kk-4)+3 = values 16+4(kk-4).. =
+        // 4kk..4kk+3. No scramble to match: the activation dwords go in
+        // unpermuted (quantize_mmq_q8_1 stores qs[i] = value i, see the
+        // yqs4[iqs/4] = q write in quantize.cu).
         const int kb0 = 2 * la_h;
         aq[kb0    ][la_row][0] = ra[0] & 0x0F0F0F0F;
         aq[kb0    ][la_row][1] = ra[1] & 0x0F0F0F0F;
@@ -184,17 +195,26 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         aq[kb0 + 1][la_row][7] = (ra[7] >> 4) & 0x0F0F0F0F;
         ad[kb0    ][la_row] = __half2float(__ushort_as_half((unsigned short) (ra[8] & 0xFFFF)));
         ad[kb0 + 1][la_row] = __half2float(__ushort_as_half((unsigned short) ((uint32_t) ra[8] >> 16)));
-        // Activation byte permute to match the scrambled weight dword order
-        // (rb[1..8] = activation dwords q0..q7 = x0..x31): dword 0 = x0,x2,x4,x6;
-        // dword 1 = x8,x10,x12,x14; ... dword 4 = x1,x3,x5,x7; ...
-        bq[lb_kb][lb_col][0] = __byte_perm(rb[1], rb[2], 0x6420);
-        bq[lb_kb][lb_col][1] = __byte_perm(rb[3], rb[4], 0x6420);
-        bq[lb_kb][lb_col][2] = __byte_perm(rb[5], rb[6], 0x6420);
-        bq[lb_kb][lb_col][3] = __byte_perm(rb[7], rb[8], 0x6420);
-        bq[lb_kb][lb_col][4] = __byte_perm(rb[1], rb[2], 0x7531);
-        bq[lb_kb][lb_col][5] = __byte_perm(rb[3], rb[4], 0x7531);
-        bq[lb_kb][lb_col][6] = __byte_perm(rb[5], rb[6], 0x7531);
-        bq[lb_kb][lb_col][7] = __byte_perm(rb[7], rb[8], 0x7531);
+        // Activation dwords in NATURAL order (rb[1..8] = pool bytes 0..31 =
+        // x0..x31), pairing x(4kk+i) with weight slot kk byte i.
+        // PAIRING BUG FIX (tier3-tiledfix 2026-10-30): this used to byte_perm
+        // an even/odd split (0x6420/0x7531) assuming the weight dwords were
+        // scrambled as {val 2i, val 2i+1} pairs. Canonical Q4_0 is
+        // {val j low, val j+16 high} (repack-common.cuh: "the PAIRING is the
+        // canonical Q4_0 order ... in every writer"), so the weight side is
+        // natural and the permute scrambled ONLY the activations: every dp4a
+        // paired w(k) with x(perm(k)). Invisible to the standalone unit tests
+        // (their CPU refs mirrored the same wrong assumption — self-consistent
+        // bit-exactness); the in-model dual-run vs the generic repack GEMM
+        // (TILEDCHK) exposed it: nbad ~= n, maxabs up to 36 nats.
+        bq[lb_kb][lb_col][0] = rb[1];
+        bq[lb_kb][lb_col][1] = rb[2];
+        bq[lb_kb][lb_col][2] = rb[3];
+        bq[lb_kb][lb_col][3] = rb[4];
+        bq[lb_kb][lb_col][4] = rb[5];
+        bq[lb_kb][lb_col][5] = rb[6];
+        bq[lb_kb][lb_col][6] = rb[7];
+        bq[lb_kb][lb_col][7] = rb[8];
         bd[lb_kb][lb_col] = __half22float2(*reinterpret_cast<const half2 *>(&rb[0]));
     };
 
