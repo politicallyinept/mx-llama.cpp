@@ -456,8 +456,9 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         } break;        case GGML_TYPE_Q4_0: {
             // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED — tiled gcn_u4_gemm with
             // 64-wide expert tiles (repack_tile_off<64>). Tile order changes FP
-            // rounding vs the generic MMQ loop: enabling the gate requires a
-            // re-seal of the Q4_0 MoE path.
+            // rounding vs the generic MMQ loop: the PINNED epilogue
+            // (gcn-u4-gemm.cu) makes the tiled MoE path bit-identical to the
+            // shipped generic regime (tier3-tiledfix seal 2026-10-31, 12/12).
             if (ggml_cuda_repack_q4_0_tiled_on()) {
                 const int64_t max_tiles = n_assign / 64 + ne02;
                 ggml_cuda_pool_alloc<int32_t>          tile_off_t (ctx.pool(), ne02 + 1);
