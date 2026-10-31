@@ -783,9 +783,32 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
     // the generic MMQ loop for the STOCK q8_1-activation Q4_0 path (both the
     // 64-wide and the w32 arm, and it outranks GGML_RP_KSPLIT). The u4act/u4p8/
     // u4x16/u4q41 dot8 variants keep their own kernels. Tile order changes FP
-    // rounding vs the generic loop: enabling the gate requires a re-seal.
+    // rounding vs the generic loop: the PINNED epilogue (gcn-u4-gemm.cu) plus
+    // the KSPLIT YIELD rule below make the tiled path bit-identical to the
+    // shipped generic regime (tier3-tiledfix seal 2026-10-31, 12/12).
+    // KSPLIT YIELD (tier3-tiledfix): the shipped tiled-OFF baseline runs the
+    // K-sliced w32 GEMM (fixed-order reduce) in the 16<=ne11<=64 window under
+    // PROFILE=speed. The tiled kernel bit-matches the STOCK single-pass, NOT
+    // the K-split reduce, so taking the tiled branch in that window would
+    // diverge from the baseline regime. Yield: when the ksplit gate fires, run
+    // the ksplit path in BOTH arms so TILED=1 is bit-identical to TILED=0.
+    static const int rp_ksplit_env = [] {
+        const w4a4_profile_knobs & prof = w4a4_profile();
+        const int n = (int) prof.ksplit;
+        if (n != 0) {
+            GGML_LOG_WARN("CUDA repack: GGML_RP_KSPLIT=%d gate ACTIVE [%s] (K-sliced w32 GEMM at 16<=ne11<=64)\n", n, prof.ksplit_src);
+        }
+        return n;
+    }();
+    const int ksplit_slices = rp_ksplit_env >= 2 ? rp_ksplit_env
+                            : (rp_ksplit_env == 1 ? 4 : 0);
+    const bool ksplit_gate = ksplit_slices > 0 && src0->type == GGML_TYPE_Q4_0
+                          && !u4p8 && !u4act && !u4x16
+                          && ne11 >= 16 && ne11 <= 64
+                          && ne00 / 32 >= 4 * (int64_t) ksplit_slices;
     const bool tiled = ggml_cuda_repack_q4_0_tiled_on()
-                     && !u4act && !u4p8 && !u4x16 && !u4q41;
+                     && !u4act && !u4p8 && !u4x16 && !u4q41
+                     && !ksplit_gate;
     const int  n_groups_t = (int) (GGML_PAD(ne00, MATRIX_ROW_PADDING) / (4 * QK8_1));
     if (ne11 >= 128) {
         const int bn = 64 * MMQ_RP_Q8_TN;
@@ -886,27 +909,12 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         // reduce kernel sums them into dst. Reorders fp32 accumulation vs the
         // single pass (maxrel ~1e-5, see /root/ksplit-results.txt). Unset =
         // stock single-pass, byte-identical. Q4_0 only, not the u4p8 variant.
-        static const int rp_ksplit_env = [] {
-            // RESOLVED via the profile helper: explicit env > profile preset
-            // (speed presets KSPLIT=1) > 0. The profile NEVER disables: an
-            // explicit KSPLIT=0 under PROFILE=speed stays off (explicit wins).
-            const w4a4_profile_knobs & prof = w4a4_profile();
-            const int n = (int) prof.ksplit;
-            if (n != 0) {
-                GGML_LOG_WARN("CUDA repack: GGML_RP_KSPLIT=%d gate ACTIVE [%s] (K-sliced w32 GEMM at 16<=ne11<=64)\n", n, prof.ksplit_src);
-            }
-            return n;
-        }();
-        const int ksplit_slices = rp_ksplit_env >= 2 ? rp_ksplit_env
-                                : (rp_ksplit_env == 1 ? 4 : 0);
+        // (ksplit env/slices hoisted above the tiled gate for the yield rule)
         // K-split's measured positives are on the STOCK q8_1 activation path only: under gate1
         // (u4act) it is NEGATIVE on both lineages, and the u4x16 combination is unmeasured.
         // Restrict it to the stock path so the gate cannot silently engage a known-negative
         // combination (BENCH 52a + the 2026-10-09 sign resolution).
-        bool ksplit = ksplit_slices > 0 && src0->type == GGML_TYPE_Q4_0 && !u4p8
-                   && !u4act && !u4x16
-                   && ne11 >= 16 && ne11 <= 64
-                   && ne00 / 32 >= 4 * (int64_t) ksplit_slices;
+        bool ksplit = ksplit_gate;  // same predicate, hoisted above the tiled gate
         ggml_cuda_pool_alloc<float> ksplit_part(ctx.pool());
         if (ksplit) {
             float * p = ksplit_part.try_alloc((size_t) ksplit_slices * ne11 * ne01);
