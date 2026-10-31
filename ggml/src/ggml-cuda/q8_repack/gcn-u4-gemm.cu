@@ -5,8 +5,11 @@
 // block computes 128 weight rows x 64 tokens, each thread an 8 x 4 register
 // tile (rows rg + 16*i, cols cg + 16*j). Per 32-value block the thread keeps
 // one integer dp4a sum and applies the block scales once in the affine Q4_0
-// form acc += d_w * (d_x * idot - 8 * sx) (identical algebra to the generic
-// loop's dw2.x*dx*idot - dw2.y*sx; the fma association differs — re-seal).
+// form acc += d_w * (d_x * idot - 8 * sum_x). The per-block fp association is
+// PINNED via intrinsics to the generic MMQ loop's ISA-verified contraction
+// (dhi = 8*d; t0 = d*dx; t1 = dhi*sx; acc += fma(t0, idot_f, -t1) — clang
+// contracts the generic source form to exactly v_mul/v_mul/v_mul/v_fma/v_add
+// on gfx906), so tiled output is BIT-IDENTICAL to the generic loop per tile.
 // Rows of a thread are interleaved (row group + 16*i) and LDS rows are padded
 // to 9 dwords so the 16 row groups of a wave hit 16 different banks. The next
 // K step (4 blocks) is fetched into registers while the current one computes
@@ -32,22 +35,17 @@
 bool ggml_cuda_repack_q4_0_tiled_on() {
     static const bool s_on = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q4_0_TILED");
-        const bool on = e != nullptr && atoi(e) != 0;  // anchor3b: default OFF (drift ladder 2026-10-30: 62x q40 long-pp KL regression)
+        // tier3-adopt: default ON. The zero-divergence seal (tier3-tiledfix rerun
+        // 2026-10-31: q40 seal 12/12 bit-identical to promoted baselines, ladder
+        // mean 0.003992 <= 0.0044) holds with the ksplit-yield gate + PINNED epilogue.
+        // Set GGML_CUDA_REPACK_Q4_0_TILED=0 to force the generic MMQ loop.
+        const bool on = e == nullptr || atoi(e) != 0;
         if (on) {
-            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0_TILED gate ACTIVE: repacked Q4_0 GEMMs run the gfx906 tiled gcn_u4_gemm (128x64 tiles, LDS-staged). Tile order changes FP rounding vs the generic MMQ loop: seal hashes shift, re-seal required\n");
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q4_0_TILED gate ACTIVE: repacked Q4_0 GEMMs run the gfx906 tiled gcn_u4_gemm (128x64 tiles, LDS-staged). PINNED epilogue + ksplit yield make output bit-identical to the generic MMQ regime (tier3-adopt).\n");
         }
         return on;
     }();
     return s_on;
-}
-
-// DIAG (tier3-tiledfix, do-not-ship): raw env value for dense/MoE isolation.
-int ggml_cuda_repack_q4_0_tiled_variant() {
-    static const int s_v = [] {
-        const char * e = getenv("GGML_CUDA_REPACK_Q4_0_TILED");
-        return e != nullptr ? atoi(e) : 0;
-    }();
-    return s_v;
 }
 
 static constexpr int GU4_BM  = 128; // weight rows per block
@@ -229,12 +227,12 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
         for (int kb = 0; kb < GU4_KB; ++kb) {
             // rows in two halves of 4: 16 live integer sums instead of 32
             // (fewer VGPRs, more waves), B read twice (gcn_q8_gemm GQ_HALVES).
-            float db[4], m8s[4];
+            float db[4], sxv[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const float2 f = bd[kb][cg + 16*j];
                 db[j]  = f.x;
-                m8s[j] = -8.0f * f.y;   // -8 * sum_x (DS4 slot, fp16-rounded as shipped)
+                sxv[j] = f.y;   // sum_x (DS4 slot, fp16-rounded as shipped)
             }
 #pragma unroll
             for (int h = 0; h < 2; ++h) {
@@ -267,12 +265,18 @@ static __global__ void gcn_u4_gemm(const uint8_t * __restrict__ wbase,
                 }
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    const float da = ad[kb][rg + 16*(4*h + i)];
+                    const float da  = ad[kb][rg + 16*(4*h + i)];
+                    const float da8 = 8.0f * da;   // scale2 dhi = 8*d (exact: power of 2)
 #pragma unroll
                     for (int j = 0; j < 4; ++j) {
-                        // acc += d_w * (d_x * idot - 8 * sum_x)
-                        acc[4*h + i][j] = fmaf(da, fmaf(db[j], (float) s[i][j], m8s[j]),
-                                               acc[4*h + i][j]);
+                        // Bit-match the generic MMQ epilogue (ISA-verified on gfx906):
+                        //   t0 = d*dx; t1 = (8*d)*sx; acc += fma(t0, idot_f, -t1)
+                        // Intrinsics pin the contraction so later passes cannot
+                        // re-fuse it back into the tiled fmaf(da, fmaf(...)) shape.
+                        const float t0 = __fmul_rn(da, db[j]);
+                        const float t1 = __fmul_rn(da8, sxv[j]);
+                        acc[4*h + i][j] = __fadd_rn(acc[4*h + i][j],
+                                                    __fmaf_rn(t0, (float) s[i][j], -t1));
                     }
                 }
             }
