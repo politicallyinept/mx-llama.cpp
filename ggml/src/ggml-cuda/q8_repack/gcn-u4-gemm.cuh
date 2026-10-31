@@ -19,6 +19,8 @@ struct block_q8_1_mmq_ds_h;
 // Gate: GGML_CUDA_REPACK_Q4_0_TILED (default OFF; set =1 to enable). When on, the repacked Q4_0
 // dense and MoE-id tiled GEMMs run gcn_u4_gemm instead of the generic MMQ loop.
 bool ggml_cuda_repack_q4_0_tiled_on();
+// DIAG (tier3-tiledfix, do-not-ship): raw gate value. 1=both, 2=MoE-only, 3=dense-only
+int ggml_cuda_repack_q4_0_tiled_variant();
 
 // Dense: M weight rows x N tokens, K = ne00 values. xmmq is the block_q8_1_mmq
 // (DS4) activation pool, n_groups = GGML_PAD(K, MATRIX_ROW_PADDING)/128.
