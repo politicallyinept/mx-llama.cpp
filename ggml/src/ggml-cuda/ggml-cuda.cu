@@ -5052,6 +5052,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_GET_ROWS && ggml_cuda_defer_gdn_state_rows(cuda_ctx, cgraph, i)) {
         return 1;
     }
+    // decode attention q/k chain: q/k norm + rope + k/v cache rows in one kernel (CV attn_qk_fused port).
+    // Gate GGML_CUDA_ATTN_QK_FUSED, default ON (=0 disables).
+    if (node->op == GGML_OP_RMS_NORM && node->ne[0] == 256) {
+        const int n = ggml_cuda_attn_qk_fused(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (n > 0) {
+            return n;
+        }
+    }
     // GDN decode gate chain (CV hc-dec.cu port): MUL_MAT(alpha) -> RESHAPE -> ADD -> SOFTPLUS -> MUL -> RESHAPE and
     // MUL_MAT(beta) -> RESHAPE -> SIGMOID in one kernel. Env gate GGML_CUDA_GDN_AB_DEC, default OFF (CV default ON).
     if (node->op == GGML_OP_MUL_MAT && i + 8 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_UNARY &&
