@@ -2368,6 +2368,122 @@ static __global__ void mul_mat_vec_repacked_id1_fused(
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// MTP parity lever 1 (GGML_CUDA_RP_MOE_COAL=1, default OFF: the id1/id1_fused arms
+// above are untouched and byte-identical): CV moe_coal_kq_ls ported to the repacked
+// K-quant planes for the MoE verify widths (2..MMQ_RP_Q8_MOE_MMV_MAX_TOKENS).
+// The id1 mat-vecs stream 4 rows per block; at verify widths that reads each expert
+// matrix in short spans and gfx906 DRAM efficiency collapses (parity trace: our
+// mul_mat_vec_repacked_id1 143 us vs CV's long-span coalesced moe_coal_kq_ls 70 us
+// at equal counts). Structure mirrors CV's moe_coal_kq_ls: 256 threads, LPR lanes
+// per row, RG row groups of 256/LPR rows per block (one long contiguous weight span
+// per block), the assignment's q8_1 activation column staged in shared memory once.
+// The weight decode is the repack twin of the id1 inner loop: rp_traits load_w on
+// the qs/scale/d planes + the affine epilogue dw2.x*dx*(ilo+ihi) - dw2.y*sx, so the
+// per-item arithmetic matches the id1 kernels term for term. The row reduction is a
+// width-LPR shfl tree instead of id1's 64-lane tree: verify-width bytes differ from
+// id1 (not byte-gated; T=1 and prefill never reach this kernel), covered by the UD
+// ladder. Witness: rp_moe_coal_witness logs one banner on first fire.
+// ---------------------------------------------------------------------------
+template <bool Q5> struct rp_coal_traits { using type = rp_traits<GGML_TYPE_Q4_K>; };
+template <>       struct rp_coal_traits<true> { using type = rp_traits<GGML_TYPE_Q5_K>; };
+
+template <bool Q5>
+static __device__ __forceinline__ float rp_coal_kq_item(
+        const uint8_t * __restrict__ w,
+        const typename rp_coal_traits<Q5>::type::geom & g,
+        const uint32_t wrow, const uint32_t it, const block_q8_1 * __restrict__ ys) {
+    using traits = typename rp_coal_traits<Q5>::type;
+    uint4 lo, hi;
+    typename traits::slot_t db;
+    traits::load_w(w, g, wrow, it, lo, hi, db);
+    const float2 dw2 = traits::scale2(db);
+    const block_q8_1 * xb = ys + it;
+    const float dx = __low2float(xb->ds);
+    const float sx = __high2float(xb->ds);
+    const int * x = reinterpret_cast<const int *>(xb->qs);
+    int ilo = 0, ihi = 0;
+    ilo = ggml_cuda_dp4a((int) lo.x, x[0], ilo);
+    ilo = ggml_cuda_dp4a((int) lo.y, x[1], ilo);
+    ilo = ggml_cuda_dp4a((int) lo.z, x[2], ilo);
+    ilo = ggml_cuda_dp4a((int) lo.w, x[3], ilo);
+    ihi = ggml_cuda_dp4a((int) hi.x, x[4], ihi);
+    ihi = ggml_cuda_dp4a((int) hi.y, x[5], ihi);
+    ihi = ggml_cuda_dp4a((int) hi.z, x[6], ihi);
+    ihi = ggml_cuda_dp4a((int) hi.w, x[7], ihi);
+    return dw2.x * dx * (float) (ilo + ihi) - dw2.y * sx;
+}
+
+// GLU=false: up-only (down proj arm of the unfused path). GLU=true: up+gate pair with
+// the id1_fused epilogue (bias + glu_op, bias row = expert*ne1 + row).
+template <bool Q5, bool GLU, int LPR, int RG>
+__launch_bounds__(256)
+static __global__ void mul_mat_vec_repacked_coal(
+        const uint8_t * __restrict__ wbase, const uint8_t * __restrict__ wbase_gate,
+        const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1,
+        const int32_t * __restrict__ ids_src1, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const uint32_t n_expert,
+        const size_t expert_stride, const uint32_t xs, const uint32_t ys,
+        const float * __restrict__ x_bias, const float * __restrict__ gate_bias,
+        const ggml_glu_op glu_op) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    using traits = typename rp_coal_traits<Q5>::type;
+    extern __shared__ int4 ys_raw[];
+    const uint32_t a = blockIdx.y;
+    const uint32_t e = expert_bounds_search(expert_bounds, n_expert, a);
+    const typename traits::geom g(ne0, ne1);
+    {
+        // stage the assignment's q8_1 activation column once (36-byte blocks copied as ints)
+        const int * src = reinterpret_cast<const int *>(xq + (size_t) ids_src1[a] * xs);
+        int * d = reinterpret_cast<int *>(ys_raw);
+        const int nints = (int) xs * (int) (sizeof(block_q8_1) / 4);
+        for (int i = threadIdx.x; i < nints; i += 256) {
+            d[i] = src[i];
+        }
+    }
+    __syncthreads();
+    block_q8_1 * ysm = reinterpret_cast<block_q8_1 *>(ys_raw);
+    const uint8_t * wu = wbase + (size_t) e * expert_stride;
+    const uint8_t * wg = GLU ? wbase_gate + (size_t) e * expert_stride : nullptr;
+    const int sub = threadIdx.x % LPR;
+    const int nit = (int) ne0 / 32;
+#pragma unroll 1
+    for (int grp = 0; grp < RG; ++grp) {
+        const int row = (blockIdx.x*RG + grp)*(256/LPR) + threadIdx.x / LPR;
+        if (row >= (int) ne1) {
+            break; // whole lane groups; nothing after the loop needs the block
+        }
+        float au = 0.0f, ag = 0.0f;
+        for (int it = sub; it < nit; it += LPR) {
+            au += rp_coal_kq_item<Q5>(wu, g, (uint32_t) row, (uint32_t) it, ysm);
+            if constexpr (GLU) {
+                ag += rp_coal_kq_item<Q5>(wg, g, (uint32_t) row, (uint32_t) it, ysm);
+            }
+        }
+#pragma unroll
+        for (int off = LPR/2; off > 0; off >>= 1) {
+            au += __shfl_xor(au, off, LPR);
+            if constexpr (GLU) {
+                ag += __shfl_xor(ag, off, LPR);
+            }
+        }
+        if (sub == 0) {
+            float out = au;
+            if constexpr (GLU) {
+                out = rp_mmv_fusion_epilogue(au, ag, x_bias, gate_bias,
+                    e * ne1 + (uint32_t) row, glu_op, true);
+            }
+            y[(size_t) ids_dst[a] * ys + row] = out;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, wbase_gate, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds,
+                     n_expert, expert_stride, xs, ys, x_bias, gate_bias, glu_op);
+    NO_DEVICE_CODE;
+#endif
+}
+
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
           bool U4Q41 = false, int KSPLIT = 1, bool SUMW = false>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
