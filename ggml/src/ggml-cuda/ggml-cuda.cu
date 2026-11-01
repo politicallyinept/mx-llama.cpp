@@ -4193,6 +4193,128 @@ static int ggml_cuda_try_gdn_cache_fusion(
     return skip;
 }
 
+// ring-mode counterpart of ggml_cuda_try_gdn_cache_fusion: the snapshot tail is scattered into ring
+// planes via ggml_cont + SET_ROWS (ids from plan_snapshot_writes). Match that chain and let the GDN
+// kernel scatter the slots straight into the cache rows (slot s of seq j -> row ids[j + n_seqs*s]),
+// skipping the cont staging and the set_rows launch. Pure data movement: byte-identical contents,
+// ring rollback semantics unchanged. Gate GGML_CUDA_GDN_SNAP_SCATTER, default ON (=0 disables).
+// Admission mirrors the state direct-read gate (decode-sized, single-seq, non-KDA, S_v=128) so the
+// in-place cache-write safety argument (warp stages its region into registers first) holds.
+static int ggml_cuda_try_gdn_cache_scatter(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_SNAP_SCATTER"); return !e || atoi(e) != 0; }();
+    static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
+    if (!enabled) {
+        return 0;
+    }
+
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v = gdn->src[2];
+    const ggml_tensor * src_g = gdn->src[3];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+
+    // the stock decode kernel must run (not chunked/colthread): only it takes snap_ids, and only its
+    // warp-staged (head, column) regions make the in-place cache write safe
+    if (K < 2 || n_seqs != 1 || n_tokens >= 8 || S_v != 128 || src_g->ne[0] == S_v) {
+        return 0;
+    }
+
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+
+    // find: VIEW(gdn tail) -> CONT -> [RESHAPE] -> SET_ROWS(cache, vals, ids)
+    const ggml_tensor * tail = nullptr;
+    const ggml_tensor * cont = nullptr;
+    int j_set = -1;
+    const int end = std::min(cgraph->n_nodes, node_idx + 64);
+    for (int j = node_idx + 1; j < end; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_GATED_DELTA_NET) {
+            break; // next layer: this gdn's chain is gone
+        }
+        if (!cont) {
+            if (t->op == GGML_OP_VIEW && t->view_src == gdn && t->view_offs == tail_off &&
+                t->ne[0] == D && t->ne[1] == n_seqs && t->ne[2] == n_written && ggml_is_contiguous(t)) {
+                tail = t;
+                continue;
+            }
+            if (t->op == GGML_OP_CONT && tail != nullptr && t->src[0] == tail) {
+                cont = t;
+                continue;
+            }
+            if (ggml_cuda_is_view_or_noop(t)) {
+                continue;
+            }
+            return 0; // any other real node before the chain
+        }
+        if (t->op == GGML_OP_SET_ROWS) {
+            j_set = j;
+            break;
+        }
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        return 0;
+    }
+    if (cont == nullptr || j_set < 0) {
+        return 0;
+    }
+
+    // SET_ROWS src order (see ggml_set_rows): src[0]=values, src[1]=ids, src[2]=cache
+    const ggml_tensor * srows = cgraph->nodes[j_set];
+    const ggml_tensor * vals  = srows->src[0];
+    const ggml_tensor * ids   = srows->src[1];
+    const ggml_tensor * cache = srows->src[2];
+
+    if (vals != cont && !(vals->op == GGML_OP_RESHAPE && vals->src[0] == cont)) {
+        return 0;
+    }
+    if (ids->type != GGML_TYPE_I32 || ids->ne[0] != n_seqs * n_written || !ggml_is_contiguous(ids)) {
+        return 0;
+    }
+    if (cache->type != GGML_TYPE_F32 || cache->ne[0] != D ||
+        cache->nb[1] != (size_t) D * sizeof(float) || ((uintptr_t) cache->data) % 16 != 0) {
+        return 0;
+    }
+    // the staged rows buffer must feed nothing but the matched SET_ROWS
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t == srows || t == vals) {
+            continue;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == cont) {
+                return 0;
+            }
+        }
+        if (t->op == GGML_OP_VIEW && t->view_src == cont) {
+            return 0;
+        }
+    }
+
+    static const bool s_scatter_witness = [] { GGML_LOG_WARN("[gdn-snap-scatter] ring snapshot direct scatter ACTIVE\n"); return true; }();
+    (void) s_scatter_witness;
+    fused_state_cpy.data        = (float *) cache->data;
+    fused_state_cpy.slot_stride = 0;
+    fused_state_cpy.ids         = (const int32_t *) ids->data;
+    if (dbg) {
+        fprintf(stderr, "[gdn-snap-scatter] node %d %s: fused direct scatter K=%d n_written=%lld ids=%s\n",
+                node_idx, gdn->name, (int) K, (long long) n_written, ids->name);
+    }
+    return j_set - node_idx;
+}
+
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
 static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
@@ -5145,6 +5267,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+        // ring mode: gdn -> cont -> set_rows snapshot scatter, fused into the kernel (env-gated)
+        const int nodes_to_skip_scatter = ggml_cuda_try_gdn_cache_scatter(cgraph, i, fused_state_cpy);
+        if (nodes_to_skip_scatter > 0) {
+            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip_scatter;
         }
     }
 
