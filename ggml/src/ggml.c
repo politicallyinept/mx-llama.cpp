@@ -7518,6 +7518,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.flags        =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7545,7 +7546,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.flags            =*/ cgraph0->flags
     };
 
     return cgraph;
@@ -7559,6 +7561,7 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+    dst->flags   = src->flags;
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];
@@ -7615,6 +7618,16 @@ struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor) {
         memset(tensor->data, 0, ggml_nbytes(tensor));
     }
     return tensor;
+}
+
+void ggml_cgraph_set_flags(struct ggml_cgraph * cgraph, uint32_t flags) {
+    if (cgraph) {
+        cgraph->flags = flags;
+    }
+}
+
+uint32_t ggml_cgraph_get_flags(const struct ggml_cgraph * cgraph) {
+    return cgraph ? cgraph->flags : 0;
 }
 
 void ggml_graph_reset(struct ggml_cgraph * cgraph) {
