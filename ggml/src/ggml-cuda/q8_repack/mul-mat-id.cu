@@ -10,6 +10,73 @@
 #include "../mmid.cuh"
 #include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
 
+// MTP parity lever 1 gates (see mul_mat_vec_repacked_coal in repack-kernels.cuh).
+// Witness-enforced: the first coal launch logs one [MOE-COAL-REPACK] banner line.
+static bool rp_moe_coal_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_RP_MOE_COAL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static bool rp_moe_coal_type_ok(const ggml_tensor * src0) {
+    return src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q5_K;
+}
+
+static int rp_moe_coal_lpr(const ggml_tensor * src0, bool glu) {
+    static const int env = [] { const char * e = getenv("GGML_CUDA_RP_MOE_COAL_LPR"); return e ? atoi(e) : 0; }();
+    if (env == 8 || env == 16 || env == 32) {
+        return env;
+    }
+    if (glu) {
+        return src0->ne[0] >= 4096 ? 32 : 16;   // CV default: wide-K gate/up pairs take 32
+    }
+    return src0->ne[0] <= 1024 ? 8 : 16;        // CV default: short-K downs take 8
+}
+
+static int rp_moe_coal_rg() {
+    static const int rg = [] { const char * e = getenv("GGML_CUDA_RP_MOE_COAL_RG"); return (e && atoi(e) >= 4) ? 4 : 1; }();
+    return rg;
+}
+
+static void rp_moe_coal_launch(cudaStream_t stream, const ggml_tensor * src0,
+        const uint8_t * w, const uint8_t * w_gate, const block_q8_1 * xq, float * dst_d,
+        const int32_t * ids_src1, const int32_t * ids_dst, const int32_t * expert_bounds,
+        int64_t ne00, int64_t ne01, int64_t ne02, size_t expert_stride,
+        int64_t x_stride, uint32_t dst_s1, int64_t n_assign, int64_t n_tokens,
+        const float * x_bias, const float * gate_bias, ggml_glu_op glu_op) {
+    const bool glu = w_gate != nullptr;
+    const bool q5  = src0->type == GGML_TYPE_Q5_K;
+    const int  lpr = rp_moe_coal_lpr(src0, glu);
+    const int  rg  = rp_moe_coal_rg();
+    const size_t shm = (size_t) (GGML_PAD(ne00, MATRIX_ROW_PADDING) / QK8_1) * sizeof(block_q8_1);
+    static bool witnessed = false;
+    if (!witnessed) {
+        witnessed = true;
+        GGML_LOG_WARN("[MOE-COAL-REPACK] repacked long-span coal kernel engaged (type=%d glu=%d n_tokens=%lld LPR=%d RG=%d)\n",
+                      (int) src0->type, (int) glu, (long long) n_tokens, lpr, rg);
+    }
+    const int rows_pb = (256 / lpr) * rg;
+    const dim3 grid((unsigned) ((ne01 + rows_pb - 1) / rows_pb), (unsigned) n_assign, 1);
+    auto go = [&](auto kern) {
+        kern<<<grid, 256, shm, stream>>>(w, w_gate, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+            ids_src1, ids_dst, expert_bounds, (uint32_t) ne02, expert_stride,
+            (uint32_t) x_stride, dst_s1, x_bias, gate_bias, glu_op);
+    };
+#define RP_COAL_L(Q5V, GLUV) \
+    switch (rg) { \
+        case 4: switch (lpr) { case 8:  go(mul_mat_vec_repacked_coal<Q5V, GLUV, 8,  4>); break; \
+                               case 32: go(mul_mat_vec_repacked_coal<Q5V, GLUV, 32, 4>); break; \
+                               default: go(mul_mat_vec_repacked_coal<Q5V, GLUV, 16, 4>); break; } break; \
+        default: switch (lpr) { case 8:  go(mul_mat_vec_repacked_coal<Q5V, GLUV, 8,  1>); break; \
+                               case 32: go(mul_mat_vec_repacked_coal<Q5V, GLUV, 32, 1>); break; \
+                               default: go(mul_mat_vec_repacked_coal<Q5V, GLUV, 16, 1>); break; } break; }
+    if (q5) { if (glu) { RP_COAL_L(true,  true)  } else { RP_COAL_L(true,  false) } }
+    else    { if (glu) { RP_COAL_L(false, true)  } else { RP_COAL_L(false, false) } }
+#undef RP_COAL_L
+}
+
 void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
         ggml_tensor * dst) {
@@ -159,6 +226,13 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
         }
 
+        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0)) {
+            rp_moe_coal_launch(stream, src0, w, nullptr, src1_q8_1_d, dst_d,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne00, ne01, ne02,
+                expert_stride, x_stride, dst_s1, n_assign, n_tokens, nullptr, nullptr, GGML_GLU_OP_REGLU);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         // Four rows per block, two waves. Five geometries were measured at
         // the verify widths and all landed within five percent; this was best.
         const dim3 grid((ne01 + 3) / 4, (unsigned) n_assign, 1);
@@ -793,6 +867,13 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
             ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
         CUDA_CHECK(cudaGetLastError());
 
+        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0)) {
+            rp_moe_coal_launch(stream, src0, w, w_gate, src1_q8_1_d, (float *) dst->data,
+                ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne00, ne01, ne02,
+                expert_stride, x_stride, dst_s1, n_assign, n_tokens, x_bias, gate_bias, fusion->glu_op);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         const dim3 grid_nc((ne01 + 3) / 4, (unsigned) n_assign, 1);
         // One row per lane, four waves. Two rows per lane costs a spill and
         // drops occupancy from 6 to 4 once the gate matrix shares the loop.
