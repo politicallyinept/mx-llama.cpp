@@ -3900,6 +3900,11 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     uintptr_t h = (uintptr_t) cgraph->nodes[0];
     h ^= (uintptr_t) cgraph->n_nodes * (uintptr_t) 0x9E3779B97F4A7C15ull;
     h ^= (uintptr_t) cgraph->nodes[0]->ne[1] * (uintptr_t) 0xBF58476D1CE4E5B9ull;
+    // the batch-type hint selects different kernels at the same shape (e.g. the
+    // MoE coal mat-vec only runs on spec-decode verify batches), so it must be
+    // part of the key: a capture made for a non-verify batch must never replay
+    // for a verify batch of the same shape, or vice versa.
+    h ^= (uintptr_t) ggml_cgraph_get_flags(cgraph) * (uintptr_t) 0x94D049BB133111EBull;
     return (const void *) h;
 }
 
@@ -6292,6 +6297,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_repack_async_release(ctx0->device);
     }
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    cuda_ctx->cgraph_flags = ggml_cgraph_get_flags(cgraph);
 
     ggml_cuda_set_device(cuda_ctx->device);
 

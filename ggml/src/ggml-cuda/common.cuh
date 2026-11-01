@@ -1507,6 +1507,11 @@ struct ggml_backend_cuda_context {
     bool copy_only = false;
     cudaEvent_t copy_event = nullptr;
 
+    // batch-type hint (GGML_CGRAPH_FLAG_*) of the graph currently being computed.
+    // Stamped at graph_compute entry so op dispatch can key on batch semantics
+    // (e.g. spec-decode verify) instead of batch width.
+    uint32_t cgraph_flags = 0;
+
     // Dedicated stream + events for the meta-backend stage-transfer copies. Using a side
     // stream avoids serializing the cross-stage memcpy behind compute on the main stream,
     // so the next ubatch's stage-A compute can start on the source GPU while the prior

@@ -226,7 +226,8 @@ void ggml_cuda_mul_mat_id_repacked(ggml_backend_cuda_context & ctx,
                 (size_t) (n_cols * x_stride), src1_q8_1_own, stream);
         }
 
-        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0)) {
+        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0) &&
+                (ctx.cgraph_flags & GGML_CGRAPH_FLAG_SPEC_VERIFY)) {
             rp_moe_coal_launch(stream, src0, w, nullptr, src1_q8_1_d, dst_d,
                 ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne00, ne01, ne02,
                 expert_stride, x_stride, dst_s1, n_assign, n_tokens, nullptr, nullptr, GGML_GLU_OP_REGLU);
@@ -867,7 +868,8 @@ void ggml_cuda_mul_mat_id_vec_repacked_fused(ggml_backend_cuda_context & ctx,
             ne02, n_tokens, n_expert_used, src1->ne[1], si1, sis1, false, stream);
         CUDA_CHECK(cudaGetLastError());
 
-        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0)) {
+        if (rp_moe_coal_on() && rp_moe_coal_type_ok(src0) &&
+                (ctx.cgraph_flags & GGML_CGRAPH_FLAG_SPEC_VERIFY)) {
             rp_moe_coal_launch(stream, src0, w, w_gate, src1_q8_1_d, (float *) dst->data,
                 ids_src1.get(), ids_dst.get(), expert_bounds.get(), ne00, ne01, ne02,
                 expert_stride, x_stride, dst_s1, n_assign, n_tokens, x_bias, gate_bias, fusion->glu_op);

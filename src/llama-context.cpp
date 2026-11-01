@@ -1853,6 +1853,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // graph->ggml batch-type hint: a multi-token ubatch with outputs at every
+        // position is a speculative-decoding verify batch. prompt chunks carry a
+        // single output (the last token, or the checkpoint boundary token) and
+        // plain decode is one token per sequence, so neither can be mistaken for
+        // a verify batch. backends may use this to admit verify-only kernels
+        // instead of guessing from batch width. stamped before sched alloc because
+        // the scheduler snapshots per-split graph views at that point; graph reuse
+        // is keyed on the same n_tokens/n_outputs that decide the hint, so a reused
+        // graph always computes with the hint it was stamped with.
+        {
+            bool all_outputs = ubatch.output != nullptr;
+            for (uint32_t i = 0; i < ubatch.n_tokens && all_outputs; ++i) {
+                all_outputs = ubatch.output[i] != 0;
+            }
+
+            ggml_cgraph_set_flags(gf,
+                (all_outputs && ubatch.n_tokens > ubatch.n_seqs) ? GGML_CGRAPH_FLAG_SPEC_VERIFY : 0u);
+
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
