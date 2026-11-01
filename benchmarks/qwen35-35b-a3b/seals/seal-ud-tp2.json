@@ -1,0 +1,48 @@
+{
+ "cases": {
+ "long-pp-r01": {
+ "sha256": "687dbf0642559e11d67229183bc04a60e940e5cbef1e1e92fb1860347fea41ea",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text segment labeled `[eval r01] Reference note for this evaluation pass: prefix caches key on ",
+ "tokens": 48
+ },
+ "long-pp-r02": {
+ "sha256": "a3a6ce42f71ca28b5e0410e95070d8eb1aa2205df150ea018425073330130ac2",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text segment labeled `[eval r02] Reference note for this evaluation pass: this header differs f",
+ "tokens": 48
+ },
+ "long-pp-r03": {
+ "sha256": "0e109abdf4e1d2c6103c68af7612d247a12407daf744f5a4015f71cd17c1d0bb",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text passage describing a rigorous benchmarking and reproducibility protocol for LLM inference ",
+ "tokens": 48
+ },
+ "primes8": {
+ "sha256": "7f8fcbbddf1f3dcdcbf633318c4bc5590031075e9f6939317db29c90ad5f3c81",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Task: List the first eight prime numbers.\n * Format: One per line.\n\n2. **Identify Prime Numbers:**",
+ "tokens": 64
+ },
+ "secs-conv": {
+ "sha256": "d52628b1adc0bc10e31f38320bcd0e7747f415478a65992fad7df54315fb76a8",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: 3100 seconds.\n * Task:",
+ "tokens": 32
+ },
+ "tensor-def": {
+ "sha256": "df2de750f0addaa6c937857fdb98be0bfed1dde227b391419132bba3a4145207",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Topic: Tensor.\n * Constraint: One sentence.\n * Goal: Explain what a tensor is.\n\n2. **Identify",
+ "tokens": 64
+ }
+ },
+ "created_utc": "2026-10-27T11:19:07Z",
+ "fingerprint": {
+ "topology": "tp2:ROCm1,ROCm2 -sm tensor -fit off -ngl 99",
+ "bench_shape": "-b 4096 -ub 1024",
+ "build_path": "rig/build-adopt",
+ "build_rev": "she-fusion (adoption, default-ON; stacked base)",
+ "build_mtime": "2026-10-27 18:02:04 -0700",
+ "model_file": "bench-quants/unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+ "model_size_bytes": 22241950336,
+ "gates": "GGML_CUDA_GCN_KQ_MOE=1;GGML_CUDA_MOE_DEC_MAX_TOKENS=8;GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MOE_VEC=1;GGML_CUDA_REPACK_KQUANT=0;GGML_GDN_COLTHREAD=1;GGML_ENABLE_CUSTOM_AR=1;HSA_FORCE_FINE_GRAIN_PCIE=1;HSA_XNACK=0"
+ },
+ "reason": "post-adoption re-seal on rig/build-adopt (she-fusion default-ON), harness-canonical. Stock-arbitrated vs clean upstream (rig/harness-adopt/longpp-arbitration.md): UD suite + q40 primes8/tensor-def/secs-conv/long-pp-r01 stock-confirmed (p0f was the outlier). q40 long-pp-r02 (adopt-only divergent) + long-pp-r03 (three-way) are ESCROW: real drift in stacked base vs stock, pre-she-fusion (SHE_FUSE=0 does not restore); pending p0f->stacked bisect. RED on those cases until root-caused is EXPECTED.",
+ "schema": "benchgate.baseline.v2",
+ "suite": "seal-ud-tp2"
+}
