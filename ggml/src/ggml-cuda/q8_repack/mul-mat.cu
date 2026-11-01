@@ -8,6 +8,7 @@
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
+#include <atomic>   // rp_dispatch_trace witness counter
 
 static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
         const ggml_tensor * src0, const uint8_t * w, const block_q8_1 * xq,
@@ -217,7 +218,37 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         // => shipped behavior unchanged.
         && (w4a4_min_tokens <= 0 || ne11 >= w4a4_min_tokens);
 
-    if (ne11 >= 1 && ne11 <= MMQ_RP_Q8_MMV_MAX_TOKENS) {
+    // MTP verify-batch dispatch gate (perf/mtp-batch-dispatch): runtime upper
+    // bound for the dense nc mat-vec window. Default = the compile-time
+    // MMQ_RP_Q8_MMV_MAX_TOKENS (8) => dispatch is byte-identical to the
+    // shipped build when the env is unset. GGML_CUDA_RP_NARROW_MAX_TOKENS=1
+    // routes MTP verify batches (T=2..7) away from the nc mat-vec family and
+    // onto the 32-wide GEMM path below (A/B lever). T=1 ALWAYS stays on the
+    // mat-vec path: single-token decode numerics are untouched by this gate.
+    static const int rp_narrow_max = [] {
+        const char * e = getenv("GGML_CUDA_RP_NARROW_MAX_TOKENS");
+        int n = MMQ_RP_Q8_MMV_MAX_TOKENS;
+        if (e != nullptr) {
+            n = atoi(e);
+            if (n < 1) n = 1;
+            if (n > MMQ_RP_Q8_MMV_MAX_TOKENS) n = MMQ_RP_Q8_MMV_MAX_TOKENS;
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_RP_NARROW_MAX_TOKENS=%d gate ACTIVE (dense batches 2..N take the nc mat-vec path, wider take the GEMM path)\n", n);
+        }
+        return n;
+    }();
+    // TEMPORARY dispatch witness (GGML_CUDA_RP_DISPATCH_TRACE=1): prints the
+    // narrow-vs-GEMM routing for small batches so a leg can prove the gate
+    // engaged at T=2. Env-gated, silent by default.
+    static const bool rp_dispatch_trace = getenv("GGML_CUDA_RP_DISPATCH_TRACE") != nullptr;
+    if (rp_dispatch_trace && ne11 >= 2 && ne11 <= 16) {
+        static std::atomic<int> rp_trace_n{0};
+        if (rp_trace_n.fetch_add(1, std::memory_order_relaxed) < 60) {
+            GGML_LOG_WARN("[rp-dispatch] %s type=%d ne01=%lld ne11=%lld -> %s\n",
+                src0->name, (int) src0->type, (long long) ne01, (long long) ne11,
+                (ne11 <= rp_narrow_max) ? "nc-vec" : "gemm");
+        }
+    }
+    if (ne11 >= 1 && ne11 <= rp_narrow_max) {
         // One token, or a narrow batch: plain Q8_1 rows, one weight pass. The
         // tiled path below computes a full 32-wide tile whatever the batch is.
         //
