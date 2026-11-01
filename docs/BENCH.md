@@ -4,6 +4,15 @@ All runs: -lm dio, env GGML_ENABLE_CUSTOM_AR=1 HSA_FORCE_FINE_GRAIN_PCIE=1
 HSA_XNACK=0 GPU_MAX_HW_QUEUES=8, HEAD build (no RCCL) unless noted.
 r=3 unless noted. Raw tables: retained on the measurement rig.
 
+Env profile: unless a section says otherwise, published results were measured with
+the production env bundle `GGML_CUDA_REPACK_Q4_0=1 GGML_TP_AR_SKIP_XBAR=1
+GGML_CUDA_REPACK_KQUANT=0 GGML_CUDA_MOE_VEC=1 GGML_CUDA_MOE_FUSE=1
+GGML_GDN_COLTHREAD=1` on top of the line above. `GGML_CUDA_REPACK_Q4_0` defaults
+OFF in source, so bare-default runs do not engage the tiled/W4A4 repack paths;
+where engaged, the tiled path is seal-verified bit-identical to the default path
+at validated widths (batch 2-15 unsealed). Gate-truth record:
+`benchmarks/defaults-vs-env.md`.
+
 ## 1. Split mode - the headline (2026-09-07)
 
 | config | pp512 | pp1024 | pp2048 | pp4096 | tg16/32 | tg128 |
@@ -2644,3 +2653,35 @@ paired arms, build-tp2:
 - Default-ON build: 17x23=391 PASS; greedy battery byte-identical to explicit-ON.
 Baseline perf on record (item1 A/B): 548.55 pp840 / 38.71 tg128 gate-off; +5.76%
 tg with gate on. Set GGML_CUDA_GCN_KQ_MV=0 to restore stock dispatch.
+
+
+## 2026-10-31: gate-truth verification - true binary defaults vs the production env bundle (dual seal)
+
+Source-verified gate audit plus a dual seal run on the seal build (same binary as the
+prior seal witness):
+
+- `GGML_CUDA_REPACK_Q4_0` defaults **OFF** in source (opt-in admission check). With true
+  binary defaults, Q4_0 tensors are never admitted to the repack path, so the tiled
+  `gcn_u4_gemm` (its own gate is default-ON but sits downstream of admission) and the
+  W4A4 u4 GEMMs do not engage for Q4_0. The "default-ON tiled/W4A4" phrasing describes
+  the env bundle, not the binary default.
+- Env-profile seal (production bundle: `REPACK_Q4_0=1 TP_AR_SKIP_XBAR=1 REPACK_KQUANT=0
+  MOE_VEC=1 MOE_FUSE=1 GDN_COLTHREAD=1`): all 4 cells GREEN on case hashes - all 24 case
+  hashes bit-match the prior seal run and the promoted baselines, zero drift. The
+  baselines were recorded WITHOUT `REPACK_Q4_0`, so this is the zero-divergence
+  evidence: tiled/W4A4 repack ON is bit-identical to the default path (validated
+  widths; batch 2-15 unsealed).
+- True-defaults seal (zero `GGML_*` vars in the server environ): diverges from the
+  baselines on the long-prefill cases (plus one tensor-def cell) - exactly the cases
+  sensitive to the bundle gates (`MOE_VEC`/`MOE_FUSE`/`GDN_COLTHREAD` off, `REPACK_KQUANT`
+  back to default ON). Empirical proof that the published results describe the env
+  bundle, not bare defaults.
+- Engagement witnesses: `[attn-qk-fused] decode q/k chain fusion ACTIVE` printed in all
+  8 cells of both profiles (fusion is structurally default-ON, a genuine engagement
+  witness at the call site). The repack engagement witness is the PAIR `REPACK_Q4_0 gate
+  ACTIVE` + `REPACK_Q4_0_TILED gate ACTIVE`; the TILED banner alone prints whenever the
+  gate is read and is not an engagement witness on its own. The seal harness fails any
+  cell whose required banners are missing.
+
+Full gate-default table (per-gate source defaults vs bundle values) and both seal
+matrices: `benchmarks/defaults-vs-env.md`.

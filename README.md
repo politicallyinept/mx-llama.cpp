@@ -138,6 +138,36 @@ rejected by the seal - do not raise the preset.)
 | Stock-path narrow-width boost (no W4A4) | `GGML_CUDA_W4A4_PROFILE=off` + `GGML_RP_KSPLIT=1` |
 | Conservative / testing (stock-identical) | `GGML_CUDA_W4A4_PROFILE=off` (or kill-switch `GGML_CUDA_W4A4_OFF=1`) |
 
+### Production profile (what the published numbers assume)
+
+Every benchmark and seal result published in this README and `docs/BENCH.md` was
+measured under a fixed env bundle (the "w4a4-env" production profile), not under
+bare binary defaults:
+
+```bash
+export GGML_CUDA_REPACK_Q4_0=1     # repack admission for Q4_0 (default OFF in source)
+export GGML_TP_AR_SKIP_XBAR=1      # TP all-reduce: skip the xbar leg
+export GGML_CUDA_REPACK_KQUANT=0   # K-quant repack OFF (binary default is ON)
+export GGML_CUDA_MOE_VEC=1         # row-lane MoE decode kernels (default OFF)
+export GGML_CUDA_MOE_FUSE=1        # MoE gate/up + SwiGLU prefill fusion (default OFF)
+export GGML_GDN_COLTHREAD=1        # column-thread GDN kernel path (default OFF)
+```
+
+plus the rig-level runtime knobs already listed at the top of `docs/BENCH.md`
+(`GGML_ENABLE_CUSTOM_AR=1`, `HSA_XNACK=0`, `HSA_FORCE_FINE_GRAIN_PCIE=1`,
+`GPU_MAX_HW_QUEUES=8`). Because `GGML_CUDA_REPACK_Q4_0` defaults OFF in source, a
+run without this bundle does not engage the tiled/W4A4 repack paths at all.
+
+Gate-truth verification (2026-10-31, dual seal on the seal build): the
+env-profile seal bit-matches the promoted baselines in all cells -- and those
+baselines were recorded with repack OFF -- which is precisely the zero-divergence
+evidence that the tiled repack path is **bit-identical to the default path where
+engaged** (seal-verified at validated widths; batch sizes 2-15 are not covered by
+the seal). A true-defaults seal run diverges from the baselines on the
+long-prefill cases, confirming empirically that the published numbers describe
+the bundle above. Full gate-default table and seal matrices:
+`benchmarks/defaults-vs-env.md`.
+
 ### Optional tuning variables
 
 Explicit values of these knobs **override the profile preset**; unset values fall
@@ -150,7 +180,7 @@ through to the profile, then to the built-in default.
 | `GGML_RP_KSPLIT` | unset (speed preset sets 1) | K-splits the repacked w32 GEMM (1 = auto slice count, 2/4/8 = explicit) | only useful on the stock path at 16 <= width <= 64; inert under the gate |
 | `GGML_CUDA_W4A4_DOT8=3` | - | per-16 activation variant | the shipped preset value (both profiles); no narrow-width cliff, smaller prefill win than the historical per-32 gate-1 number |
 | `GGML_CUDA_W4A4_SUMW` | unset | precomputed SUMW plane for the Q4_0 u4 epilogue (+2 B/block) | `speed` presets it on; trade VRAM for MoE/narrow decode - NOTE: dense prefill pays ~-2% pp512 (BENCH section 70), so keep it off when dense prefill throughput matters |
-| `GGML_CUDA_REPACK_Q4_0` | unset | forces repack admission for Q4_0 regardless of dot8 mode | diagnostic - normally leave unset |
+| `GGML_CUDA_REPACK_Q4_0` | unset (repack admission OFF) | admits Q4_0 to the repack path regardless of dot8 mode | the production profile sets `=1` (see Production profile); unset = stock path |
 | `GGML_RP_GENERIC_MMV` | unset | forces the generic (non-repacked) MMV path | troubleshooting - compare against to isolate the repack path |
 | `GGML_W4A4_ONLY` | unset | restricts execution to W4A4 ops only (skips everything else) | debugging graph coverage, not for serving |
 
@@ -194,6 +224,8 @@ Gate values are **modes, not additive flags**: `DOT8=1` (per-32), `=3` (per-16),
 
 All numbers on ROCm MI50 (gfx906), llama-bench / llama-perplexity, base-model Q4_0 files,
 r>=3 unless noted, interleaved arms, VRAM returned to baseline (10.87 MB/GPU) between legs.
+Unless a cited section says otherwise, runs used the production env profile above (see
+Production profile), since `GGML_CUDA_REPACK_Q4_0` defaults OFF in source.
 Full tables and repro commands: `docs/BENCH.md` (campaign log); summary records for
 the benchmark-model runs are mirrored under `benchmarks/`.
 
