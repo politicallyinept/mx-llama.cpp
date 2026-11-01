@@ -660,12 +660,26 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
 
 // the recurrent-state GET_ROWS feeding only a decode-sized GDN (1 sequence, < 8 tokens, S_v 128): the stock
 // decode kernel reads its state row from the cache itself (each warp reads its (head, column) region into
-// registers before writing the same region back, so the in-place cache update stays safe). The K>1 snapshot
-// path writes different regions than it reads and is excluded (decode is always K == 1).
+// registers before writing the same region back, so the in-place cache update stays safe). The same argument
+// holds for the K>1 snapshot path (keep_rs_t): every snapshot-slot write lands in the SAME (head, column)
+// region the warp already staged into registers, and with n_seqs == 1 no other warp reads any slot plane,
+// so direct-read stays safe for K up to GGML_CUDA_GDN_STATE_ROWS_KMAX. K>1 only occurs under speculative
+// decode (cparams.n_rs_seq = spec.need_n_rs_seq()), so the default KMAX=1 keeps every non-spec path
+// byte-identical to the shipped build.
 // Gate GGML_CUDA_GDN_STATE_ROWS_OK, default ON (set =0 in the env to disable).
 bool ggml_cuda_gdn_state_rows_ok(const ggml_tensor * get_rows, const ggml_tensor * gdn) {
     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_STATE_ROWS_OK"); return !e || atoi(e) != 0; }();
     static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
+    // MTP verify-batch fix: max snapshot-slot count (op K) admitted to direct-read. Default 1 = shipped.
+    static const int kmax = [] {
+        const char * e = getenv("GGML_CUDA_GDN_STATE_ROWS_KMAX");
+        int n = e ? atoi(e) : 1;
+        if (n < 1) n = 1;
+        if (n > 16) n = 16;
+        if (e && n > 1) GGML_LOG_WARN("[gdn-state-rows] KMAX=%d ACTIVE: direct-read admitted for snapshot depths K<=KMAX (MTP verify)\n", n);
+        return n;
+    }();
+    const int K = ggml_get_op_params_i32(gdn, 0);
     const ggml_tensor * v = gdn->src[2];
     const ggml_tensor * g = gdn->src[3];
     const ggml_tensor * cache = get_rows->src[0];
@@ -673,13 +687,13 @@ bool ggml_cuda_gdn_state_rows_ok(const ggml_tensor * get_rows, const ggml_tensor
     const int64_t D = v->ne[0]*v->ne[0]*v->ne[1];
     const bool kda = g->ne[0] == v->ne[0];
     const bool conds[] = {
-        enabled, !kda, ggml_get_op_params_i32(gdn, 0) == 1,
+        enabled, !kda, K >= 1 && K <= kmax,
         gdn->type == GGML_TYPE_F32, v->ne[0] == 128,
         v->ne[2] < 8, v->ne[3] == 1, cache->type == GGML_TYPE_F32, cache->ne[0] == D,
         cache->nb[1] == (size_t) D*sizeof(float), ids->type == GGML_TYPE_I32, ids->ne[0] >= 1,
         true, ((uintptr_t) cache->data) % 16 == 0 };
     static const char * names[] = {
-        "gate-enabled", "!kda", "K==1",
+        "gate-enabled", "!kda", "K<=KMAX",
         "gdn-f32", "v-ne0==128",
         "v-ne2<8", "v-ne3==1", "cache-f32", "cache-ne0==D",
         "cache-nb1", "ids-i32", "ids-ne0>=1",
