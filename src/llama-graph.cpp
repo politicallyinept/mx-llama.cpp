@@ -4028,6 +4028,10 @@ llm_graph_input_rs * llm_graph_context::build_rs_inp() const {
     return (llm_graph_input_rs *) res->add_input(std::move(inp));
 }
 
+ggml_tensor * llm_graph_get_rows_gdn_state(ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids) {
+    return ggml_get_rows(ctx, states, ids);
+}
+
 ggml_tensor * llm_graph_context::build_rs(
         llm_graph_input_rs * inp,
         ggml_tensor * s,

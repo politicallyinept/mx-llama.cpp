@@ -1013,6 +1013,12 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
 
+// GDN verify-batch state getter (mtp-gdn-k1): reads the ubatch state rows straight from the cache via
+// s_copy_main, so the build_rs tail gather carries only the snapshot-copy rows and the CUDA gdn_state_rows
+// fusion can admit the K>1 verify graph to direct-read. Pass to build_rs only when n_rs > n_seqs, which
+// requires n_rs_seq > 0 (MTP-family speculative decode); every other path keeps the stock view shape.
+ggml_tensor * llm_graph_get_rows_gdn_state(ggml_context * ctx, ggml_tensor * states, ggml_tensor * ids);
+
 struct llm_graph_qkv {
     ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
     ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]

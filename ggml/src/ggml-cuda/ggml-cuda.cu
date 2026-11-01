@@ -5034,6 +5034,10 @@ static bool ggml_cuda_defer_gdn_state_rows(ggml_backend_cuda_context * cuda_ctx,
     }
     static const bool s_gdn_rows_witness = [] { fprintf(stderr, "[gdn-state-rows] recurrent-state gather direct-read ACTIVE\n"); return true; }();
     (void) s_gdn_rows_witness;
+    if (dbg) {
+        fprintf(stderr, "[gdn-state-rows] node %d %s: fused direct-read K=%d ids=%s\n",
+            i, g->name, ggml_get_op_params_i32(gdn, 0), g->src[1]->name);
+    }
     cuda_ctx->gdn_state_rows.push_back({gdn, (const float *) g->src[0]->data, (const int32_t *) g->src[1]->data});
     return true;
 }

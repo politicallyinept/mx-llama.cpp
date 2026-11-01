@@ -408,7 +408,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // mtp-gdn-k1: under MTP verify the ring holds K = n_rs_seq + 1 snapshot rows per sequence (n_rs > n_seqs,
+    // impossible without n_rs_seq > 0). Split the state gather: the GDN reads its row through s_copy_main (the
+    // CUDA gdn_state_rows fusion skips this gather and the kernel reads the cache row directly), the tail
+    // gather keeps feeding the snapshot copies. K == 1 graphs (T=1 decode, prefill) are untouched.
+    const llm_graph_get_rows_fn gdn_state_rows_getter = inp->mctx->get_n_rs() > n_seqs
+        ? llm_graph_get_rows_fn(llm_graph_get_rows_gdn_state)
+        : nullptr;
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs, gdn_state_rows_getter);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
