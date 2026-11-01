@@ -8,12 +8,13 @@ This branch contains the complete W4A4 weight-quantized GEMM path developed for 
 (32 GB HBM2) accelerators, including the activation-side u4 path, K-split scheduling, the
 correctness-first validation lineage, and the full measured performance/correctness record.
 
-**Default behavior (P5 default flip):** with `GGML_CUDA_W4A4_PROFILE` unset the int4-path
-knobs resolve to the sealed `speed` preset (DOT8=3 per-16, MIN_TOKENS=128, KSPLIT=1,
-SUMW=1) - the W4A4/u4 paths are **on by default** at batch widths at or above the floor.
-Set `GGML_CUDA_W4A4_PROFILE=off` (or `none`), or the kill-switch `GGML_CUDA_W4A4_OFF=1`,
-for byte-identical stock behavior. The repack admission gate (`GGML_CUDA_REPACK_Q4_0`)
-and the debug gates remain opt-in. Three small non-int4 items ride along: an opt-in
+**Default behavior:** with `GGML_CUDA_W4A4_PROFILE` unset the int4-path knobs resolve to
+the sealed `speed` preset (DOT8=3 per-16, MIN_TOKENS=128, KSPLIT=1, SUMW=1). The
+tiled/W4A4 repack paths engage only for tensors admitted through the repack admission
+gate (`GGML_CUDA_REPACK_Q4_0`, default OFF in source); the production profile sets these
+envs explicitly. Set `GGML_CUDA_W4A4_PROFILE=off` (or `none`), or the kill-switch
+`GGML_CUDA_W4A4_OFF=1`, for byte-identical stock behavior. The debug gates remain
+opt-in. Three small non-int4 items ride along: an opt-in
 `MXFP4` quantize ftype, a TP-3 entry in the custom-AllReduce auto-select list (only
 relevant when the fork's custom AllReduce is engaged), and a DSV4 KV-cache flag that
 reports checkpoint restore as unsupported (conservative: the compressed state cannot be
@@ -27,11 +28,19 @@ restored losslessly).
   ([mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp), itself a fork of
   ggml-org/llama.cpp); the fork's own records reference that lineage (`docs/BENCH.md`
   cites "mxxm-t master" as the upstream base).
-- **CV-port additions:** on top of that lineage this branch carries in-house GPU kernel work
-  for gfx906-class (MI50) accelerators. Headline items:
-  - tiled Q4_0 repack GEMM (gfx906 `gcn_u4_gemm`, 128x64 tiles, LDS-staged), now default-ON
-    (tier3-adopt), sealed bit-identical to the generic MMQ loop at the validated widths
-    (batch sizes 2-15 are not covered by the seal);
+- **CV fork (external source):** part of the kernel work on this branch derives from
+  Castagna Veloce, an external llama.cpp fork by benpeterson40
+  ([benpeterson40/castagna-veloce](https://github.com/benpeterson40/castagna-veloce)).
+  Ported kernels are marked in the source comments (`CV (castagna-veloce) port`, pinned
+  to CV commit `3483d46`); the Provenance column of the gate table below notes which
+  gates are CV ports.
+- **CV-port / in-house additions:** on top of that lineage this branch carries GPU kernel
+  work for gfx906-class (MI50) accelerators, ported from the CV fork and developed
+  in-house. Headline items:
+  - tiled Q4_0 repack GEMM (gfx906 `gcn_u4_gemm`, 128x64 tiles, LDS-staged), engaged for
+    Q4_0 tensors admitted to the repack path (tier3-adopt), sealed bit-identical to the
+    generic MMQ loop at the validated widths (batch sizes 2-15 are not covered by the
+    seal);
   - `gcn_u4_gemm` activation nibble-pairing fix (canonical Q4_0 order);
   - `attn_qk_fused` call-site restore: the fused decode attention q/k chain is re-engaged
     in the CUDA fusion matcher.
@@ -44,7 +53,7 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 
 | Env var | Default | Effect | Provenance |
 |---|---|---|---|
-| `GGML_CUDA_REPACK_Q4_0_TILED` | ON (`=0` off) | repacked Q4_0 GEMMs run the tiled gfx906 `gcn_u4_gemm` (128x64 tiles, LDS-staged); sealed bit-identical to the generic MMQ loop at validated widths (batch 2-15 not sealed) | tier3-adopt (flipped default-ON) |
+| `GGML_CUDA_REPACK_Q4_0_TILED` | ON (`=0` off) | repacked Q4_0 GEMMs run the tiled gfx906 `gcn_u4_gemm` (128x64 tiles, LDS-staged); engages only for Q4_0 admitted via `GGML_CUDA_REPACK_Q4_0` (default OFF); sealed bit-identical to the generic MMQ loop at validated widths (batch 2-15 not sealed) | tier3-adopt |
 | `GGML_CUDA_ATTN_QK_FUSED` | ON (`=0` off) | fuses the decode attention q/k chain (norm + rope + K/V cache rows) into one kernel | CV attn_qk_fused port; call site restored |
 | `GGML_CUDA_GDN_STATE_ROWS_OK` | ON (`=0` off) | GDN decode reads its recurrent-state row directly via the GET_ROWS ids (gather node skipped) | CV gdn_state_rows port |
 | `GGML_CUDA_GDN_AB_DEC` | OFF (`=1` on) | fuses the GDN decode gate chain (alpha softplus path + beta sigmoid) into one kernel | CV hc-dec port (default ON in CV) |
@@ -52,6 +61,7 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_REPACK_KQUANT` | ON (`=0` off) | repacks Q4_K/Q5_K/Q6_K into the GEMM-friendly layout; `=0` keeps canonical layout (stock path) for A/B | gcn-repro A/B lane |
 | `GGML_CUDA_REPACK_KQUANT_MOE_FUSION` | ON (`=0` off) | admits K-quant/IQ4_NL expert tensors to the repacked MoE up/gate mat-vec fusion | repack MoE-fusion lane |
 | `GGML_CUDA_REPACK_Q8_0` | OFF (`=1` on) | opt-in Q8_0 repack (flipped from default-ON after a decode-regression finding) | q8_0-repack decode-diag lane |
+| `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | ON (`=0` off) | pins Q8_0 matmuls to stock accumulation order: Q8_0 stays canonical (repack suppressed for Q8_0 even with `GGML_CUDA_REPACK_Q8_0=1`); `=0` restores the repacked Q8_0 path | anchor3 consolidation |
 | `GGML_CUDA_MOE_VEC` | OFF (`=1` on) | row-lane MoE decode kernel family (decode-shape admission) | CV port |
 | `GGML_CUDA_MOE_FUSE` | OFF (`=1` on) | MoE gate/up + SwiGLU prefill fusion on the expert-grouped GCN v4 GEMM | CV-port prefill fusion |
 | `GGML_TP_AR_MTP_SAFE` | OFF (`=1`/`=2`) | disables the custom TP all-reduce once a tensor-width change is seen (MTP/spec-decode safety) | fork TP work |
@@ -84,8 +94,10 @@ Three coordinated pieces, layered so each is independently useful:
 ## Turning it on
 
 The **profile** preset resolves the four int4-path knobs; an unset profile resolves to
-`speed` (the P5 default flip), so the tuned configuration is active out of the box.
-Everything else is optional per-knob tuning.
+`speed` (the P5 default flip). Note that the tiled/W4A4 repack paths engage only for
+tensors admitted through the repack admission gate (`GGML_CUDA_REPACK_Q4_0`, default OFF
+in source); the production profile sets these envs explicitly. Everything else is
+optional per-knob tuning.
 
 ```bash
 # Optional: override the default preset

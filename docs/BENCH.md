@@ -254,7 +254,8 @@ Analysis (in-parent; subagent died to provider timeouts - 3rd strike):
  same set => barrier provably redundant => elided. Bit-exact (reduce order
  untouched). Twoshot's barrier_end is intra-call (allgather visibility),
  NOT elided.
-- Merged to production 2094f4db5. Results: 2-rank broadcast path
+- Merged to production on the perf/ar-latency-gfx906 branch lineage. Results: 2-rank
+  broadcast path
  43.12 -> 44.81 (+3.9%, variance 10x tighter); 3-rank twoshot no-op (as
  designed). dense-prod-model merged-build stack: 20.35 t/s. GGML_TP_AR_SKIP_XBAR=1
  deployed fleet-wide in start.sh. Live proxy verify PASS.
@@ -374,7 +375,9 @@ gfx906 has no native bf16 (emulated conversion), which is why wasted
 conversion in bf16s hurts.
 
 Bug caught by PPL gate: initial patch had 2x slot-stride error (readers used
-slice*1 instead of slice*4) -> PPL 13671. Fixed in 7dbc60505. Lesson: bench
+slice*1 instead of slice*4) -> PPL 13671. Fixed in a follow-up commit on the
+perf/ar-bf16-wire-gfx906 branch lineage (readers switched to the correct slice*4 slot
+stride). Lesson: bench
 never validates output; the PPL gate is what makes a wire-format change safe.
 
 NOT deployed - production stays f32 until Brad opts in. To enable: set
@@ -741,7 +744,6 @@ cuts 3 VGPRs. Re-gauntlet: pp2048 116.58 (was 98.4, +19% recovered), pp8192
 Remaining -26% vs stock is STRUCTURAL: 4 unchained accumulators + 8 LDS scale
 reads per block = epilogue-FMA-bound, inherent to per-8. C1 closes: per-8
 GEMM = documented quality-mode trade, not deployable universal mode.
-NOTE: step2 commits 60c627733/2570c9a5a were on-box only; pushed separately.
 
 ## 42. C1 follow-up: H-form per-8 epilogue rework - REJECT; per-8 frontier now fully mapped (2026-09-27)
 
@@ -996,7 +998,8 @@ search weighted by imatrix (window around ref amax/6 code), vs MXFP4's one E8M0 
 quantize_row_nvfp4_impl in ggml-quants.c; quantize_nvfp4 branches on quant_weights; NVFP4 ftype
 wired in llama-quantize (dense 2D ne0%64 branch). CPU seal: no-imatrix bit-identical to ref;
 synthetic weighted-error ratios 0.825-0.957; REAL community-FT expert data w_err 0.629 (37% error cut,
-vs MXFP4's 5.7% - the finer scale grid actually bites on real weights). Commits + 1f6be1d1a.
+vs MXFP4's 5.7% - the finer scale grid actually bites on real weights). Code for this
+leg lives on branch perf/nvfp4-imatrix.
 
 ### Numbers (community-MoE-35B, same harness as M3, Q4 control same-run)
 | quant | PPL@8k | vs Q4_0 |
@@ -1322,7 +1325,8 @@ Fresh rocprofv3 traces (per-gate cwd, both gates captured cleanly) refine 49g on
  bottleneck; -20.5/-22.4/-22.6% across pp512/2048/4096, unchanged from 28B).
 Follow-up path if ever funded: pre-fold weight scale d into d4/m at prefetch (sWs16 extension)
 and/or fp32 scale storage - removes the delta ALU ops from the epilogue; layout changes are a
-dead end. Patched sources preserved at rig/w4a4-32b-patch/; tree reverted clean at 98d1d8b18.
+dead end. Patched sources preserved at rig/w4a4-32b-patch/; tree reverted clean after
+the experiment.
 
 ## 50. gfx906 wave64 idiom comparison vs Strata (2026-10-04, branch bench/gfx906-idiom-compare )
 
