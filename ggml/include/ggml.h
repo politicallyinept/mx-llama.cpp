@@ -2891,6 +2891,16 @@ extern "C" {
     GGML_API struct ggml_cgraph * ggml_graph_dup       (struct ggml_context * ctx, struct ggml_cgraph * cgraph, bool force_grads);
     GGML_API void                 ggml_graph_cpy       (struct ggml_cgraph * src, struct ggml_cgraph * dst);
     GGML_API void                 ggml_graph_reset     (struct ggml_cgraph * cgraph); // set regular grads + optimizer momenta to 0, set loss grad to 1
+
+    // Graph-level batch-type hints, set by the graph builder at build time and read by
+    // backends at compute time. Advisory: a backend may ignore them.
+    //   GGML_CGRAPH_FLAG_SPEC_VERIFY: the graph computes a speculative-decoding verify
+    //   batch (a multi-token decode batch with outputs at every position), as opposed
+    //   to a prompt chunk (single output) or a plain single-token decode.
+#define GGML_CGRAPH_FLAG_SPEC_VERIFY 0x00000001u
+
+    GGML_API void                 ggml_cgraph_set_flags(struct ggml_cgraph * cgraph, uint32_t flags);
+    GGML_API uint32_t             ggml_cgraph_get_flags(const struct ggml_cgraph * cgraph);
     GGML_API void                 ggml_graph_clear     (struct ggml_cgraph * cgraph);
 
     GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);

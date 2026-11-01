@@ -364,6 +364,10 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // advisory batch-type hints (GGML_CGRAPH_FLAG_*), set by the graph builder at build
+    // time; 0 means no hint. Backends that key caches on graph shape should mix them in.
+    uint32_t flags;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)
