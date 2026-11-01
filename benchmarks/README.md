@@ -46,3 +46,9 @@ stripped or replaced with `(internal ref)` during the copy.
 | file | campaign | contents |
 |---|---|---|
 | `p03-h2h-summary.md` | P03 head-to-head | cross-engine summary covering both benchmark models |
+
+### top level
+
+| file | campaign | contents |
+|---|---|---|
+| `defaults-vs-env.md` | gate-truth verification, 2026-10-31 | per-gate source defaults vs the production env bundle; dual seal matrices (env-profile vs true-defaults) proving the published results describe the env bundle and the tiled repack path is bit-identical to the default path |
