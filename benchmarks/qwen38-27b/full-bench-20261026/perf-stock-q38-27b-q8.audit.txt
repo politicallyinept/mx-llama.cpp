@@ -1,0 +1,8 @@
+cell=perf-stock-q38-27b-q8 leg=stock model=q38-27b-q8 mode=perf status=server_fail note=health rc=1; 
+vram_before=10866688 vram_after=11046912
+build=250d100ccb779ef34c54889f0867cc051a055712
+env=[]
+	libhipblas.so.3 => /opt/rocm-7.2.3/lib/libhipblas.so.3 (0x00007f36add24000)
+	librocblas.so.5 => /opt/rocm-7.2.3/lib/librocblas.so.5 (0x00007f36a5e00000)
+	libamdhip64.so.7 => /opt/rocm-7.2.3/lib/libamdhip64.so.7 (0x00007f36a4400000)
+	librocsolver.so.0 => /opt/rocm-7.2.3/lib/librocsolver.so.0 (0x00007f3670800000)

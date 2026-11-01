@@ -1,0 +1,8 @@
+cell=perf-cv-q38-27b-q4_0 leg=cv model=q38-27b-q4_0 mode=perf status=server_fail note=health rc=2; 0.00.103.052 E cmn  common_init_: failed to load model 'bench-quants/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf' 0.00.103.056 E srv    load_model: failed to load model; 'bench-quants/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf' 0.00.104.436 E srv  llama_server: exiting due to model loading error 
+vram_before=10866688 vram_after=10866688
+build=250d100ccb779ef34c54889f0867cc051a055712
+env=[]
+	libhipblas.so.3 => /opt/rocm-7.2.3/lib/libhipblas.so.3 (0x00007e0f9c324000)
+	librocblas.so.5 => /opt/rocm-7.2.3/lib/librocblas.so.5 (0x00007e0f93a00000)
+	libamdhip64.so.7 => /opt/rocm-7.2.3/lib/libamdhip64.so.7 (0x00007e0f92000000)
+	librocsolver.so.0 => /opt/rocm-7.2.3/lib/librocsolver.so.0 (0x00007e0f5e400000)

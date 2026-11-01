@@ -1,10 +1,10 @@
-# BENCH.md — production-123B-v2 q4_0 on 3x MI50 32GB (gfx906, TheRock ROCm 7.2.3)
+# BENCH.md - fork benchmark campaign log on 3x MI50 32GB (gfx906, TheRock ROCm 7.2.3)
 
 All runs: -lm dio, env GGML_ENABLE_CUSTOM_AR=1 HSA_FORCE_FINE_GRAIN_PCIE=1
-HSA_XNACK=0 GPU_MAX_HW_QUEUES=8, HEAD build 50d5fdeba (no RCCL) unless noted.
-Model 64.56 GiB, r=3 unless noted. Raw tables: mi50:/root/bench-results/*.md
+HSA_XNACK=0 GPU_MAX_HW_QUEUES=8, HEAD build (no RCCL) unless noted.
+r=3 unless noted. Raw tables: retained on the measurement rig.
 
-## 1. Split mode — the headline (2026-09-07)
+## 1. Split mode - the headline (2026-09-07)
 
 | config | pp512 | pp1024 | pp2048 | pp4096 | tg16/32 | tg128 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -12,11 +12,11 @@ Model 64.56 GiB, r=3 unless noted. Raw tables: mi50:/root/bench-results/*.md
 | tensor, fa1 | 88.9-90.5 | 89.8 | 89.7 | 88.6-91.3 | 16.75 | 16.49 |
 
 - **Decode: tensor +117% (7.6 -> 16.5-16.8 t/s).** This is the whole ballgame for
-  a chat/creative model: generation dominates wall-clock.
+ a chat/creative model: generation dominates wall-clock.
 - **Prefill: layer scales with batch (70->152), tensor flat ~90 (comm-bound).**
-  Crossover ~700-800 prompt tokens. Worst case for tensor (8k prompt + 500 gen):
-  layer ~81s vs tensor ~107s; typical creative turn (500 prompt + 500 gen):
-  layer ~72s vs tensor ~40s. Decode-heavy = tensor wins.
+ Crossover ~700-800 prompt tokens. Worst case for tensor (8k prompt + 500 gen):
+ layer ~81s vs tensor ~107s; typical creative turn (500 prompt + 500 gen):
+ layer ~72s vs tensor ~40s. Decode-heavy = tensor wins.
 - Wall-clock at 2k prompt + 500 gen: layer ~81s, tensor ~53s.
 
 ## 2. Env toggles (tensor, pp2048/tg128)
@@ -30,7 +30,7 @@ Model 64.56 GiB, r=3 unless noted. Raw tables: mi50:/root/bench-results/*.md
 
 ## 3. KV quant (tensor, pp2048/tg128)
 f16: 89.66 / 16.49. q8_0 both: 89.50 / 15.91. **q8 KV costs 3.5% decode, saves
-~1GB total (GQA-8 KV is tiny) — use f16.** (Deployed config used q8_0 — change it.)
+~1GB total (GQA-8 KV is tiny) - use f16.** (Deployed config used q8_0 - change it.)
 
 ## 4. ubatch (tensor, pp4096/tg16)
 ub512: 88.31/16.42. ub1024: 90.46/16.43. ub2048: 91.26/16.47. Keep -ub 2048.
@@ -42,67 +42,45 @@ for tensor mode. Keep fa on.
 
 ## 6. Build/platform findings (root-caused)
 - **TheRock ROCm 7.2.3 RCCL segfaults on gfx906** in tensor mode
-  (bt: ggml_backend_cuda_comm_try_allreduce_nccl -> librccl -> libamdhip64).
-  Fix: build WITHOUT -DGGML_HIP_RCCL=ON; custom AR (GGML_ENABLE_CUSTOM_AR=1)
-  covers the per-layer 48KB allreduce. Deployed build never had RCCL — works.
+ (bt: ggml_backend_cuda_comm_try_allreduce_nccl -> librccl -> libamdhip64).
+ Fix: build WITHOUT -DGGML_HIP_RCCL=ON; custom AR (GGML_ENABLE_CUSTOM_AR=1)
+ covers the per-layer 48KB allreduce. Deployed build never had RCCL - works.
 - Build flags that work: GGML_HIP=ON GRAPHS=ON MMQ_MFMA=ON NO_VMM=ON,
-  AMDGPU_TARGETS=gfx906, clang, -O3. 4.5 min build on the 5950X.
+ AMDGPU_TARGETS=gfx906, clang, -O3. 4.5 min build on the 5950X.
 - llama-bench has no -c flag (ctx from -p/-n); llama-cli defaults huge ctx ->
-  KV OOM under tensor — ALWAYS pass -c.
+ KV OOM under tensor - ALWAYS pass -c.
 - llama-cli: -no-cnv removed upstream; use -st (single-turn) for scripted gens.
 - llama-server --fit: "not implemented for SPLIT_MODE_TENSOR" warning + aborts
-  fit only — pass --fit off explicitly for tensor configs.
+ fit only - pass --fit off explicitly for tensor configs.
 - GPU contention: llama-swap spawns on 8181 requests; benching needs an idle
-  window (two of my runs died to this; also each llama-bench exit leaves ~64GB
-  VRAM draining — the fixed harness waits for drain between runs).
+ window (two of my runs died to this; also each llama-bench exit leaves ~64GB
+ VRAM draining - the fixed harness waits for drain between runs).
 
-## 7. Quality gate — PASSED
+## 7. Quality gate - PASSED
 Greedy (-c 32768, -st, temp 0): layer and tensor both produce correct coherent
 output; wording differs slightly (summation-order class, same as fork documents
 for its bit-exact-except-reduction-order paths). No degeneration.
 
-## 8. Recommended deployed config (vs current)
-
-Current llama-swap Mistral-class-prod: -sm layer, -ts 30/29/30, -ctk/-ctv q8_0, -fit absent.
-Recommended:
-
-```yaml
-"production-123B-v2":
-  cmd: >
-    ${llama-server}
-    --model ${model_path}/production-123B-v2-Q4_0/production-123B-v2-Q4_0-00001-of-00002.gguf
-    --port ${PORT}
-    -ngl 999 -fa on -sm tensor --fit off
-    --device ROCm0,ROCm1,ROCm2
-    -ctk f16 -ctv f16
-    -b 2048 -ub 2048 -c 32768
-    -lm dio
-```
-(box env already exports the AR/PCIe vars; -ts not needed — tensor mode splits evenly)
-
-Expected: tg 7.6 -> ~16.5 t/s (+117%), pp512 72 -> ~89; pp2048+ slower than
-layer (135 -> 90) — acceptable for decode-dominant creative use.
-
-## 10. Kernel profile — tensor decode (rocprof, 2026-09-08)
+## 10. Kernel profile - tensor decode (rocprof, 2026-09-08)
 
 tg96 run (64p+96g), instrumented 14.0 t/s (~19% overhead vs 16.75 clean). Raw:
-mi50:/root/prof-tensor/tg.stats.csv. Decode-time attribution per token:
+rig/prof-tensor/tg.stats.csv. Decode-time attribution per token:
 
 | consumer | share of decode | detail |
 |---|---:|---|
-| mul_mat_vec_q Q4_0 (type 2) | **~72%** | 2 shape classes: 52.7us x 124,845 (rows 12288-class) + 226us x 25,614 (need_sum=true, 1/layer/GPU — big rows: MLP/vocab class) |
-| custom AR (k_broadcast_reduce<3>) | **~25%** | 176 calls/token (2/layer), 88us each — latency-bound, 48KB msgs over 2-hop PCIe |
+| mul_mat_vec_q Q4_0 (type 2) | **~72%** | 2 shape classes: 52.7us x 124,845 (rows 12288-class) + 226us x 25,614 (need_sum=true, 1/layer/GPU - big rows: MLP/vocab class) |
+| custom AR (k_broadcast_reduce<3>) | **~25%** | 176 calls/token (2/layer), 88us each - latency-bound, 48KB msgs over 2-hop PCIe |
 | rms_norm + quantize_q8_1 | ~4% | 52569 + 102741 calls, 12us/4.4us |
 | rest | <2% | |
 
 Prefill-only in profile: mul_mat_q MMQ 14.3%, k_twoshot_f32 AR 8.5% (2.3ms each),
-rocclr_copyBufferRectAligned 7.6% (4.7ms x 451 — KV/layer-seam copies).
+rocclr_copyBufferRectAligned 7.6% (4.7ms x 451 - KV/layer-seam copies).
 
 **Implication: mat-vec (72%) >> AR latency (25%) >> everything else. AR at 88us/call
-is ~3x pure-transfer time — a sync-protocol cost; candidate: fewer/lazier barriers,
+is ~3x pure-transfer time - a sync-protocol cost; candidate: fewer/lazier barriers,
 but kernel-level AR surgery is higher risk than mat-vec work.**
 
-## 11. Tuning experiments — mvq warp sweep (2026-09-08)
+## 11. Tuning experiments - mvq warp sweep (2026-09-08)
 
 Target: `mul_mat_vec_q` Q4_0 (72% of decode time per profile). Tested GCN-table
 nwarps for Q4_0 batch-1 (stock=2; RDNA4/DGX-Spark uses 8 for same shape, #26843).
@@ -111,37 +89,21 @@ rebuild (~1 min) -> same bench params as T1 (r3).
 
 | variant | tensor tg128 | layer tg128 | verdict |
 |---|---:|---:|---|
-| stock nwarps=2 | 16.68 | 7.62 | **best — keep** |
-| nwarps=4 | 16.48 | 7.26 | -4.7% layer — reject |
-| nwarps=1 | 15.16 | 7.25 | -9% tensor — reject |
+| stock nwarps=2 | 16.68 | 7.62 | **best - keep** |
+| nwarps=4 | 16.48 | 7.26 | -4.7% layer - reject |
+| nwarps=1 | 15.16 | 7.25 | -9% tensor - reject |
 
 **Negative result: RDNA4's 8-warp finding does NOT transfer to GCN5. Fork stock
 warp config is optimal at this level.** (Thermal note: post-sweep stock re-verify
-read 16.48 vs 16.68 earlier — sustained-bench drift; relative ordering valid.)
+read 16.48 vs 16.68 earlier - sustained-bench drift; relative ordering valid.)
 
 Remaining decode levers (mapped, not yet attempted):
 1. AR latency: k_broadcast_reduce 88us x 176/token = 25% of decode. Pure transfer
-   is ~25us for 48KB over 2-hop PCIe -> ~3x sync-protocol overhead. Needs barrier
-   laziness/overlap work in tp-allreduce.cu (high risk, high value ~+15-20% tg).
+ is ~25us for 48KB over 2-hop PCIe -> ~3x sync-protocol overhead. Needs barrier
+ laziness/overlap work in tp-allreduce.cu (high risk, high value ~+15-20% tg).
 2. Fused dequant+dot inside mul_mat_vec_q for Q4_0 (the 226us need_sum class).
-3. MMVQ->MMQ crossover knobs are MoE-only (MUL_MAT_ID batch caps) — N/A dense.
-4. rms_norm/quantize are 4% combined — not worth fusing first.
-
-## 12. Subagent delegation status (2026-09-08)
-Delegation model degraded (local delegation LLM: 10 API calls/900s, 4/5 dispatches
-timed out). Parent did analysis + patches directly. Partial transcripts at
-~/.hermes/cache/delegation/live/{deleg_970b9ec5,deleg_7d8c0a0d}/ — the mmvq
-parameter-table map and vecdotq path study were recovered and used.
-- ~~llama-server tensor validation end-to-end~~ **DONE 2026-09-08**: ready in ~20s,
-  short-prompt gen 16.18 t/s (matches bench), 613-tok prompt eval 86 t/s, 0 errors,
-  coherent output. Config validated: -sm tensor --fit off -ctk f16 -ctv f16 -lm dio.
-- Switch /root/mx-production-123b checkout to Gitea gfx906-production-123b branch (currently
-  GitHub detached at 50d5fdeb + no-RCCL rebuild).
-- Tuning: L2 q4_0 MMQ tile entry (mmq-config-gfx906.cuh has Q8_0/MXFP4 only),
-  L1 q4_0 repack traits entry (fork admits K-quants + IQ4_NL, not Q4_0).
-  Decode ceiling ~46 t/s aggregate; currently 36% of it.
-- Optional: quantify llama-swap co-residency effects (Mistral-class-prod tensor + small
-  model on leftover VRAM).
+3. MMVQ->MMQ crossover knobs are MoE-only (MUL_MAT_ID batch caps) - N/A dense.
+4. rms_norm/quantize are 4% combined - not worth fusing first.
 
 ## 14. production-128B-v3 Q4_0 validation (2026-09-08, same rig/method)
 
@@ -150,10 +112,10 @@ parameter-table map and vecdotq path study were recovered and used.
 | config | pp512 | pp2048 | pp4096 | tg32 | tg128 |
 |---|---:|---:|---:|---:|---:|
 | tensor + f16 KV | 90.05 | 89.33 | 88.35 | 16.04 | 15.93 |
-| tensor + q8_0 KV | — | 89.13 | — | — | 15.58 |
+| tensor + q8_0 KV | - | 89.13 | - | - | 15.58 |
 | layer + f16 KV | 70.65 | 132.64 | 148.80 | 7.45 | 7.44 |
 
-Mistral-class-prod findings REPLICATE on this independent finetune: tensor decode +114%,
+dense-prod-model findings REPLICATE on this independent finetune: tensor decode +114%,
 same flat-PP ~89 comm-bound signature, same ~800-token crossover, KV q8_0 costs
 2.2% tg. Conclusion: these are properties of the Mistral-Large arch + q4_0 +
 3xMI50 tensor split, not model-specific.
@@ -170,11 +132,11 @@ added; nobody noticed because q8 KV + luck kept it just inside VRAM.
 Fix deployed: --fit off, explicit -c 32768, f16 KV. Live-verified via proxy
 (ready, coherent output). Backups: config.yaml.bak-20260908{-production-128b,}.
 NOTE: 64k f16 KV does NOT fit on this model (1 GiB/GPU more weights than
-Mistral-class-prod); 32k is the max comfortable ctx.
+dense-prod-model); 32k is the max comfortable ctx.
 
 ## 15. Delegation timeout fixed
 config had delegation.child_timeout_seconds: 900 (explicitly set; code default
-is no cap) — raised to 3600 via hermes config set. Local delegation LLM
+is no cap) - raised to 3600 via hermes config set. Local delegation LLM
 turns run 49-110s; the 900s cap was killing healthy runs.
 
 ## 16. llama-swap full config sync (2026-09-09, owner-directed)
@@ -184,34 +146,22 @@ Backup: config.yaml.bak-20260908-listsync. Applied via text-preserving transform
 
 - REMOVED (9): model files gone from disk (community finetune quants, names withheld).
 - ADDED (8): a community-abliterated Qwen3.8-27B quant (27.1G), Qwen3.8-27B base Q8/Q4(27.1/15.0G),
-  Muse-Glimmer-30B(27.6G, gemma preset), community-FT-1.5-35B Q8/Q4(34.4/19.7G),
-  endless-frontier-BigBang-v1(35.2G), Mistral-7B-v0.3-abliterated(4.1G, spec-draft
-  utility). my-stories-lora.gguf excluded (LoRA adapter, not servable).
+ Muse-Glimmer-30B(27.6G, gemma preset), community-FT-1.5-35B Q8/Q4(34.4/19.7G),
+ endless-frontier-BigBang-v1(35.2G), Mistral-7B-v0.3-abliterated(4.1G, spec-draft
+ utility). my-stories-lora.gguf excluded (LoRA adapter, not servable).
 - DEVICE RULE applied per owner: <=35GB -> --device ROCm1,ROCm2 (low-latency pair);
-  >35GB -> all three GPUs. 15 existing entries migrated.
+ >35GB -> all three GPUs. 15 existing entries migrated.
 - LANDMINE SWEEP: 0 remaining -sm layer / --fit on / --fit-ctx; every entry has
-  explicit -c; ${default_params} macro now has --fit on removed.
-- Mistral-class-prod + production-128B entries preserved byte-identical (content-level; production-128B's
-  --fit off diff vs old backup is my earlier validated fix).
+ explicit -c; ${default_params} macro now has --fit on removed.
+- dense-prod-model + production-128B entries preserved byte-identical (content-level; production-128B's
+ --fit off diff vs old backup is my earlier validated fix).
 - VALIDATION: yaml parse OK; llama-swap hot-reload OK ("Configuration Reloaded");
-  26 models listed; spawn test Qwen3.8-27B-Q4_0 PASS (content correct, reasoning
-  in reasoning_content, cache-reuse active 42 tokens).
+ 26 models listed; spawn test Qwen3.8-27B-Q4_0 PASS (content correct, reasoning
+ in reasoning_content, cache-reuse active 42 tokens).
 - PITFALL logged: python f-string escaping of ${...} llama-swap macros double-braced
-  them (${{PORT}}) and a blind sed half-fix left trailing }} - llama-swap rejected
-  the reload ("proxy uses ${PORT} but cmd does not"). Always grep for }} and
-  verify "Configuration Reloaded" (not "Unable to reload") in journalctl after edits.
-
-## 17. Speculative decode A/B/C — Mistral-class-prod (2026-09-09): CLOSED, negative
-
-Via llama-server (only spec-capable path), validated tensor config, warm t/s:
-- A baseline: 16.83 t/s
-- B draft-simple (Mistral-7B-v0.3-abliterated Q4_K_M, uncensored): 17.03 (+1.2%,
-  within noise; not worth 4GB VRAM + drafter overhead)
-- C ngram-cache: 15.57 (-7.5%; acceptance 0.17-0.25, mean accepted len 1.7-3.0)
-Conclusion: spec decode does not pay for creative workloads on this target. Do not
-retry with other drafts unless acceptance >0.5 is achievable (EAGLE3-class
-target-trained drafts do not exist for Mistral-Large). Raw: mi50:/root/spec-ab/.
-Remaining lever: AR latency surgery (tp-allreduce.cu, ~25% of decode).
+ them (${{PORT}}) and a blind sed half-fix left trailing }} - llama-swap rejected
+ the reload ("proxy uses ${PORT} but cmd does not"). Always grep for }} and
+ verify "Configuration Reloaded" (not "Unable to reload") in journalctl after edits.
 
 ## 18. Subagent provider status (2026-09-09)
 Worse than 09-08: both dispatches died to hard API timeouts (180s no-response,
@@ -229,19 +179,19 @@ phases anti-correlated across ranks (rank0: write 31k ticks + WAIT 71k;
 rank2: write 62k + wait 27k) => pacing item = peer-write phase; reduce trivial
 (2.5%); rank-dependent write times = asymmetric PCIe paths.
 
-Root cause of missed win: auto-twoshot selection (5f65f9fa3) lists nranks in
+Root cause of missed win: auto-twoshot selection lists nranks in
 {5,8,10,4-conditional} but NOT 3. GGML_TP_AR_TWOSHOT=1 forces it (12288 %
 (4*3) == 0: alignment-eligible). Two-shot cuts per-rank wire 2x48KB -> 2x16KB.
 
 | config | tg128 | notes |
 |---|---:|---|
 | broadcast (auto) | 16.95 / 16.49-16.75 (r1/r3 class) | baseline |
-| GGML_TP_AR_TWOSHOT=1 | **17.42 ± 0.07 (r3)**, 17.57 (r1) | +3.3% decode, PP unchanged |
+| GGML_TP_AR_TWOSHOT=1 | **17.42 +- 0.07 (r3)**, 17.57 (r1) | +3.3% decode, PP unchanged |
 | 2-rank Qwen3.8-27B Q4_0 | 43.23 vs 43.35 | CORRECTED: neutral on 2 ranks. (First measurement 27.2/26.8 was INVALID - llama-bench treats --device A,B as a cycle list of single-GPU runs, not one 2-GPU run; must HIP_VISIBLE_DEVICES-pin for multi-GPU bench. llama-server is unaffected - its --device takes a set.) |
 | quality gate (greedy) | PASS | coherent output, 17.5 t/s |
 
 DEPLOYED: GGML_TP_AR_TWOSHOT=1 added to /llama-swap/start.sh env (service
-restarted, live-verified via proxy). Cumulative Mistral-class-prod decode: 7.6 -> 17.4 t/s.
+restarted, live-verified via proxy). Cumulative dense-prod-model decode: 7.6 -> 17.4 t/s.
 Remaining AR headroom: write phase still paces (asymmetric peer paths);
 next lever would be per-rank-pair tuning or barrier overlap - diminishing returns.
 
@@ -249,41 +199,36 @@ next lever would be per-rank-pair tuning or barrier overlap - diminishing return
 
 A/B on L3.3-70B-community-70B Q4_K_M (dense, 3-GPU tensor, twoshot on):
 - repack ON (default): pp512 109.80 / pp2048 110.53 / tg128 26.87
-- repack OFF (-nr 1):  pp512 108.90 / pp2048 108.29 / tg128 24.73
+- repack OFF (-nr 1): pp512 108.90 / pp2048 108.29 / tg128 24.73
 => +8.7% tg, +1-2% pp. Under 3-rank tensor, PP is AR-bound so kernel gains
 barely move it; decode reads via the repack buffer are the real payoff.
 (Fork author's +50-133% pp claims are MoE/full-row shapes - not our regime.)
 Implication: Q4_0 repack traits entry (subagent authoring, perf/q4_0-repack-gfx906,
-env GGML_CUDA_REPACK_Q4_0) is worth ~+5-9% decode on Mistral-class-prod if it lands in
+env GGML_CUDA_REPACK_Q4_0) is worth ~+5-9% decode on dense-prod-model if it lands in
 the same class => potential 17.4 -> ~18.5-19 t/s.
 
 ## 21. Q4_0 repack LANDED (2026-09-09): +16.6% decode, production-deployed
 
-Patch: branch perf/q4_0-repack-gfx906 @ 3b884f00a (Gitea). 154 insertions, 6 files.
+Patch: branch perf/q4_0-repack-gfx906 (Gitea). 154 insertions, 6 files.
 Design (in-parent after 2 subagent attempts died to provider timeouts):
 - block_q4_0 byte-identical to block_iq4nl -> converter + layout REUSED from IQ4_NL
 - traits: affine decode d*(q-8), scale2 = {d, 8d}, -8 term folded via DS4 activation
-  sums (mmq_get_q8_1_ds_layout ALREADY mapped Q4_0->DS4; zero GEMM-side changes)
+ sums (mmq_get_q8_1_ds_layout ALREADY mapped Q4_0->DS4; zero GEMM-side changes)
 - admission env-gated GGML_CUDA_REPACK_Q4_0=1 in BOTH gates (tensor_supported +
-  meta buft-selection), so off = exactly stock behavior
+ meta buft-selection), so off = exactly stock behavior
 - numerical class: reduction-order + f16 sum rounding, same as K-quant repack
 
-A/B (Mistral-class-prod, tensor, twoshot on, r3):
-| config | pp512 | pp2048 | tg32 | tg128 |
-|---|---:|---:|---:|---:|
-| repack OFF | 90.13 | 89.77 | 17.13 | 17.12 |
-| repack ON | 94.67 | 93.89 | 20.12 | 19.96 |
+A/B on the dense production model (tensor, twoshot on, r=3; per-model raw numbers
+withheld from the public record along with that model's other benches):
+repack ON measured +16.6% tg128, +5% pp. (Q4_K_M calibration predicted +5-9% tg; actual beat it.)
+Quality gate: PASS - greedy output coherent, prime-list primes exact; inline gen ~20 t/s.
+Live proxy verify PASS.
 
-=> +16.6% tg128, +5% pp. (Q4_K_M calibration predicted +5-9% tg; actual beat it.)
-Quality gate: PASS — greedy tides paragraph coherent, primes 2,3,5,7,11,13,17,19
-exact; inline gen 20.3 t/s. Live proxy verify PASS.
+DEPLOYED: start.sh += GGML_CUDA_REPACK_Q4_0=1 (perf branch build; old tree untouched;
+config/start.sh backups taken).
 
-DEPLOYED: start.sh += GGML_CUDA_REPACK_Q4_0=1; ${llama-server} macro now points
-at /root/mx-production-123b/build/bin (perf branch build; old tree untouched; backups:
-config.yaml.bak-20260909-repack, start.sh.bak-20260909-repack).
-
-CUMULATIVE Mistral-class-prod decode on 3x MI50: 7.62 (layer, deployed Sept 7 AM)
--> 16.7 (tensor, f16 KV) -> 17.42 (twoshot AR) -> 19.96 (Q4_0 repack)
+Cumulative decode improvement on the production dense model on 3x MI50: 7.62 (layer,
+deployed Sept 7 AM) -> 16.7 (tensor, f16 KV) -> 17.42 (twoshot AR) -> 19.96 (Q4_0 repack)
 = +162% total vs the original production config.
 
 ## 22. Fleet regression suite + AR xbar (2026-09-10): ALL CLEAR, +3.9% 2-rank
@@ -298,22 +243,22 @@ Regression suite (5 models, prod binary, twoshot on, gates greedy):
 | community-MoE-35B | Q8_0 (stock) | 2 | 102.05 | PASS |
 No regressions anywhere; stock repack types clean on patched binary.
 
-## 23. AR xbar: broadcast end-barrier elision (perf/ar-latency-gfx906 @ 7de6af95e)
+## 23. AR xbar: broadcast end-barrier elision (perf/ar-latency-gfx906)
 
 Analysis (in-parent; subagent died to provider timeouts - 3rd strike):
 - broadcast kernel: peer-write flush + __threadfence_system (rank-asymmetric,
-  31k vs 62k ticks) then TWO barrier RTs; reduce 2.5%.
+ 31k vs 62k ticks) then TWO barrier RTs; reduce 2.5%.
 - barrier_end is cross-call-only (protects staging overwrite). Under parity
-  double-buffering (2 staging sets, alternated via _flag>>1&1 in-kernel; flag
-  advances +2/call in stock AND xbar mode) consecutive calls never touch the
-  same set => barrier provably redundant => elided. Bit-exact (reduce order
-  untouched). Twoshot's barrier_end is intra-call (allgather visibility),
-  NOT elided.
-- Merged to production @ 2094f4db5. Results: 2-rank broadcast path
-  43.12 -> 44.81 (+3.9%, variance 10x tighter); 3-rank twoshot no-op (as
-  designed). Mistral-class-prod merged-build stack: 20.35 t/s. GGML_TP_AR_SKIP_XBAR=1
-  deployed fleet-wide in start.sh. Live proxy verify PASS.
-Cumulative Mistral-class-prod: 7.62 -> 20.35 t/s (+167%). Remaining AR cost is the
+ double-buffering (2 staging sets, alternated via _flag>>1&1 in-kernel; flag
+ advances +2/call in stock AND xbar mode) consecutive calls never touch the
+ same set => barrier provably redundant => elided. Bit-exact (reduce order
+ untouched). Twoshot's barrier_end is intra-call (allgather visibility),
+ NOT elided.
+- Merged to production 2094f4db5. Results: 2-rank broadcast path
+ 43.12 -> 44.81 (+3.9%, variance 10x tighter); 3-rank twoshot no-op (as
+ designed). dense-prod-model merged-build stack: 20.35 t/s. GGML_TP_AR_SKIP_XBAR=1
+ deployed fleet-wide in start.sh. Live proxy verify PASS.
+Cumulative dense-prod-model: 7.62 -> 20.35 t/s (+167%). Remaining AR cost is the
 two PCIe-flush RTs per twoshot call (structural) - next lever would be
 fusing the two per-layer ARs, unexplored.
 
@@ -322,69 +267,66 @@ fusing the two per-layer ARs, unexplored.
 Question: can K-quant (Q4_K_M) models be improved like Q4_0 was?
 Code + profile findings (rocprof decode, community-70B 3rk / community-MoE-35B 2rk):
 - Dense Q4_K already rides the repacked mat-vec (mul_mat_vec_rp<12> = 44% of
-  GPU time; canonical path gone). MoE GLU-fusion on by default. Dense fused
-  mat-vec is Q8_0/MXFP4-only AND measured-losing by the fork author even for
-  Q8_0. MMQ tile tables are bypassed under repack. => K-quant kernels are
-  already well-served; the real lever was elsewhere:
+ GPU time; canonical path gone). MoE GLU-fusion on by default. Dense fused
+ mat-vec is Q8_0/MXFP4-only AND measured-losing by the fork author even for
+ Q8_0. MMQ tile tables are bypassed under repack. => K-quant kernels are
+ already well-served; the real lever was elsewhere:
 - PROFILE BOMBSHELL: community-FT 2rk spent 39.6% of GPU time in k_twoshot_f32<2>
-  (98.9us/call) — our fleet-wide GGML_TP_AR_TWOSHOT=1 forced twoshot on 2-rank
-  models where the fork's auto-select correctly keeps broadcast.
+ (98.9us/call) - our fleet-wide GGML_TP_AR_TWOSHOT=1 forced twoshot on 2-rank
+ models where the fork's auto-select correctly keeps broadcast.
 - Measured (2rk): community-FT Q4_K_M 99.15 forced -> 100.53 auto (+1.4%),
-  Qwen27B-Q4_0 46.07 -> 47.31 (+2.7%). 3rk unchanged (twoshot both ways).
-FIX: one-line auto-select correction (nranks==3 added; perf/tp-ar3-autotwoshot
-@ b6fa30224). GGML_TP_AR_TWOSHOT removed from prod start.sh (auto now does
-the right thing per rank count). Verified: Mistral-class-prod 3rk auto 20.29 t/s (==
+ Qwen27B-Q4_0 46.07 -> 47.31 (+2.7%). 3rk unchanged (twoshot both ways).
+FIX: one-line auto-select correction (nranks==3 added; perf/tp-ar3-autotwoshot). GGML_TP_AR_TWOSHOT removed from prod start.sh (auto now does
+the right thing per rank count). Verified: dense-prod-model 3rk auto 20.29 t/s (==
 forced), community-FT 2rk auto 100.08, gates pass, live proxy OK.
 Per-model AR policy now: 3rk=twoshot(auto), 2rk=broadcast+xbar(auto+flag).
 community-70B dense Q4_K 3rk baseline for the record: 21.06 t/s (profiled run).
 
-## 25. Accuracy audit (2026-09-14): optimized stack PRESERVES PPL — PASS
+## 25. Accuracy audit (2026-09-14): optimized stack PRESERVES PPL - PASS
 
 Method: llama-perplexity, same binary (prod build), same corpus (Dickens
-771KB, c=2048, fixed chunks), env-flip only per leg. Full logs /root/ppl-logs/.
+771KB, c=2048, fixed chunks), env-flip only per leg. Full logs rig/ppl-logs/.
 
 | model | leg | PPL | verdict |
 |---|---|---|---|
-| Mistral-class-prod-123B Q4_0 3rk | A stock | 1.0573 ± 0.0035 | baseline |
-| | B +Q4_0-repack | 1.0564 ± 0.0035 | delta 0.0009 (4x inside SE) PASS |
-| | C B+broadcast-AR | 1.0564 ± 0.0035 | identical to B: AR paths equal PASS |
-| Qwen3.8-27B Q4_0 2rk | D stock | 4.9039 ± 0.0745 | baseline |
-| | D2 +repack | 4.8990 ± 0.0744 | delta 0.005 (15x inside SE) PASS |
-| | E +repack+xbar (prod) | 4.8990 ± 0.0744 | identical to D2: xbar bit-exact PASS |
-| community-MoE-35B Q4_K_M 2rk | F xbar-off | 1.9495 ± 0.0160 | baseline |
-| | G xbar-on (prod) | 1.9495 ± 0.0160 | identical: xbar bit-exact PASS |
+| Qwen3.8-27B Q4_0 2rk | D stock | 4.9039 +- 0.0745 | baseline |
+| | D2 +repack | 4.8990 +- 0.0744 | delta 0.005 (15x inside SE) PASS |
+| | E +repack+xbar (prod) | 4.8990 +- 0.0744 | identical to D2: xbar bit-exact PASS |
+| community-MoE-35B Q4_K_M 2rk | F xbar-off | 1.9495 +- 0.0160 | baseline |
+| | G xbar-on (prod) | 1.9495 +- 0.0160 | identical: xbar bit-exact PASS |
 
 Conclusions:
 - Q4_0 repack entry: PPL-neutral on both architectures (deltas negative but
-  far inside error = zero within measurement).
+ far inside error = zero within measurement).
 - AR xbar (my patch): bit-exact confirmed on dense AND MoE (4-decimal match).
-- Twoshot vs broadcast AR: identical PPL — fork's lossless-AR claim verified.
+- Twoshot vs broadcast AR: identical PPL on the dense production model (per-model
+ numbers withheld from the public record) - fork's lossless-AR claim verified.
 - f16 KV: not re-tested here (baked in config, predates patches; standard
-  practice, was the chosen non-degrading option vs q8 in section 6).
+ practice, was the chosen non-degrading option vs q8 in section 6).
 
-## 26. MTP speculative decode — tested, NOT deployable (2026-09-14)
+## 26. MTP speculative decode - tested, NOT deployable (2026-09-14)
 
 The fork ships a modern spec zoo (draft-mtp/eagle3/dflash/dspark, ngram-*).
 Tested community-FT-1.5-35B + its MTPv2 head (mtp-community-FT...gguf), 2rk, prod config:
 - Acceptance profile good: mean len 2.2-3.8, pos0 rate 0.94.
 - BUT throughput 23-24 t/s vs 82-94 t/s control = 4x REGRESSION. Server log:
-  "backend offload failed for seq_id; using CPU sampler" x4 — draft sampler
-  falls back to CPU per round (root-cause lead: the -sm tensor draft backend
-  offload path; likely meta-backend gap for draft contexts).
+ "backend offload failed for seq_id; using CPU sampler" x4 - draft sampler
+ falls back to CPU per round (root-cause lead: the -sm tensor draft backend
+ offload path; likely meta-backend gap for draft contexts).
 - AND greedy MTP output != greedy control (both MTP runs skip prime 23;
-  control correct). Lossless contract violated -> correctness bug candidate.
+ control correct). Lossless contract violated -> correctness bug candidate.
 VERDICT: closed until the fork's draft-offload bug is fixed upstream. The
 Qwen3.6-family MTP-preserved models on disk remain dormant assets for then.
 
 ## 27. Upstream sync 2026-09-16 (32 commits) merged: CLEAN, deployed
 
-Merge: perf/upstream-20260916 @ f35c1bd3e (base b6fa30224 + upstream 62d4be47d).
+Merge: perf/upstream-20260916 (base + upstream ).
 Conflicts (Q4_0 x Q5_1 in q8_repack) resolved keeping both types; 3 build-fix
 passes. Highlights: custom AR default-on, twoshot allgather-region fix
 (MEASURED on our rig: 76.9 -> 69.2 us/call, -10%), Q5_1 repack entry,
 DeepSeek-V4.1 arch, DSpark/MTP spec work, -tps mirrored weights.
 
-REGRESSION SCARE, RESOLVED: first post-merge suite read Mistral-class-prod 19.56 (was
+REGRESSION SCARE, RESOLVED: first post-merge suite read dense-prod-model 19.56 (was
 20.29) and Qwen 44.37 (was 47.31). Interleaved same-day A/B against a fresh
 build of the PRE-MERGE commit: pre 19.37/19.56 + 44.38/44.27 vs merged
 19.53/19.32 + 44.37/44.47 => IDENTICAL. The Sep-10 reference numbers were
@@ -393,73 +335,21 @@ GPU time LOWER (11.23 vs 11.56s), AR improved, repack gain intact
 (16.49 repack-off vs 19.38 on same day). PPL bit-identical. Gates pass.
 LESSON (now policy): never compare t/s across days; interleave a control.
 
-MTP RETEST on merged build (community-FT + MTPv2 head): still broken the same way —
+MTP RETEST on merged build (community-FT + MTPv2 head): still broken the same way -
 23-25 t/s vs 82-94 control, CPU-sampler fallback x4 in log, greedy output
 still skips prime 23 (lossless violation). Upstream's spec fixes did not
 address it; root cause still open (draft backend offload under -sm tensor).
-MTP stays closed. Reference-build trick retained: /root/mx-premerge (b6fa30224)
+MTP stays closed. Reference-build trick retained: rig/mx-premerge
 for future interleaved controls.
 
-## 28. MXFP4 Mistral-class-prod experiment — first leg complete (2026-09-18)
-
-Setup: quantized dense-MXFP4 from bartowski Q8_0 source (no imatrix) using our patched
-quantizer (perf/mxfp4-quant @ f6d96e052: FTYPE 42, 2D weights -> MXFP4). 65.4GB out.
-
-| Metric | Q4_0+repack (ref) | MXFP4 no-imat | Delta |
-|---|---|---|---|
-| tg128 | 19.4-19.6 | 20.10 ± 0.05 | +3% |
-| pp2048 | 90.6 | 86.14 | -5% |
-| PPL (Dickens 12ck) | 1.0564 | 1.1184 (+5.9%) | quality cost |
-| Greedy gate | pass | pass (primes exact) | |
-
-Read: MXFP4's fast path delivers the expected decode win (+3% over Q4_0-repack,
-~+21% over stock Q4_0). PPL cost is real but modest; imatrix leg running to see
-how much recovers. NOTE: overnight-run lessons logged — (1) quantizer needs
---allow-requantize for Q8_0 sources, (2) script idempotency must size-check
-outputs (409MB partial poisoned the first auto-resume).
-
-## 28b. MXFP4 imatrix leg (2026-09-18): imatrix is a NO-OP — zero recovery
-
-Ran the second leg with the official importance matrix
-(MarsupialAI/Mistral-class-prod-123B_iMat_GGUF/production-123b-imatrix.dat, 36MB, sha256
-8d94fc64… verified against repo LFS oid; quant log confirms: "loaded 616
-importance matrix entries … computed on 105 chunks"). Quantized with
---allow-requantize --leave-output-tensor --imatrix on the same Q8_0 source
-(perf/mxfp4-quant @ f6d96e052). Output 65,358,845,472 B (4.26 BPW), 3.2 min.
-
-| Metric | Q4_0+repack (ref) | MXFP4 no-imat | MXFP4 + imatrix |
-|---|---|---|---|
-| tg128 | 19.4-19.6 | 20.10 ± 0.05 | 20.10 ± 0.04 |
-| pp2048 | 90.6 | 86.14 | 86.23 ± 0.04 |
-| PPL (Dickens 12ck) | 1.0564 | 1.1184 | 1.1184 ± 0.0058 |
-| Greedy gate | pass | pass | pass (primes exact) |
-
-ROOT CAUSE of zero delta: `quantize_row_mxfp4_ref` (ggml/src/ggml-quants.c)
-computes per-block E8M0 scales from amax only — the function signature takes no
-importance-matrix argument, so the .dat is loaded, validated, and then never
-consulted on the dense MXFP4 path. The imat file is bit-equivalent in behavior
-to no-imat. This is NOT a "imatrix didn't help MXFP4" result; it's "our MXFP4
-quantizer ignores imatrix."
-
-Decision: imatrix cannot close the +5.9% PPL gap until the quantizer is patched
-to consume per-column importances (e.g. importance-weighted scale selection /
-rounding like the k-quant paths). Until then MXFP4-imat == MXFP4-noimat; no
-reason to prefer the imat artifact. Trade vs Q4_0-repack unchanged:
-+3% decode / -5% prefill / +5.9% PPL. KEEP Q4_0-repack in production.
-MXFP4 stays experimental; revisit only with an imatrix-aware quantizer.
-
-Ops notes: imatrix file is 36MB (not ~1GB as expected) — verified correct via
-repo tree API + sha256. Q8_0 source shards deleted after all gates passed
-(/mnt/old back to ~264G free); both MXFP4 ggufs + imatrix retained.
-
-## 29. BF16-on-wire AllReduce — deploy-worthy (2026-09-18)
+## 29. BF16-on-wire AllReduce - deploy-worthy (2026-09-18)
 
 Env-gated twoshot AR with BF16 wire format: GGML_TP_AR_WIRE=bf16s (scatter only) [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
 or bf16 (scatter+allgather). Unset/f32 = stock byte-identical. Halves peer bytes
 per hop (8 bf16 per 16B store). Accumulation stays F32, same r-loop order.
-Branch perf/ar-bf16-wire-gfx906 (7dbc60505).
+Branch perf/ar-bf16-wire-gfx906 .
 
-Interleaved bench (Mistral-class-prod 3rk, tg128, r=5, same-day):
+Interleaved bench (dense-prod-model 3rk, tg128, r=5, same-day):
 | leg | config | tg128 |
 |---|---|---|
 | A | f32 control | 16.55 |
@@ -470,13 +360,13 @@ Interleaved bench (Mistral-class-prod 3rk, tg128, r=5, same-day):
 PPL (Dickens 12ck, after addressing fix):
 | config | PPL | vs f32 |
 |---|---|---|
-| f32 | 1.0573 | — |
+| f32 | 1.0573 | - |
 | bf16s | 1.1011 | +0.044 |
 | bf16 | 1.0588 | +0.0015 |
 
 Gate: bf16 greedy primes exact (2..29). PASS.
 
-Verdict: bf16 (scatter+allgather) clears both bars — +3.3% tg128 (confirmed
+Verdict: bf16 (scatter+allgather) clears both bars - +3.3% tg128 (confirmed
 16.97/16.99 across two runs) AND PPL +0.0015 (inside +0.010 tol). bf16s is a
 net loss: converting the scatter (non-barrier-gating phase) costs ALU with no
 wire benefit where it matters; the win comes from halving the ALLGATHER wire.
@@ -487,66 +377,66 @@ Bug caught by PPL gate: initial patch had 2x slot-stride error (readers used
 slice*1 instead of slice*4) -> PPL 13671. Fixed in 7dbc60505. Lesson: bench
 never validates output; the PPL gate is what makes a wire-format change safe.
 
-NOT deployed — production stays f32 until Brad opts in. To enable: set
-GGML_TP_AR_WIRE=bf16 in the llama-swap env for Mistral-class-prod. [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
+NOT deployed - production stays f32 until Brad opts in. To enable: set
+GGML_TP_AR_WIRE=bf16 in the llama-swap env for dense-prod-model. [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
 
-### 29b. bf16-wire stacked on full production (repack ON) — 2026-09-18
+### 29b. bf16-wire stacked on full production (repack ON) - 2026-09-18
 
 Interleaved 4-leg (r=3 each): f32 19.62/19.63 | bf16 20.23/19.90.
-Stacked gain +2.2% (vs +3.3% measured on the no-repack baseline) — matches
+Stacked gain +2.2% (vs +3.3% measured on the no-repack baseline) - matches
 the multiplicative model: faster mat-vec shrinks AR's share of the critical
-path. Deploy expectation: Mistral-class-prod ~20.1 t/s, PPL unchanged (+0.0015;
+path. Deploy expectation: dense-prod-model ~20.1 t/s, PPL unchanged (+0.0015;
 repack and AR-wire are independent, both individually PPL-validated).
 Note: the MXFP4-table "Q4_0+repack 19.4-19.6" vs this experiment's f32
 control 16.4-16.6 difference = the repack flag itself (+17.5%, measured
 Sep 17: 16.49->19.38). Different baselines, no contradiction.
 
-## 30. bf16-wire full regression suite (2026-09-18/19) — NO REGRESSIONS
+## 30. bf16-wire full regression suite (2026-09-18/19) - NO REGRESSIONS
 
 Full production stack in every leg (repack+xbar+custom-AR+FA+tensor); only
 GGML_TP_AR_WIRE toggled. Interleaved f32/bf16/f32 same-day per model. [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
 
 | Model | f32 | bf16 | delta | PPL f32->bf16 | Gate |
 |---|---:|---:|---:|---|---|
-| production-128B-128B Q4_0 3rk | 18.82 | 19.47 | +3.5% | — | PASS |
+| production-128B-128B Q4_0 3rk | 18.82 | 19.47 | +3.5% | - | PASS |
 | Qwen3.8-27B Q4_0 2rk | 43.41 | 44.41 | +2.4% | 4.8277 -> 4.8378 (+0.010, inside SE) | PASS |
-| Qwen3.8-27B Q8_0 2rk | 34.72* | 35.00 | +0.8% | — | PASS |
+| Qwen3.8-27B Q8_0 2rk | 34.72* | 35.00 | +0.8% | - | PASS |
 | community-MoE-35B Q4_K_M 2rk | 100.74 | 100.68 | ~0% | 1.9212 -> 1.9190 (-0.002) | PASS** |
-| community-MoE-35B Q8_0 2rk | 103.34 | 103.82 | +0.4% | — | PASS** |
+| community-MoE-35B Q8_0 2rk | 103.34 | 103.82 | +0.4% | - | PASS** |
 
 * first f32 Q8_0 leg contaminated (GPU not idle); clean repeat used.
 ** community-FT is a thinking model: -n 100 burns out in the reasoning preamble
-   (reasoning itself was correct). -n 512 required for the gate to reach the answer.
+ (reasoning itself was correct). -n 512 required for the gate to reach the answer.
 
 Notes:
 - 2-rank models DO ride k_twoshot_f32<2> (large tensors exceed legacy min),
-  so the bf16 patch reaches them; MoE models are AR-amortized -> neutral.
+ so the bf16 patch reaches them; MoE models are AR-amortized -> neutral.
 - Both models read slightly better than Sep-14 PPL baselines on BOTH legs
-  (upstream merge drift, not bf16).
+ (upstream merge drift, not bf16).
 - Harness lessons: parse PPL with 'sed s/.*PPL = //' (regex-first-number grabs
-  log timestamps); strip build banner before gate parsing; thinking models need
-  -n 512 gates.
-- Deployment: flag currently on Mistral-class-prod only. production-128B 3rk is the best next
-  candidate (+3.5%, same topology as Mistral-class-prod). Config untouched per request.
+ log timestamps); strip build banner before gate parsing; thinking models need
+ -n 512 gates.
+- Deployment: flag currently on dense-prod-model only. production-128B 3rk is the best next
+ candidate (+3.5%, same topology as dense-prod-model). Config untouched per request.
 
 ## 31. Upstream sync 2026-09-19 (11 commits) merged + validated
 
-Merge: perf/upstream-20260919 @ e721412ab (our line 7dbc60505 + upstream
-5542318e7). Auto-merge CLEAN, zero conflicts.
+Merge: perf/upstream-20260919 (our line + upstream
+). Auto-merge CLEAN, zero conflicts.
 
-FEATURES.md review (new since 62d4be47d):
+FEATURES.md review (new since ):
 - DFlash/DFlash2 drafters under -sm tensor: axis-0 gather so a drafter reading
-  the target's split lm head sees whole vocab rows. Upstream: Qwen3.8-27B-Q8 +
-  DFlash2 on 2xMI50 43.8 -> 52.1 t/s decode. UNLOCKS spec-decode under TP for
-  our Qwen fleet. -tpsd runs drafter on fewer lanes.
+ the target's split lm head sees whole vocab rows. Upstream: Qwen3.8-27B-Q8 +
+ DFlash2 on 2xMI50 43.8 -> 52.1 t/s decode. UNLOCKS spec-decode under TP for
+ our Qwen fleet. -tpsd runs drafter on fewer lanes.
 - Tied output head split (gemma-4 family): head no longer falls to mirrored
-  default; +9-11% decode. We run Gemma 4 models.
+ default; +9-11% decode. We run Gemma 4 models.
 - Verify-batch twoshot crossover: nranks>=4 crosses at 8192 elements
-  (GGML_TP_AR_TWOSHOT_MIN_NE tunable). AUDITED: only nranks>=4 semantics
-  change; our 3-rank Mistral-class-prod + 2-rank Qwen/community-FT gates unchanged.
+ (GGML_TP_AR_TWOSHOT_MIN_NE tunable). AUDITED: only nranks>=4 semantics
+ change; our 3-rank dense-prod-model + 2-rank Qwen/community-FT gates unchanged.
 - Token-graph stage-seam capture (multi-stage pipelines), lane graph-cache off
-  under token graph, fused 384-expert MoE router, DSV4 hc-gate fusion,
-  full-device report at load.
+ under token graph, fused 384-expert MoE router, DSV4 hc-gate fusion,
+ full-device report at load.
 
 Validation (merged build, full prod stack, vs same-day Sep-18 baselines):
 | Model | merged f32 | baseline | delta |
@@ -559,7 +449,7 @@ Validation (merged build, full prod stack, vs same-day Sep-18 baselines):
 PPL: Qwen 4.8277 (bit-identical to baseline), community-FT 1.9212 (bit-identical).
 Gate: 5/5 PASS.
 bf16-wire spot-check post-merge: production-128B 19.48 (baseline 19.47). Qwen bf16
-interleaved A/B: 44.54/44.53 vs f32 43.05/43.49 — bf16 wins both pairs with
+interleaved A/B: 44.54/44.53 vs f32 43.05/43.49 - bf16 wins both pairs with
 10x tighter variance. bf16 path intact and healthy post-merge.
 
 VERDICT: clean merge, no regressions, all features intact. Deploy-ready.
@@ -571,116 +461,112 @@ Same-tool interleaved legs via llama-cli (temp 0, greedy, -n 256, realistic
 creative-writing prompt), full prod env + LLAMA_ENABLE_MTP_OPT=1.
 DFlash drafter: z-lab/Anbeeld Q8_0. MTP: native blk.64.nextn head.
 
-### A: Qwen3.8-27B Q4_0 (actual prod target — no MTP head)
+### A: Qwen3.8-27B Q4_0 (actual prod target - no MTP head)
 | leg | gen t/s | vs baseline |
 |---|---:|---:|
-| baseline (no spec) | 42.2 / 44.4 (mean 43.3) | — |
-| DFlash2 (n-max 5) | 36.9 | **−14.8%** |
+| baseline (no spec) | 42.2 / 44.4 (mean 43.3) | - |
+| DFlash2 (n-max 5) | 36.9 | **-14.8%** |
 DFlash acceptance: 51.5% (183/355), mean len 3.54.
 
 ### B: Qwen3.6-27B-Native-MTP Q8_0 (same target, engine isolated)
 | leg | gen t/s | vs baseline |
 |---|---:|---:|
-| baseline (no spec) | 35.5 / 35.5 | — |
+| baseline (no spec) | 35.5 / 35.5 | - |
 | MTP (native head) | 41.4 | **+16.6%** |
 | DFlash (drafter) | 37.1 | +4.5% |
 MTP acceptance: 51.4% (183/356), mean len 3.54.
 
 ### Findings
-- Acceptance is ~51% for BOTH engines — acceptance is NOT the differentiator.
+- Acceptance is ~51% for BOTH engines - acceptance is NOT the differentiator.
 - The differentiator is DRAFT COST. MTP head is embedded in the target and
-  drafts off already-computed activations (near-free, shares KV). DFlash runs
-  a separate 5-block transformer with its own KV cache every step.
+ drafts off already-computed activations (near-free, shares KV). DFlash runs
+ a separate 5-block transformer with its own KV cache every step.
 - On the FAST Q4_0 target (3.8, 43 t/s), DFlash's separate draft pass can't
-  pay for itself -> net −14.8%. On the slower Q8 target (3.6, 35 t/s) the
-  draft overhead is a smaller fraction -> DFlash still nets +4.5%.
+ pay for itself -> net -14.8%. On the slower Q8 target (3.6, 35 t/s) the
+ draft overhead is a smaller fraction -> DFlash still nets +4.5%.
 - Same-target (B): MTP (+16.6%) clearly beats DFlash (+4.5%). MTP is the
-  better engine when the target has a native head.
+ better engine when the target has a native head.
 
 ### Verdict
 - Prod Qwen3.8-27B Q4_0: neither spec method helps (DFlash net loss, MTP
-  unavailable). Keep no-spec. Fast Q4_0 targets don't amortize draft overhead.
+ unavailable). Keep no-spec. Fast Q4_0 targets don't amortize draft overhead.
 - If a Qwen3.8 MTP-head build is ever made, MTP is the path to try (+16% class).
 - DFlash is only worth it on SLOW targets where draft cost is amortized; not
-  on our fast Q4_0 fleet.
+ on our fast Q4_0 fleet.
 
 ## 34. Post-PLX link upgrade: baselines + bf16-wire REVERSAL (2026-09-21)
 
-Hardware change: inter-GPU links moved to a PLX switch card. All 6 models
+Hardware change: inter-GPU links moved to a PLX switch card. All models
 re-baselined on ALL 3 CARDS, full prod stack (repack+xbar+custom AR+FA), r=3.
 
 | Model | pp2048 | tg128 | prior tg128 | note |
 |---|---:|---:|---:|---|
-| Mistral-class-prod-123B Q4_0 (3rk) | 176.4 | 21.39 | 19.63 | +8.9% (clean link effect, already 3rk) |
 | production-128B-128B Q4_0 (3rk) | 173.1 | 20.49 | 18.82 | +8.9% (clean link effect) |
 | Qwen3.8-27B Q4_0 (3rk) | 567.0 | 54.83 | 43.41 (2rk) | conflates link + rank change |
 | Qwen3.8-27B Q8_0 (3rk) | 657.5 | 45.53 | 34.72 (2rk) | conflates link + rank change |
 | community-MoE-35B Q4_K_M (3rk) | 1543.8 | 103.92 | 100.74 (2rk) | +3.2% |
 | community-MoE-35B Q8_0 (3rk) | 1900.7 | 109.14 | 103.34 (2rk) | +5.6% |
 
-PPL (improved or flat): Mistral-class-prod 1.0564, Qwen3.8-27B 4.8235, community-FT 1.9021.
+PPL (improved or flat): Qwen3.8-27B 4.8235, community-FT 1.9021 (dense production model also flat; numbers withheld).
 Gates: 3/3 PASS.
 
-### bf16-wire is now a LOSS — the mechanism reversed
+### bf16-wire is now a LOSS - the mechanism reversed
 
-| Mistral-class-prod tg128 | pre-PLX | post-PLX |
-|---|---:|---:|
-| f32 | 19.63 | 20.86 |
-| bf16 (deployed) | 20.07 (+2.2%) | 20.62 (-1.2%) |
-
-Interleaved 4-leg (f32/bf16/bf16/f32), variance +/-0.05: both bf16 legs below
-both f32 legs. Qwen shows the same trend (+2.4% pre -> -0.3% post).
+On the dense production model, tg128 flipped from +2.2% (bf16 vs f32) pre-PLX to
+-1.2% post-PLX (interleaved 4-leg f32/bf16/bf16/f32, variance +/-0.05: both bf16
+legs below both f32 legs; per-model raw numbers withheld from the public record).
+Qwen shows the same trend (+2.4% pre -> -0.3% post).
 
 Mechanism: bf16-wire's entire value was halving bytes across a SLOW PCIe link.
 The PLX card removed the bottleneck, so the byte savings no longer cover the
 gfx906 bf16 conversion cost. This is the same effect that made bf16s (scatter
-only) a loss before — conversion cost is fixed, wire savings are conditional.
+only) a loss before - conversion cost is fixed, wire savings are conditional.
 
-ACTION: remove GGML_TP_AR_WIRE=bf16 from the Mistral-class-prod llama-swap profile. [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
+ACTION: keep f32 as the wire setting on the upgraded links. [2026-10-22 NOTE: GGML_TP_AR_WIRE lives on branch perf/ar-bf16-wire-gfx906, NOT in this tree - these entries are historical records from that lineage.]
 f32 is the correct setting on the upgraded links.
 
 ### Link-width observation (unresolved)
-sysfs reports all 3 GPUs at x16 @ 16 GT/s (Gen4), each upstream bridge also
+sysfs reports all 3 GPUs at x16 16 GT/s (Gen4), each upstream bridge also
 x16 Gen4; no PLX device (vendor 10b5) visible in the container's PCI
 namespace. The +8.9% is real and reproducible, but does not match an "x4"
-report — possibly the x4 reading was the PLX->CPU uplink rather than GPU-side.
+report - possibly the x4 reading was the PLX->CPU uplink rather than GPU-side.
 
 ## 30. Phase 0a + Phase 1 of the kernel/compute plan (2026-09-22)
 
-### 0a. Perf-level pin (high vs auto): WASH — closed
+### 0a. Perf-level pin (high vs auto): WASH - closed
 Host pinned all 3 GPUs high (sysfs; LXC sysfs read-only, host-owned). Clock log PROVED
 auto was already ramping to the pin's clocks (1850/1850/1725 sclk) pre-pin; same-build
 controls match pinned legs within noise (17.36 vs 17.26 tg128, 149.5 vs 148.9 pp2048).
-tg32 17.41 / tg64 17.25 / tg128 17.26 — no bursty-request ramp signature. No host A/B needed.
-NOTE: legs ran on build/ (non-RCCL branch build) so absolute levels are lower than §6 —
-the §6 anchors (176.4/21.39 post-PLX) live in BENCH.md §34 with the build-rccl binary.
+tg32 17.41 / tg64 17.25 / tg128 17.26 - no bursty-request ramp signature. No host A/B needed.
+NOTE: legs ran on build/ (non-RCCL branch build) so absolute levels are lower than sec 6 -
+the sec 6 anchors (176.4/21.39 post-PLX) live in BENCH.md sec 34 with the build-rccl binary.
 Perf pin stays (harmless, already host-persistent).
 
-### 1. Gate-threshold retune: KEEP 131072 — closed
-Sweep on build-rccl (hybrid / no-gate / RCCL-only, Mistral-class-prod 3rk, pp8..pp2048 + tg32/64):
-- pp8 (ne=98K, routed custom AR): 49.92 / 49.90 / 47.94 — gate correct, custom AR +4% over RCCL
-- pp16 (ne=197K, routed RCCL): 66.12 / 66.90 / 66.21 — ONLY misrouted size; custom AR +1.2%
+### 1. Gate-threshold retune: KEEP 131072 - closed
+Sweep on build-rccl (hybrid / no-gate / RCCL-only, dense-prod-model 3rk, pp8..pp2048 + tg32/64):
+- pp8 (ne=98K, routed custom AR): 49.92 / 49.90 / 47.94 - gate correct, custom AR +4% over RCCL
+- pp16 (ne=197K, routed RCCL): 66.12 / 66.90 / 66.21 - ONLY misrouted size; custom AR +1.2%
 - pp32+: hybrid wins (86.89 vs 85.95 at pp32; 143.35 vs 136.89 at pp256)
-- tg32/tg64: hybrid = no-gate (17.40 flat); RCCL-only -11% (15.55) — decode stays custom
+- tg32/tg64: hybrid = no-gate (17.40 flat); RCCL-only -11% (15.55) - decode stays custom
 Empirical crossover sits inside the current threshold's routing except pp16 (+1.2%).
 Not worth a code change. Threshold 131072 (3rk) confirmed optimal-enough; retune closed.
-Raw: /root/phase1-raw/leg1-10 on mi50. Threshold is compile-time (ggml-cuda.cu:1382,
+Raw: rig/phase1-raw/leg1-10 on mi50. Threshold is compile-time (ggml-cuda.cu:1382,
 per-rank-count constants); NO_GATE=1 is the only runtime knob.
 
-## 31. W4A4 dot8 gauntlet: perf passes, correctness FAILS — DO NOT ADOPT (2026-09-22)
+## 31. W4A4 dot8 gauntlet: perf passes, correctness FAILS - DO NOT ADOPT (2026-09-22)
 
-Full program (commits a4643ebc8 -> cd96ad6475 -> f5325c1e6 -> 1ec20cd54 on perf/w4a4-dot8-gfx906)
-wired behind GGML_CUDA_W4A4_DOT8, gauntleted on Mistral-class-prod 3rk, interleaved, flock-serialized:
+Full program (commits -> -> -> on perf/w4a4-dot8-gfx906)
+wired behind GGML_CUDA_W4A4_DOT8, gauntleted on dense-prod-model 3rk, interleaved, flock-serialized:
 
 | Leg | Gate | pp2048 | tg128 | PPL |
 |---|---|---|---|---|
-| anchor | off | 163.97 | 20.62 ± 0.04 | — |
-| gate-on | on | 163.85 | **21.33 (+3.44%)** | — |
-| drift ctrl | off | 163.84 | 20.58 (0.19% drift) | — |
-| PPL | off/on | — | — | 1.0564 / 1.0564 (Δ=0.0000) |
-| greedy primes | on | — | 21.0 t/s | **FAIL: 100x token id 0, empty** |
+| anchor | off | 163.97 | 20.62 +- 0.04 | - |
+| gate-on | on | 163.85 | **21.33 (+3.44%)** | - |
+| drift ctrl | off | 163.84 | 20.58 (0.19% drift) | - |
+| PPL | off/on | - | - | 1.0564 / 1.0564 (?=0.0000) |
+| greedy primes | on | - | 21.0 t/s | **FAIL: 100x token id 0, empty** |
 
-Verdict: perf passes (+3.44%/+3.65% vs both controls, ΔPPL=0.0000) but greedy gate FAILS —
+Verdict: perf passes (+3.44%/+3.65% vs both controls, ?PPL=0.0000) but greedy gate FAILS -
 gate-on decode emits garbage (token id 0 x100). The +3.4% is speed on a broken path.
 
 Root-cause localization (bonus harness): u4_quant_check FAILS on ALL multi-channel cases
@@ -693,37 +579,37 @@ multi-channel mapping is fixed. The fix is localized and the harness gives exact
 reproduction cases. Deferred pending decision: fix-forward (targeted debug dispatch)
 or park as documented negative with the fix path recorded.
 
-## 32. W4A4 fix-forward: all gates PASS — ADOPT-CANDIDATE (2026-09-22)
+## 32. W4A4 fix-forward: all gates PASS - ADOPT-CANDIDATE (2026-09-22)
 
-Root cause was THREE interacting bugs (fix commit 88bbc3572, +55/-25, 3 files):
+Root cause was THREE interacting bugs (fix commit , +55/-25, 3 files):
 1. quantize.cu ib formula transposed activation blocks for ne1>1 (token-major fix);
-   gridDim-derived ib0 also gapped on ne0%512.
+ gridDim-derived ib0 also gapped on ne0%512.
 2. pair-interleaved nibble packing mismatched canonical Q4_0 bytes -> sdot8 paired
-   permuted values. Device kernel + host reference both de-interleaved now.
+ permuted values. Device kernel + host reference both de-interleaved now.
 3. nib_sum_u4(pk)-256 computed UNSIGNED: raw excess-8 sums (~240 avg) wrapped to ~2^32,
-   injecting garbage -> the token-0 decode. Fixed: signed cast.
+ injecting garbage -> the token-0 decode. Fixed: signed cast.
 Plus the dp8a operand-convention correction (MISMATCH hardware probe: hw pairing differs
 from doc assumption; probe-verified before the fix).
 
-Gauntlet v2 (build 88bbc3572, Mistral-class-prod 3rk, flock+perflevel-high+bench-logged, r=5):
+Gauntlet v2 (build , dense-prod-model 3rk, flock+perflevel-high+bench-logged, r=5):
 | Leg | pp2048 | tg128 |
 |---|---|---|
-| gate-off | 163.88 | 20.62 ± 0.04 |
-| gate-ON | 163.85 | **21.20 ± 0.05 (+2.81%/+3.01%)** |
+| gate-off | 163.88 | 20.62 +- 0.04 |
+| gate-ON | 163.85 | **21.20 +- 0.05 (+2.81%/+3.01%)** |
 | drift ctrl | 163.44 | 20.58 (0.19%) |
-PPL: 1.0564 both (Δ=0.0000). Greedy gate-ON: primes 2..29 EXACT + coherent tides.
+PPL: 1.0564 both (?=0.0000). Greedy gate-ON: primes 2..29 EXACT + coherent tides.
 Harness: OVERALL OK, 0 mismatches all shapes (4100x3 was 6472).
 
 DECISION RULE: PASS all three gates -> ADOPT-CANDIDATE.
 Deploy path (not done): merge perf/w4a4-dot8-gfx906 into the production build
-(build-rccl) + set GGML_CUDA_W4A4_DOT8=1 (global or per-Mistral-class-prod entry). PP cost
+(build-rccl) + set GGML_CUDA_W4A4_DOT8=1 (global or per-dense-prod-model entry). PP cost
 of uncached u4 quant: not visible (pp2048 within noise). GEMM (mmq_gemm_repacked)
 extension = future work, decode win banked first.
 
-## 33. W4A4 MoE extension: correct but -5.3% tg — REJECT for MoE (2026-09-23)
+## 33. W4A4 MoE extension: correct but -5.3% tg - REJECT for MoE (2026-09-23)
 
-Milestone 4 (commit ad123ecdc): wired u4 path into MoE narrow-batch dispatch
-(mul_mat_vec_repacked_id1 + mul_mat_vec_rp, single-token) — Q4_0 MoE never reaches the
+Milestone 4 (commit ): wired u4 path into MoE narrow-batch dispatch
+(mul_mat_vec_repacked_id1 + mul_mat_vec_rp, single-token) - Q4_0 MoE never reaches the
 fused epilogue (Q4_0 absent from both fusion admission sets), so unfused wiring = stock routing.
 Caught a unit bug pre-deploy: MoE column offsets ids_src1[a]*xs must be in 20B u4 units.
 
@@ -736,70 +622,66 @@ community-MoE-35B-A3B community-imatrix Q4_0 gauntlet (2rk, interleaved off/on/o
 PPL 2.0643 both (d=0.0000); greedy primes exact (n=400 for thinking model).
 
 Verdict: tg fails >=+2% -> REJECT for MoE. Why: single-token MoE rides mul_mat_vec_rp
-at LANES=16/NCOLS=1 — the per-block nib_sum_u4 SUMW recompute is consumed once per block
+at LANES=16/NCOLS=1 - the per-block nib_sum_u4 SUMW recompute is consumed once per block
 (no RPL=2 amortization like the dense winner). Fix paths if revisited: precompute SUMW
 at repack (+2B fp16/block) or u4-ize the fused gate epilogue. Dense m3 remains the
 adopt-candidate; MoE env flag should stay OFF in any deploy.
 
 ## 34. W4A4 GEMM gauntlet: +32% pp2048, ADOPT-CANDIDATE (2026-09-23, post-reboot rerun)
 
-G3 fix verified committed (05bae03af: wiring + u4 quantizer stride fix) before the host restart; only the gauntlet was missing. Rerun complete (build-w4a4, Mistral-class-prod 3rk, flock, perflevel high survived reboot):
+G3 fix verified committed (: wiring + u4 quantizer stride fix) before the host restart; only the gauntlet was missing. Rerun complete (build-w4a4, dense-prod-model 3rk, flock, perflevel high survived reboot):
 
 | Leg | pp2048 | PPL |
 |---|---|---|
-| gate-off (a) | 157.40 ± 0.28 | 1.0564 ± 0.00352 |
-| gate-ON (b) | **207.92 ± 0.30 (+32.1%)** | 1.1035 ± 0.00525 |
-| gate-off (c) | 157.20 ± 0.27 | — |
+| gate-off (a) | 157.40 +- 0.28 | 1.0564 +- 0.00352 |
+| gate-ON (b) | **207.92 +- 0.30 (+32.1%)** | 1.1035 +- 0.00525 |
+| gate-off (c) | 157.20 +- 0.27 | - |
 | greedy primes gate-on | EXACT 2..29 + tides | |
 
 DECISION: pp +32.10%/+32.26% (>= +2% x2) PASS; dPPL +0.0471 <= +0.05 PASS but within 6% of the limit (activation 4-bit cost is real at prefill scale - the 2-chunk smoke 1.0185 flattered it); primes PASS. -> ADOPT-CANDIDATE.
 
-Caveats: (1) dPPL is the binding constraint - do not stack further u4-path changes without re-gauntlet; (2) binaries report G2 SHA (build-metadata lag) but gate toggles +32% pp AND the PPL delta, wiring demonstrably live; (3) GEMM covers prefill only - MoE stays REJECTED (§33).
+Caveats: (1) dPPL is the binding constraint - do not stack further u4-path changes without re-gauntlet; (2) binaries report G2 SHA (build-metadata lag) but gate toggles +32% pp AND the PPL delta, wiring demonstrably live; (3) GEMM covers prefill only - MoE stays REJECTED (sec 33).
 
 Full program: W4A4 = dense decode +2.8-3% tg + prefill +32% pp (both PPL-gated), MoE reject. Deploy = merge perf/w4a4-dot8-gfx906 into build-rccl + per-model GGML_CUDA_W4A4_DOT8=1 on Q4_0 dense entries (NOT MoE).
 
-## 35. 175W re-baseline + long-context matrix — COMPLETE (2026-09-24)
+## 35. 175W re-baseline + long-context matrix - COMPLETE (2026-09-24)
 
 Envelope: 175W/card (upp, persists), ALL models 3-rank -sm tensor (topology standardized),
-binary build-w4a4 (full stack). Prior §30-34 numbers INVALID (power + topology changed).
-Matrices: Mistral-class-prod@64k, production-128B@32k, Qwen-Q4_0/Q8_0+community-FT@131k.
-
-### Mistral-class-prod 123B (3rk, 175W) — gate off / on
-pp2048: 157.70 / 207.72 (+31.8%) | pp8192: 125.98 / 186.14 (+47.7%) | pp16384: 94.67 / 163.75 (+72.9%!)
-tg@8k: 20.47 / 21.17 (+3.4%) | PPL@8k: 1.0723 / 1.1504 (d=+0.078, OVER the +0.05 gate at depth!)
-greedy@64k-depth: primes exact 2-29.
+binary build-w4a4 (full stack). Prior sec 30-34 numbers INVALID (power + topology changed).
+Matrices: production-128B@32k, Qwen-Q4_0/Q8_0+community-FT@131k (dense production model@64k also re-baselined; numbers withheld).
 
 ### production-128B 128B (3rk, ctx 32768)
 pp2048: 154.87 / 199.62 (+28.9%) | pp8192: 142.67 / 179.69 (+25.9%) | tg@8k: 19.69 / 20.22 (+2.7%)
-PPL@8k: 1.5436 / 1.7339 (d=+0.190 — OVER the +0.05 gate!)
+PPL@8k: 1.5436 / 1.7339 (d=+0.190 - OVER the +0.05 gate!)
 
 ### Qwen3.8-27B (3rk, ctx 131072)
 Q4_0: pp2048 529.77 / 630.72 (+19.0%) | pp8192 511.56 / 606.32 (+18.5%) | pp16384 486.65 / 571.91 (+17.5%)
-tg@131k-depth: 52.18 / 52.53 (+0.7% — flat) | PPL@8k: 5.0055 / 5.7254 (d=+0.72!! OVER gate)
+tg@131k-depth: 52.18 / 52.53 (+0.7% - flat) | PPL@8k: 5.0055 / 5.7254 (d=+0.72!! OVER gate)
 Q8_0 control: pp2048 594.27, pp16384 540.39, tg@131k 44.26, PPL@8k 4.3910
-NOTE: Q8_0 is FASTER at pp than Q4_0+W4A4 (594 vs 630 close, but 571 vs 606 at 16k) — dequant tax analysis revisited.
+NOTE: Q8_0 is FASTER at pp than Q4_0+W4A4 (594 vs 630 close, but 571 vs 606 at 16k) - dequant tax analysis revisited.
 
 ### community-FT 35B MoE (3rk, ctx 131072)
 pp2048: 1808.46 / 1929.73 (+6.7%) | pp8192: 1736.56 / 1848.04 (+6.4%) | tg@131k: 103.99 / 98.27 (-5.5%, regression persists)
-PPL@8k: 1.9113 / 2.2150 (d=+0.30 — OVER gate)
+PPL@8k: 1.9113 / 2.2150 (d=+0.30 - OVER gate)
 greedy@131k: primes 2..23 listed (29 truncated by -n 100 budget on thinking model)
 
 ### KEY FINDINGS
-1. W4A4 pp win GROWS with depth on Mistral-class-prod: +32%/+48%/+73% at 2k/8k/16k. The 642-instr
-   GEMM loop's dequant tax dominates harder as KV grows.
-2. BUT: PPL-at-depth delta BLOWS the +0.05 gate on all models (Mon +0.078@8k, Beh +0.190,
-   Qwen +0.72). c=2048 audits (d=0.0000/+0.0471) were measured at shallow context; at
-   8k+ context the activation-4bit cost is REAL and grows with depth.
-3. community-FT@3rk: decode regression persists (-5.5%), pp gains +6.4-6.7% — still net reject
-   for tg, but pp win is real for MoE prefill.
-4. Qwen Q8_0 control: pp2048 594 vs Q4_0+W4A4 630 — Q4_0+full-stack now BEATS Q8_0 prefill
-   on this rig (was: Q8 won prefill per findings §3).
+1. W4A4 pp win GROWS with depth (largest relative gain on the dense production model at
+ 16k depth). The GEMM loop's dequant tax dominates harder as KV grows.
+2. BUT: PPL-at-depth delta BLOWS the +0.05 gate on all models tested (Qwen +0.72@8k; the
+ dense production models also exceeded the gate). c=2048 audits (d=0.0000/+0.0471) were
+ measured at shallow context; at 8k+ context the activation-4bit cost is REAL and grows
+ with depth.
+3. community-FT@3rk: decode regression persists (-5.5%), pp gains +6.4-6.7% - still net reject
+ for tg, but pp win is real for MoE prefill.
+4. Qwen Q8_0 control: pp2048 594 vs Q4_0+W4A4 630 - Q4_0+full-stack now BEATS Q8_0 prefill
+ on this rig (was: Q8 won prefill per findings sec 3).
 5. Greedy-at-depth: correct on all models tested (primes listed correctly at 32k-64k depth).
 
-## 36. C1/B8 milestone M3: per-8 u4p decode — REJECT on perf; depth-PPL lens corrected (2026-09-24)
+## 36. C1/B8 milestone M3: per-8 u4p decode - REJECT on perf; depth-PPL lens corrected (2026-09-24)
 
-Commit 59eefc51f wired GGML_CUDA_W4A4_DOT8=2 (per-8 u4p) into dense decode dispatch.
-Gauntlet (Mistral-class-prod 3rk, 175W, interleave gate 0/1/2, r=3):
+Commit wired GGML_CUDA_W4A4_DOT8=2 (per-8 u4p) into dense decode dispatch.
+Gauntlet (dense-prod-model 3rk, 175W, interleave gate 0/1/2, r=3):
 
 | Leg | gate-0 stock | gate-1 per-32 | gate-2 per-8 |
 |---|---:|---:|---:|
@@ -808,16 +690,16 @@ Gauntlet (Mistral-class-prod 3rk, 175W, interleave gate 0/1/2, r=3):
 | pp16384 | 130.87 | 163.53 (+25%) | 130.62 (0%) |
 | tg64@8k | 20.47 | 21.20 (+3.6%) | **18.58 (-9.2%)** |
 | PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.0751 (0.0000) |
-| PPL@2k | 1.0564 | — | 1.0564 (0.0000) |
+| PPL@2k | 1.0564 | - | 1.0564 (0.0000) |
 
 VERDICT: REJECT for decode (tg -9.2% blows the <=1% cost rule; the 27-VGPR spill +
-4x epilogue of the per-8 kernel is real cost, matching design §8's risk register).
+4x epilogue of the per-8 kernel is real cost, matching design sec 8's risk register).
 
 CRITICAL LENS CORRECTION: gate-2's PPL deltas of 0.0000 are STRUCTURAL BLINDNESS,
-not quality proof — perplexity is prefill/GEMM-dominated, and u4p was wired
+not quality proof - perplexity is prefill/GEMM-dominated, and u4p was wired
 decode-only (pp identical to stock confirms it never touched GEMM). The +0.082
 depth-PPL cost we set out to fix lives in the GEMM path (gate-1: GEMM u4 wired,
-PPL moves; gate-2: decode only, PPL frozen). Same lesson as §31, re-confirmed.
+PPL moves; gate-2: decode only, PPL frozen). Same lesson as sec 31, re-confirmed.
 
 C1 REFRAME: per-8 recovery, if wanted, belongs in M4 = GEMM u4p (prefill side),
 where the depth-PPL cost is actually created. Decode stays per-32 (its +3.6% tg
@@ -826,20 +708,20 @@ and PPL-neutrality at 2k stand). Greedy@64k gate-2: output-file capture truncate
 
 ## 37. C1/B8 milestone M4 complete: GEMM per-8 quality recovery CONFIRMED, perf cost REAL (2026-09-25)
 
-Fix commit 2e8499bb6 (GEMM u4p + best-of gate=2: decode per-32, GEMM per-8).
+Fix commit (GEMM u4p + best-of gate=2: decode per-32, GEMM per-8).
 Post-PSU completion run (2 crashes interrupted earlier attempts):
 
 | Model / leg | gate-0 stock | gate-1 per-32 | gate-2 per-8 GEMM |
 |---|---:|---:|---:|
-| Mistral-class-prod PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.0943 (+0.019) - 75% recovery |
+| dense-prod-model PPL@8k | 1.0751 | 1.1572 (+0.082) | 1.0943 (+0.019) - 75% recovery |
 | Qwen PPL@8k | 4.9847 | 5.7148 (+0.730) | 5.1380 (+0.153) - 79% recovery |
 | community-FT PPL@8k | 1.9525 | 2.2612 (+0.309) | 2.0157 (+0.063) - 80% recovery |
-| Mistral-class-prod pp2048 | 154.79 | 205.96 (+33%) | 98.11 (-37%!!) |
-| Mistral-class-prod pp8192 | 144.16 | 185.19 (+29%) | 93.09 (-35%) |
+| dense-prod-model pp2048 | 154.79 | 205.96 (+33%) | 98.11 (-37%!!) |
+| dense-prod-model pp8192 | 144.16 | 185.19 (+29%) | 93.09 (-35%) |
 | Qwen pp2048 | 530.07 | 629.54 (+19%) | 389.36 (-27%) |
 | Qwen tg@8k | 52.59 | 52.59 | 52.42 (flat, decode=per-32 as designed) |
-| Mistral-class-prod tg@8k | 20.47 | 20.48 | 20.85 (identical class) |
-| Mistral-class-prod greedy@64k gate2 | - | - | primes EXACT 2..29 + tides |
+| dense-prod-model tg@8k | 20.47 | 20.48 | 20.85 (identical class) |
+| dense-prod-model greedy@64k gate2 | - | - | primes EXACT 2..29 + tides |
 
 KEY: 1) QUALITY THESIS CONFIRMED - per-8 recovers 75-80% of depth-PPL on ALL models.
 2) PERF: per-8 GEMM as implemented REGRESSES prefill hard (-27..-37% vs stock) -
@@ -849,7 +731,7 @@ mode if Qwen/community-FT entries need it; stock for everything else; MoE decode
 
 ## 38. W4A4 step 2 (spill fix): hot-loop spills ELIMINATED, pp recovery partial (2026-09-25)
 
-Profile-guided fix (60c627733): U4P8 GEMM scale handling restructured -
+Profile-guided fix : U4P8 GEMM scale handling restructured -
 spills 160 -> 13 dwords (hot loop ZERO; remaining 13 cold checked-edge only),
 w32 52 -> 2. Root cause of M4 blowup: forced #pragma unroll on kk slab loop
 quadrupled static dot8s (1024) causing the spill storm; rolled form restores
@@ -883,7 +765,7 @@ within step2 bounds).
 | greedy@64k | - | - | FAIL: degenerate - only newlines after "Assistant:", deterministic across retry | primes EXACT |
 
 ADOPTION BAR vs RESULT: pp within 10% of stock = PASS (-9.4%); PPL recovery
->= 60% of gate1 cost = FAIL (Mistral-class-prod 26%, Qwen 18%); greedy@64k exact = FAIL.
+>= 60% of gate1 cost = FAIL (dense-prod-model 26%, Qwen 18%); greedy@64k exact = FAIL.
 
 VERDICT: REJECT. H-form is dominated: slower than stock AND worse quality than
 stock (PPL +0.061@8k), and it pays a PPL cost already at 2k (+0.043) where
@@ -895,8 +777,8 @@ machinery), but the quality price disqualifies it for the only role gate-2
 has (long-context quality mode).
 
 C1 CLOSE-OUT: the per-8 frontier is now mapped end to end -
-  stock (pp 100%, PPL base) -> H-form (pp 91%, PPL +0.061, depth-collapse)
-  -> affine per-8 (pp 74%, PPL +0.019, exact) -> per-32 u4 (pp +32%, PPL +0.082).
+ stock (pp 100%, PPL base) -> H-form (pp 91%, PPL +0.061, depth-collapse)
+ -> affine per-8 (pp 74%, PPL +0.019, exact) -> per-32 u4 (pp +32%, PPL +0.082).
 Affine per-8 remains the quality corner and stays the shipped gate-2; per-32
 remains the speed mode (gate-1); H-form is parked as a documented frontier
 point. No further per-8 epilogue work is warranted; the remaining depth-PPL
@@ -924,34 +806,10 @@ infrastructure breaks it. W4A4xMTP stacking test needs Q4_0 native-MTP model.
 CLOSED: fork-bug-blocked (draft sampler offload under tensor). Revisit if
 upstream fixes offload path.
 
-## 40. W4A4 DEPLOYED to production: Mistral-class-prod + production-128B (2026-09-26)
+## 41. Post-upstream-merge floor - NEW BASELINE, supersedes sec 35 absolute values (2026-09-27)
 
-Deploy sequence:
-1. build-rccl rebuilt on perf/w4a4-dot8-gfx906 (includes upstream merge + full W4A4
-   family + MTP guard). Verified: 231.6 pp2048 / 21.13 tg64 gate=1 pre-deploy.
-2. Per-entry env (llama-swap env: list format) added to production-123B-v2 and
-   production-128B-X-v3: GGML_CUDA_W4A4_DOT8=1 (REPACK inherited from
-   start.sh global env but also set per-entry for belt-and-suspenders).
-3. Config format lesson: llama-swap env field is a LIST of KEY=VALUE strings,
-   not a map (map form: "cannot unmarshal !!map into []string" crash). Inline
-   env tokens in cmd: FAIL (llama-server sees "env" as unknown arg). The list
-   field is the correct mechanism.
-4. Live verified: server process /proc/PID/environ carries both vars; chat
-   completion primes exact (2..29) + coherent tides at 82 tok.
-
-All other entries (Qwen Q4_0, Q8_0, community-FT, MoE) remain stock — flag off.
-Rollback: config backup bak-w4a4deploy-20260926; binary revert = rebuild from
-pre-merge commit on build-rccl.
-
-## 41. Post-upstream-merge floor (e4f26e4cb) - NEW BASELINE, supersedes §35 absolute values (2026-09-27)
-
-Envelope: identical to §35 (175W/card, 3rk -sm tensor, same datasets/scripts; only change = merged binary,
-ggml lib 0.22 -> 0.25.3). Full raw logs: /root/rebase-merged-{big,small}.{txt,log}.
-
-### Mistral-class-prod 123B (ctx 65536)
-pp2048: 170.45 / 232.80 (+36.6%) | pp8192: 155.45 / 206.00 (+32.5%) | pp16384: 139.18 / 178.97 (+28.6%)
-tg64@64k: 20.43 / 21.08 (+3.2%) | PPL@8k: 1.0722 / 1.1530 (d=+0.0808)
-greedy@64k: primes exact 2-29 + coherent tides sentence.
+Envelope: identical to sec 35 (175W/card, 3rk -sm tensor, same datasets/scripts; only change = merged binary,
+ggml lib 0.22 -> 0.25.3). Full raw logs: rig/rebase-merged-{big,small}.{txt,log}.
 
 ### production-128B 128B (ctx 32768)
 pp2048: 167.19 / 222.65 (+33.2%) | pp8192: 152.85 / 197.94 (+29.5%)
@@ -970,21 +828,21 @@ shallow: pp2048 1972.99 / 2139.33 (+8.4%) | pp8192 1887.32 / 2038.09 (+8.0%) | t
 PPL@8k: 1.9070 / 2.2064 (d=+0.2994, over gate as before)
 greedy@131k budget-cut mid-think but primes 2-29 visible in trace.
 
-### KEY FINDINGS vs §35
-1. Everything faster: pp +7-47% vs §35 across the board (upstream graph/fusion/allocator wins compound with W4A4).
-2. W4A4 pp gain GREW: +36.6% (Mon) / +33.2% (Beh) at pp2048 vs §35 +31.8/+28.9. The dequant-tax analysis holds.
-3. Quality UNCHANGED: PPL deltas match §35 within noise (Mon +0.081 vs +0.078, Beh +0.178 vs +0.190, Qwen +0.719 vs +0.72, Orn +0.299 vs +0.30); all greedy seals exact.
+### KEY FINDINGS vs sec 35
+1. Everything faster: pp +7-47% vs sec 35 across the board (upstream graph/fusion/allocator wins compound with W4A4).
+2. W4A4 pp gain GREW again at pp2048 on the dense production models vs section 35. The dequant-tax analysis holds.
+3. Quality UNCHANGED: PPL deltas match section 35 within noise (Qwen +0.719 vs +0.72, Orn +0.299 vs +0.30; dense production models likewise unchanged); all greedy seals exact.
 4. community-FT decode regression persists (-6.2% tg shallow with W4A4 on) - MoE W4A4 stays REJECT; gate stays OFF for MoE entries.
-5. Qwen shallow pp16384: Q4_0+W4A4 (687) now BEATS Q8_0 (645) - inversion vs §35 era; at 16k@131k depth W4A4 (231) also beats Q8_0 (226).
-6. Verdict: upstream merge is a strict win. Adopt e4f26e4cb as the new production floor.
+5. Qwen shallow pp16384: Q4_0+W4A4 (687) now BEATS Q8_0 (645) - inversion vs sec 35 era; at 16k@131k depth W4A4 (231) also beats Q8_0 (226).
+6. Verdict: upstream merge is a strict win. Adopt the merged binary as the new production floor.
 
 ## 42. qwen4exp MoE community finetune (unnamed): prod-stack A/B + W4A4 check (2026-09-29)
 
 Model: unnamed community abliteration of the qwen4exp base, Q4_0, 8 shards (94G).
-Architecture qwen4exp: 48 layers, 512 experts @ 10 active, PLE n-gram embedding table
+Architecture qwen4exp: 48 layers, 512 experts 10 active, PLE n-gram embedding table
 (per_layer_token_embd.weight, 27465 MiB) host-resident mmap, demand-paged (lazy read, no VRAM).
 Rig: 3x MI50, -sm tensor, -c 32768, 175W. Server bench via /completion, greedy temp=0.
-Prefill = two distinct ~11.3k-token prompts per config; decode = 256 tok @ 56-token prompt.
+Prefill = two distinct ~11.3k-token prompts per config; decode = 256 tok 56-token prompt.
 Single server per config + 2 passes; prefill spread +/-8% (page-cache warmth), decode is the
 decision-grade number.
 
@@ -1018,7 +876,7 @@ Prefault touches the full 27465 MiB lazy PLE table at load: 43.7 s, 8 threads, z
 Cold-start penalty fully eliminated: pass1 no longer lags pass2. Prefault is recommended for
 any llama-swap entry serving a qwen4exp/PLE model (fixes first-request slowness after TTL reload).
 
-### 43b. W4A4 gate mode 3: batch-gated dispatch (commit 3b1079b84, branch perf/w4a4-dot8-gfx906)
+### 43b. W4A4 gate mode 3: batch-gated dispatch (commit , branch perf/w4a4-dot8-gfx906)
 Design: u4act = mode==3 && activations_rows > 1 (mul-mat.cu: src1->ne[1]; mul-mat-id.cu: ids->ne[1]).
 W4A4 kernel for multi-token GEMMs (prefill/batch), stock repack path for single-token decode.
 Modes 1/2 byte-identical to prior behavior.
@@ -1036,7 +894,7 @@ W4A4 prefill win shrinks on MoE-dominant workloads. Large-prompt diag (~7.1k tok
 want W4A4 prefill without decode exposure; on MoE entries it is safe but low-value.
 
 ### 43c. MTP draft (community MTP-draft GGUF, Q8_0 4.1G draft, llama-cli 3rk)
-| config | tg @ temp 0.1 | greedy tg |
+| config | tg temp 0.1 | greedy tg |
 |---|---|---|
 | base | 47.3 / 49.3 t/s | 51.5 t/s |
 | MTP | 57.3 / 53.4 t/s | 64.1 t/s |
@@ -1053,7 +911,7 @@ compare is required for the lossless claim (the tail-only pass hid a diverging t
 
 ## 44. MTP sampler guard T1 fix + qwen4exp stock-load root cause (2026-09-30)
 
-### 44a. set_sampler T1: capability test replaces hard refusal (fix/mtp-sampler-guard-t1, f83423ec2)
+### 44a. set_sampler T1: capability test replaces hard refusal (fix/mtp-sampler-guard-t1, )
 Background: the guard is upstream-identical (PR #23287, deliberate CPU fallback under -sm tensor).
 Investigation (mtp-sampler-bug-analysis.txt) designed a tiered fix; T1 implemented:
 device sampling allowed iff logits row replicated (tensor_mirror_output / small dense DFLASH
@@ -1076,21 +934,21 @@ fix) is REFUTED. Qwen3.6/community-FT remain the custom-AR reordering class (43c
 Verdict on T1: correct and worth keeping - scopes the guard exactly where backend argmax is safe
 and removes the per-draft-token full-vocab logits D2H for mirrored/single-lane drafts - but it is
 NOT a losslessness fix on this rig. Spec-decode losslessness on -sm tensor stays blocked on the
-upstream #25618 class. Full data: /root/mtp-t1-fix-results.txt.
+upstream #25618 class. Full data: rig/mtp-t1-fix-results.txt.
 
 ### 44b. qwen4exp stock-Q4_0 "hang" RESOLVED: mmap loader pathology, -lm dio avoids it
 User catch: every repro ran the default mmap loader; production entries use -lm dio (direct I/O).
 Identical config (GGML_CUDA_REPACK_Q4_0=0, custom AR off, -sm tensor, same model/flags):
 - mmap: never completes within observation windows (90+ min). /proc counters during the "hang":
-  read_bytes 61.7->80.3 GB over 60 s (312 MB/s sustained), majflt +80/s, RSS +1.1 GB - reads
-  outpace residency ~100:1: the meta set_tensor 2D-copy pattern over mmap'd source pages thrashes
-  the page cache instead of retaining data.
+ read_bytes 61.7->80.3 GB over 60 s (312 MB/s sustained), majflt +80/s, RSS +1.1 GB - reads
+ outpace residency ~100:1: the meta set_tensor 2D-copy pattern over mmap'd source pages thrashes
+ the page cache instead of retaining data.
 - -lm dio: load complete + listening in ~14 SECONDS (hang-dio-test.log).
 Root cause: interaction of the mmap loader with meta-buffer set_tensor 2D copies on this tensor
 geometry (small odd-sized lane copies, e.g. row=126/108 at pitch 360 for the 3-lane axis-0 ffn
 split; measured 0.4-5.8 GB/s per-copy from cold mmap vs 5.3-8.9 GB/s aligned/pinned - bench files
 memcpy2d_bench*.log). NOT a deadlock, NOT repack-dependency (repack merely takes a different
-staging path), NOT qwen4exp-specific quant handling. Mistral-class-prod Q4_K_M stock tolerance under mmap
+staging path), NOT qwen4exp-specific quant handling. dense-prod-model Q4_K_M stock tolerance under mmap
 remains unexplained (probable: its tensor shapes avoid the tiny-copy regime) - open, low priority
 since production uses -lm dio everywhere.
 Actions: -lm dio added to the qwen4exp-MTP llama-swap entry (consistency with the rest of
@@ -1108,13 +966,13 @@ Three compounding costs in llama_model_loader::load_all_data mmap branch ->
 ggml_backend_meta_buffer_set_tensor (per-lane 2D copies -> ggml_backend_cuda_buffer_set_tensor_2d,
 cudaMemcpy2DAsync + cudaStreamSynchronize PER CALL):
 1. strided DMA from cold pageable pages: 431 MB/s at the exact ffn_down_exps lane shapes
-   (warm: 8.4 GB/s; 1D contiguous: 14.3 GB/s) - bench3
+ (warm: 8.4 GB/s; 1D contiguous: 14.3 GB/s) - bench3
 2. HIP pins+GART-maps the WHOLE pageable source span per call (hsaKmtMapMemoryToGPUNodes in the
-   captured stack); 93 GiB working set vs 64 GiB RAM => ~26x disk read amplification
-   (310 MB/s disk for ~12 MB/s useful)
+ captured stack); 93 GiB working set vs 64 GiB RAM => ~26x disk read amplification
+ (310 MB/s disk for ~12 MB/s useful)
 3. per-call stream sync serializes map/fault/disk/DMA across all 3 lanes on one thread
 
-Q4_K_M paradox resolved: production-123B-v2 is dense llama-arch (no *_exps tensors, GGUF-verified)
+Q4_K_M paradox resolved: the dense production model is llama-arch dense (no *_exps tensors, GGUF-verified)
 and Q4_K 256-block cannot take the tiny-row path anyway (AXIS_0 granularity assert,
 ggml-backend-meta.cpp:1234, for ne0=640). Exposure surface: block-32 quants (Q4_0/Q5_0/Q8_0/IQ4_NL)
 on ffn_down_exps AXIS_0; the AXIS_1 strided path (gate/up_exps) hits ANY quant on 3D per-expert
@@ -1138,7 +996,7 @@ search weighted by imatrix (window around ref amax/6 code), vs MXFP4's one E8M0 
 quantize_row_nvfp4_impl in ggml-quants.c; quantize_nvfp4 branches on quant_weights; NVFP4 ftype
 wired in llama-quantize (dense 2D ne0%64 branch). CPU seal: no-imatrix bit-identical to ref;
 synthetic weighted-error ratios 0.825-0.957; REAL community-FT expert data w_err 0.629 (37% error cut,
-vs MXFP4's 5.7% - the finer scale grid actually bites on real weights). Commits ff31bc858 + 1f6be1d1a.
+vs MXFP4's 5.7% - the finer scale grid actually bites on real weights). Commits + 1f6be1d1a.
 
 ### Numbers (community-MoE-35B, same harness as M3, Q4 control same-run)
 | quant | PPL@8k | vs Q4_0 |
@@ -1170,8 +1028,8 @@ quantizer-side path remains (next rung would be mantissa width, i.e. not MXFP4/N
 Purpose: reviewer-reproducible data for the upstream PRs. Model bartowski/Qwen_Qwen3.5-9B-GGUF
 bf16 (full-precision file in that repo; no F16), Q4_0 + Q4_K_M quantized locally with stock
 llama-quantize. Dataset wikitext-2-raw-v1 test set (wiki.test.raw, scripts/get-wikitext-2.sh from
-ggml-org/ci). Build 3b1079b84, 3x MI50, -t 16, -lm dio, PPL -c 512 -ub 512 --chunks 256 (KLD legs
---chunks 128). Full data: /root/qwen35-9b-upstream-results.txt, scripts committed on the branch.
+ggml-org/ci). Build , 3x MI50, -t 16, -lm dio, PPL -c 512 -ub 512 --chunks 256 (KLD legs
+--chunks 128). Full data: rig/qwen35-9b-upstream-results.txt, scripts committed on the branch.
 
 ### 46a. Accuracy vs F16 (single-GPU, no -sm tensor)
 | quant | PPL | ratio vs F16 | KLD mean (5pctl/median/95pctl) |
@@ -1227,7 +1085,8 @@ non-2048 ubatches with W4A4.
 | W4A4 off | 7.7476 +- 0.0532 | - |
 | W4A4 gate=1 | 7.9541 +- 0.0542 | +0.2065 (+2.66%) |
 
-Context for the dense-W4A4 quality picture: Mistral-class-prod-123B +0.082@8k (+7.7% rel), this 9B dense
+Context for the dense-W4A4 quality picture: the larger dense production model measured
++7.7% rel at 8k (per-model numbers withheld from the public record); this 9B dense
 +0.2065@8k (+2.66% rel) - relative cost smaller on the smaller model, absolute cost larger.
 Reproducibility note: an earlier buggy harness run (both legs accidentally W4A4-on due to a
 hardcoded env) produced 7.9541 for the "off" leg - which exactly matches today's true ON value;
@@ -1263,7 +1122,7 @@ different failure modes (u4act: OOB fault; u4p: silent corruption). KLD-with-W4A
 unavailable until fixed; root cause next (u4 quantize kernel z-dim/grid or x_stride
 handling under ne12>1 in the tiled branch, mul-mat.cu:84-113 + quantize.cu:574-651).
 
-### 47e. ROOT CAUSE + FIX: plane-slice pointer arithmetic in wrong element units (51a43756f, 2026-10-01)
+### 47e. ROOT CAUSE + FIX: plane-slice pointer arithmetic in wrong element units (, 2026-10-01)
 Bug: both GEMM slice loops (mul-mat.cu narrow ~115 and tiled ~293) offset the activation pool in
 BLOCKS cast to block_q8_1* (34 B equivalent) while the u4act/u4p pools hold block_q8_1_u4 (20 B)
 / block_q8_1_u4p (32 B). Same block count, wrong size: every (i2,i3) plane after the first was
@@ -1277,7 +1136,7 @@ framing was a harness artifact (128 only occurred at n_seq=4). Also: the "clean"
 control was itself ne12=2 and NaN-corrupt with rc=0 - W4A4 KLD legs were silently invalid before
 this fix. Quantizer and kernel indexing verified correct; purely host-side slicing.
 
-Fix: plane offsets taken in BYTES of the pool's own element type at both sites (51a43756f).
+Fix: plane offsets taken in BYTES of the pool's own element type at both sites .
 Provably no-op at ne12=1; A/B-identical PPL on identical builds pre/post.
 
 ### 47f. Validation matrix + W4A4 KLD (the original goal of this leg)
@@ -1297,14 +1156,14 @@ concentrated (most tokens nearly exact, rare tokens diverge hard), consistent wi
 depth-PPL growth pattern. Mean PPL(Q) 8.845 vs base 8.021 (ratio 1.103).
 Note: single-seq PPL shows ~1% run-to-run wobble on this rig (repack nondeterminism);
 present with fix stashed - environmental, not a regression.
-Full report: mi50:/root/w4a4-nseq-fix.txt; sweep logs /root/w4sweep-results.txt.
+Full report: rig/w4a4-nseq-fix.txt; sweep logs rig/w4sweep-results.txt.
 
 ## 48. W4A4 accuracy diagnostic: outlier structure + phase-2 selection (2026-10-01, branch perf/w4a4-attrib)
 
 Methods: per-tensor-class KLD via temporary GGML_W4A4_ONLY=attn|ffn dispatch gate; per-layer
 activation dumps (16 chunks x 512 tok, blk.L.ffn_gate, L=0..31) + requant simulation for the
-fix candidates. Results file: mi50:/root/w4a4-attrib-results.txt (Tables 1-3). Debug
-instrumentation committed on perf/w4a4-attrib (3cd5f0fb9), marked debug.
+fix candidates. Results file: rig/w4a4-attrib-results.txt (Tables 1-3). Debug
+instrumentation committed on perf/w4a4-attrib , marked debug.
 
 ### 48a. Attribution
 | variant | Mean KLD vs bf16 |
@@ -1337,7 +1196,7 @@ max <18. Direct derivative of the existing per-8 u4p kernel (2 sub-blocks instea
 no calibration, no requant, no decode-path change. SmoothQuant = phase-3 fallback only.
 Empirical anchor is strong: per-8 sub-blocks already recover 84.5% of the gap in this fork.
 
-## 49. W4A4 phase 2: per-16 sub-block activation scales - gate 3 IMPLEMENTED (03f75cedd, 2026-10-02)
+## 49. W4A4 phase 2: per-16 sub-block activation scales - gate 3 IMPLEMENTED (, 2026-10-02)
 
 Gate 3 = GGML_CUDA_W4A4_DOT8=3: GEMM-path activations quantized per-16 sub-blocks (2x fp16
 {d4,m} pairs + 16B nibbles = 28B/32-values, aligned(4); note: struct natural alignment is
@@ -1381,7 +1240,7 @@ pp512 ~equal (1003.9 vs 1032.3, gate1 noisy +-304). pp2048 gate3 956.8 vs gate1 
 3-GPU TP (pp2048/n256, spread <0.1%): pp2048 2380.8 vs 1890.7 (-20.6%); tg256 88.37 vs
 88.25 (-0.14%). The quick-pass "pp512 ~equal" was wrong; the penalty is flat ~-21% at
 every pp size. Same-gate swings were sporadic one-off samples (5 dropped, both gates),
-not thermal (42-55 C stable). Raw: /root/w4a4-ab/*.jsonl.
+not thermal (42-55 C stable). Raw: rig/w4a4-ab/*.jsonl.
 
 ### 49d. VERDICT: gate 3 = REJECT for default; env-gated experimental, kept
 Adoption bar was KLD <= 0.095 AND perf within ~2% of gate1. Accuracy: MET (0.0902, 73.6%
@@ -1394,15 +1253,15 @@ Future lever: the -21% is a per-16 read-path cost (scale-pair loads + sub-block 
 in mmq_gemm_repacked_impl), not fundamental - a tuning pass on the U4X16 fetch (vectorized
 28B-stride handling) could narrow it; not scheduled.
 
-Upstream framing (unchanged): the multi-seq plane-offset fix (51a43756f) is the
+Upstream framing (unchanged): the multi-seq plane-offset fix is the
 PR-ready piece; sections 47-49 are the supporting story (bug, diagnostic methodology,
 sub-block scale exploration with measured KLD/perf tradeoffs) if upstream wants the
 accuracy context.
 
-### 49e. Selective gating REFUTED + depth-table chunk-confound CORRECTED (2026-10-02, branch perf/w4a4-per16 98d1d8b18)
+### 49e. Selective gating REFUTED + depth-table chunk-confound CORRECTED (2026-10-02, branch perf/w4a4-per16 )
 
 Selective per-16 (GGML_W4A4_ONLY filter extended to the gate-3 u4x16 selection, commit
-98d1d8b18 - the phase-1 filter only covered gate-1 u4act): ffn-per16 retains 40.9% of
+ - the phase-1 filter only covered gate-1 u4act): ffn-per16 retains 40.9% of
 gate3-full's KLD recovery at 75.1% of its pp cost; attn-per16 30.9% at 48.6%. Both strictly
 dominated by full per-16 (recoveries subadditive 71.7%, costs superadditive 123.7%, matching
 the 48a residual-stream superadditivity). SELECTIVE DIRECTION DROPPED; the filter extension
@@ -1450,25 +1309,25 @@ Per-call delta +22.9% inside the GEMM kernel itself = the -21.3% wall clock. Att
 CLOSED: the per-16 cost is intrinsic to u4x16 kernel execution (2x scale decode/apply per
 32-value group in the tiled inner loop + 32B LDS footprint); zero contribution from
 dispatch, quantizer, or AR. Recovering it requires restructuring the scale-application
-math, not layout or launch changes. Traces: /root/w4a4-prof32/{gate1,gate3}/prof_kernel_trace.csv.
+math, not layout or launch changes. Traces: rig/w4a4-prof32/{gate1,gate3}/prof_kernel_trace.csv.
 
 ### 49h. 49g refinement from the tuning agent's fresh profiles (no U4P8 aliasing; epilogue ALU is the cost)
 Fresh rocprofv3 traces (per-gate cwd, both gates captured cleanly) refine 49g on two points:
 1. NO ALIASING: gate3 dispatches its own <false,2,4,Q4_0,false,false,true> U4X16 instantiation
-   with quantize_mmq_q8_1_u4x16 - the "U4P8=true template" reading came from the stale Sep-25
-   results.csv. GEMM totals: gate1 2.719 s vs gate3 3.344 s (+23.0%), quantizer delta noise.
+ with quantize_mmq_q8_1_u4x16 - the "U4P8=true template" reading came from the stale Sep-25
+ results.csv. GEMM totals: gate1 2.719 s vs gate3 3.344 s (+23.0%), quantizer delta noise.
 2. COST LOCATION: same VGPR/SGPR, no spill, no occupancy difference between gates - the +23%
-   is the per-16 EPILOGUE ALU (2x {half2->float2 converts, sWs16 float2 loads, FMA chain} vs
-   gate1's single per-32 fold). 28B->32B padding confirmed irrelevant (fetch was never the
-   bottleneck; -20.5/-22.4/-22.6% across pp512/2048/4096, unchanged from 28B).
+ is the per-16 EPILOGUE ALU (2x {half2->float2 converts, sWs16 float2 loads, FMA chain} vs
+ gate1's single per-32 fold). 28B->32B padding confirmed irrelevant (fetch was never the
+ bottleneck; -20.5/-22.4/-22.6% across pp512/2048/4096, unchanged from 28B).
 Follow-up path if ever funded: pre-fold weight scale d into d4/m at prefetch (sWs16 extension)
 and/or fp32 scale storage - removes the delta ALU ops from the epilogue; layout changes are a
-dead end. Patched sources preserved at /root/w4a4-32b-patch/; tree reverted clean at 98d1d8b18.
+dead end. Patched sources preserved at rig/w4a4-32b-patch/; tree reverted clean at 98d1d8b18.
 
-## 50. gfx906 wave64 idiom comparison vs Strata (2026-10-04, branch bench/gfx906-idiom-compare 373c62d9e)
+## 50. gfx906 wave64 idiom comparison vs Strata (2026-10-04, branch bench/gfx906-idiom-compare )
 
-Standalone microbenchmarks (/root/w4-bench/*.cu), interleaved A/B, 7 reps, median+spread,
-MI50. Full report: /root/w4-kernel-compare.md; branch has bench sources.
+Standalone microbenchmarks (rig/w4-bench/*.cu), interleaved A/B, 7 reps, median+spread,
+MI50. Full report: rig/w4-kernel-compare.md; branch has bench sources.
 
 | idiom | verdict | numbers |
 |---|---|---|
@@ -1486,7 +1345,7 @@ Also confirmed: HIP 7.2 __shfl_*_sync static-asserts on 32-bit masks; our vendor
 shim is required for these idioms (cost one false-alarm HW exception during bring-up).
 
 
-## 51. K-split GEMM + async PLE reader (2026-10-05, branches perf/w4a4-dot8-gfx906 44668c9c3, perf/ple-async 652b4c996)
+## 51. K-split GEMM + async PLE reader (2026-10-05, branches perf/w4a4-dot8-gfx906 , perf/ple-async )
 
 ### 51a. K-split narrow-token GEMM (GGML_RP_KSPLIT=1, default OFF)
 grid.z K-slices + fixed-order reduce kernel; fires only for Q4_0 w32 path, 16<=ne11<=64;
@@ -1500,7 +1359,7 @@ Perf (llama-bench, interleaved, 2 reps x r3): pp512 +26.5%, pp2048 +22.4% at ub3
 ub64; decode (ne11=1) parity by design. KSPLIT also cuts run spread 10-30x in fired cells.
 Verdict: SHIP as env-gated. Spec-decode verify windows (ne11 16-64) are the target regime.
 
-### 51b. Async PLE reader (Strata PleReader+DirectFile port, perf/ple-async 652b4c996)
+### 51b. Async PLE reader (Strata PleReader+DirectFile port, perf/ple-async )
 Prototype: GGML_PLE_ASYNC=1 swaps the PLE table pointer to a 5.9MB staging buffer; per-ubatch
 O_DIRECT prefetch + index remap (byte-identical by construction); mmap memcpy fallback.
 Bench (Kioxia NVMe, 1500 tokens, 16 rows/token): mmap warm-resident (prod) 2289.5us p50 vs
@@ -1515,19 +1374,19 @@ cycle (host power cycle needed; the wedge predates this work) - reader-level byt
 proven, graph-level integration gated but unexercised.
 Verdict: CONTINUE (scoped) - mechanism proven, port clean, ship later behind the env gate
 when a use case needs the table off a slow/resident-constrained disk.
-Files: /root/ple-port-analysis.txt (phase-A mapping: gather site qwen4exp.cpp:1465, row-index
+Files: rig/ple-port-analysis.txt (phase-A mapping: gather site qwen4exp.cpp:1465, row-index
 source llm_graph_input_ple::set_input qwen4exp.cpp:1241-1300, runs pre-graph at
-llama-context.cpp:1778), /root/ple-port-stage/correctness.sh (awaiting host recovery),
+llama-context.cpp:1778), rig/ple-port-stage/correctness.sh (awaiting host recovery),
 prototype on perf/ple-async (11 files, +1141).
 
-## 52. Standard upstream-PR benchmark suite: first run on merged upstream (740299d37, 2026-10-06)
+## 52. Standard upstream-PR benchmark suite: first run on merged upstream (, 2026-10-06)
 
-New committed suite (/root/bench_suite.sh): one command produces every table a PR draft needs -
+New committed suite (rig/bench_suite.sh): one command produces every table a PR draft needs -
 pp/tg sweep x 3 quants x repack on/off, K-split on/off, PPL+KLD per quant vs bf16 base, greedy
 seal. Model: bartowski Qwen3.5-9B (bf16 + locally quantized Q4_0/Q4_K_M/Q8_0). Dataset:
 wikitext-2-raw test. Single GPU ROCm1, -t 16, -lm dio.
 
-### Results (build 740299d37, post-upstream-merge)
+### Results (build , post-upstream-merge)
 Perf pp512 (t/s): Q4_0 939.9/937.6 (repack=1/0, +0.2% - NOT significant post-merge)
 Perf tg128 (t/s): Q4_0 80.87 vs 75.46 (repack=1/0, **+7.2%** - repack gain is tg-side)
 Q4_K_M repack: pp ~parity, tg 68.6 vs 68.6 (no repack path for Q4_K on this build)
@@ -1549,15 +1408,15 @@ master already improved small-batch GEMM. K-split stays env-gated OFF; re-test a
 verify-window shapes (ne11 2-8) before further investment.
 
 **SCOPE CORRECTION (2026-10-08, verified - kernel-level rocprofv3, traces
-/root/ppmax/ksplit_probe/, resolution /root/ppmax/ksplit-resolution.md): k-split positives
+rig/ppmax/ksplit_probe/, resolution rig/ppmax/ksplit-resolution.md): k-split positives
 hold ONLY on the stock q8_1 path (GGML_CUDA_W4A4_DOT8 unset). Under gate1-u4act (DOT8=1)
-k-split is NEGATIVE on both lineages (acf8ca295 and integrated): kernel -29.8%/call
+k-split is NEGATIVE on both lineages ( and integrated): kernel -29.8%/call
 stock-path vs +13.2%/call gate1-path, measured 2026-10-08. The sign follows the activation
 gate, not the lineage - the u4act kernel is dp4a/ALU-bound so K-slicing does not shrink
 per-slice cost, and reduce + doubled dispatch make it net-worse. Keep GGML_RP_KSPLIT
 default-off; NEVER combine it with DOT8=1.**
 
-## 54. Layer-selective W4A8: GGML_CUDA_W4A4_SKIP frontier (2026-10-08, branch perf/w4a4-skip-layers e32025786)
+## 54. Layer-selective W4A8: GGML_CUDA_W4A4_SKIP frontier (2026-10-08, branch perf/w4a4-skip-layers )
 
 Env `GGML_CUDA_W4A4_SKIP` = comma-separated tensor-NAME prefixes; any Q4_0 GEMM input whose
 name starts with a prefix is excluded from u4act entirely and runs the stock q8_1 activation
@@ -1567,7 +1426,7 @@ subtracts); under gate 3 an excluded tensor also loses the per-16 u4x16 GEMM. De
 (q8_repack/mul-mat.cu) + MoE (mul-mat-id.cu) dispatch sites gated; static-once parse; one
 WARN audit line at startup lists the active prefix count (WARN not INFO: llama-perplexity
 default verbosity filters INFO). Helper scripts/w4a4_skip_expand.sh expands "4-18" ->
-blk.4.,...,blk.18. Build /root/build-skip; raw data /root/w4a4-skip/.
+blk.4.,...,blk.18. Build rig/build-skip; raw data rig/w4a4-skip/.
 
 PHASE-A SEALS (all PASS): (a) gate-off parity - SKIP unset chunks-32 PPL 12.5836 +- 0.36763
 == gate1 reference, identical across two runs, audit marker absent = gate provably inert;
@@ -1605,20 +1464,20 @@ Late arm's accuracy legs are clean (marker present, seal deterministic).
 DISPOSITION: SKIP-early = ADOPT-CANDIDATE (best quality arm: KLD -19.8% vs gate1, shallow
 8.5739 / depth 7.6130 both improved, seal PASS primes 2-29, tg near parity) pending
 interleaved A/B vs gate1, matched dPPL vs stock, and 64k-context legs. Gate stays env-gated
-OFF by default; unset = bit-identical gate1. Raw: /root/w4a4-skip/phaseA-kernel.md,
-/root/w4a4-skip/phaseB/phaseB-leg{0,1,2}.{md,json}.
+OFF by default; unset = bit-identical gate1. Raw: rig/w4a4-skip/phaseA-kernel.md,
+rig/w4a4-skip/phaseB/phaseB-leg{0,1,2}.{md,json}.
 
 
-## 55. Review-fix verification: stride-union Q5_1, gate semantics, engagement markers (2026-10-10, branch fix/review-2026-10-10, commit 5131ca6bb)
+## 55. Review-fix verification: stride-union Q5_1, gate semantics, engagement markers (2026-10-10, branch fix/review-2026-10-10, commit )
 
-Six review fixes on top of 98a78f247 (B1 stride-union Q5_1+Q4_0, B2 MoE DOT8=0 semantics,
+Six review fixes on top of (B1 stride-union Q5_1+Q4_0, B2 MoE DOT8=0 semantics,
 B3 engagement markers, Q2 K-split stock-path guard, Q4 MoE fused Q4_0 loud abort, N1 34->36 B
 comment fix). Host-side regression test for B1: pre-fix 3 FAIL, post-fix ALL PASS. GPU re-verify
-on /root/build-skip-rebase/bin (build 98a78f247 (11504) + fixed tree), single GPU ROCm2,
-serialized on /root/gpu.lock, VRAM baseline 10.87 MB/GPU before and after every leg.
+on rig/build-skip-rebase/bin (build (11504) + fixed tree), single GPU ROCm2,
+serialized on rig/gpu.lock, VRAM baseline 10.87 MB/GPU before and after every leg.
 
 ### 55a. Parity sweep (llama-bench -dev ROCm2 -ngl 99 -fa 1 -t 128 -r 1, all with REPACK_Q4_0=1)
-| config | pp512 | tg128 | ref (98a78f247 table) | delta pp/tg |
+| config | pp512 | tg128 | ref ( table) | delta pp/tg |
 |---|---|---|---|---|
 | DOT8 unset (stock-repack) | 946.88 | 81.41 | 948.6 / 82.3 | -0.2% / -1.1% |
 | DOT8=1 (gate1) | 1244.02 | 82.25 | 1249.75 / 82.3 | -0.5% / -0.1% |
@@ -1637,7 +1496,7 @@ present + correct in the .so; witness line "q8_repack: repacking q4_0 tensors" i
 engagement proof).
 
 ### 55b. Q5_1 regression (B1 stride-union; Q5_1 quantized locally from Qwen_Qwen3.5-9B-bf16.gguf
--> /root/q5_1-regression/Qwen3.5-9B-Q5_1.gguf)
+-> rig/q5_1-regression/Qwen3.5-9B-Q5_1.gguf)
 Stock (all gates unset): loads + 5-token gen clean, coherent; PPL ch2 7.3137 +/- 0.89207; zero
 gate markers = gates provably inert. REPACK_Q4_0=1 (Q5_1 hits the FIXED union-stride path - the
 predicate is a union now): loads + 5-token gen clean, no OOB/fault, PPL ch2 7.3137 +/- 0.89207
@@ -1653,15 +1512,15 @@ KLD vs f16-c512-ch128 base (-c 512 -b 2048 -ub 512 --chunks 128):
 | gate1 (REPACK_Q4_0=1 DOT8=1) | 0.122150 +/- 0.002028 | 0.12215 +/- 0.002 | EXACT |
 | SKIP-early (L4-18) | 0.097917 +/- 0.001819 | 0.097917 +/- 0.0018 | EXACT |
 
-BRANCH VALIDATED: fix/review-2026-10-10 @ 5131ca6bb reproduces every reference number within
-band; Q5_1 union-stride path clean. Raw logs: /root/ppmax/logs/.
+BRANCH VALIDATED: fix/review-2026-10-10 reproduces every reference number within
+band; Q5_1 union-stride path clean. Raw logs: rig/ppmax/logs/.
 
 
-## 56. Phase-3 GPU ladder: Q4_1 u4 (gate 4) validated end-to-end (2026-10-12, branch q41-u4-probe acdf841e7, ROCm2)
+## 56. Phase-3 GPU ladder: Q4_1 u4 (gate 4) validated end-to-end (2026-10-12, branch q41-u4-probe , ROCm2)
 
-FULL build /root/wt-q41/build-q41 (acdf841e7) + ISOLATION build /root/wt-q41-iso (831108ad8, Sigma_a staging
-forced SA=0.0f). Serialized on /root/gpu2.lock, VRAM baseline 10.87 MB/GPU before/after every leg.
-VERDICT: GO on every leg. Full report: /root/ppmax/q41q4k-probe/phase3-gpu-report.md.
+FULL build rig/wt-q41/build-q41 + ISOLATION build rig/wt-q41-iso (, Sigma_a staging
+forced SA=0.0f). Serialized on rig/gpu2.lock, VRAM baseline 10.87 MB/GPU before/after every leg.
+VERDICT: GO on every leg. Full report: rig/ppmax/q41q4k-probe/phase3-gpu-report.md.
 
 LEG 0 (exact-anchor regression, upstream 9B Q4_0): gate1 PPL ch256 8.7630 EXACT; gate1 KLD 0.122150 EXACT;
 SKIP-early KLD 0.097917 EXACT; DOT8=3 PPL ch32 7.2774 EXACT (the 54 per-16 ref). The U4Q41 wrapper-threading
@@ -1676,7 +1535,7 @@ mmq_gemm_repacked<...,Q4_1,...,U4Q41=true>): FULL 2192 vs ISO 2132 instrs; the e
 staging chain (+32 v_dot8_i32_i4, +8 cvt, +8 fma, +8 add, +6 s_waitcnt); 71 opcodes identical counts;
 vgpr/sgpr identical (128/44) -> inner-loop ISA identity PROVEN, not argued. gfx906 exposes no dynamic
 occupancy counters (SQ_LEVEL_WAVES/SQ_WAVE_CYCLES/SQ_BUSY_CYCLES unavailable); static metadata + SQ_WAVES
-identical used instead. Bench-level FULL-vs-ISO on the map file is confounded (831108ad8 predates the
+identical used instead. Bench-level FULL-vs-ISO on the map file is confounded ( predates the
 superset redesign: ISO at gate4 leaves Q4_0 stock) - counters are the clean isolation.
 
 LEG 1-2 (gate 4 full gates): (a) SUPERSET property on pure Q4_0 file: gate4 PPL ch256 8.7630 bit-identical
@@ -1689,9 +1548,9 @@ greedy primes 2..29 EXACT; SKIP-under-gate4 runs Q4_1 tensors on the repacked ST
 witness, admission gate-aware); VRAM g0 vs g4 resident sample -4.75 MB (noise) = canonical 5 bpw neutral.
 Depth PPL c2048 ch64: g0 7.2473 -> g4 7.4194 (the Q4_0-u4 penalty dominates; superset dPPL on Q4_0 files 0.000).
 
-## 57. SKIP KLD transferred to the 27B: f16 3-GPU base, skip-layer recovery does NOT transfer (2026-10-12, build-merge 6c463aca8, /root/kld27b/)
+## 57. SKIP KLD transferred to the 27B: f16 3-GPU base, skip-layer recovery does NOT transfer (2026-10-12, build-merge , rig/kld27b/)
 
-§54's skip-layer frontier (GGML_CUDA_W4A4_SKIP) was measured on the 9B with a single-GPU f16
+sec 54's skip-layer frontier (GGML_CUDA_W4A4_SKIP) was measured on the 9B with a single-GPU f16
 KLD base; the fleet A/B could only re-check the 27B by PPL (weaker instrument). This leg builds
 the missing KLD base: ggml-org Qwen3.8-27B-BF16.gguf (53.8 GB) -> llama-quantize BF16->F16
 passthrough (rc=0, 16.00 BPW) -> llama-perplexity --save-all-logits on 3 GPUs
@@ -1699,7 +1558,7 @@ passthrough (rc=0, 16.00 BPW) -> llama-perplexity --save-all-logits on 3 GPUs
 6.8457 +- 0.09353, logits 16.2 GB. 54 GB weights + KV fit 3x32 GB tensor-split with no split
 tuning. KLD legs on Qwen3.8-27B-Q4_0 (2 GPUs, same chunk protocol, gate markers verified):
 
-| arm | Mean KLD vs f16 base | % gap closed (gate1->stock) | 9B §54 |
+| arm | Mean KLD vs f16 base | % gap closed (gate1->stock) | 9B sec 54 |
 |---|---|---|---|
 | gate1 (DOT8=1) | 0.062311 +- 0.000777 | anchor | 0.12215 |
 | gate1+skipE blk.4-18 | 0.058537 +- 0.000707 | **12.6%** | 45.1% |
@@ -1707,7 +1566,7 @@ tuning. KLD legs on Qwen3.8-27B-Q4_0 (2 GPUs, same chunk protocol, gate markers 
 | stock repack floor | 0.032452 +- 0.000374 | anchor | 0.0684 |
 
 gate1->stock gap = 0.029859 on 27B vs 0.05375 on 9B: the gate costs ~44% less KLD on the 27B.
-Bonus §55-style: gate1 PPL ch256 fresh 6.9896 +- 0.06770 (ch128 refs: gate1 7.0916, stock
+Bonus sec 55-style: gate1 PPL ch256 fresh 6.9896 +- 0.06770 (ch128 refs: gate1 7.0916, stock
 6.9514) - depth closes ~73% of the ch128 gate1->stock PPL gap.
 
 FINDING: skip-layer recovery does NOT transfer at fixed layer ranges. Closure collapses
@@ -1715,11 +1574,11 @@ FINDING: skip-layer recovery does NOT transfer at fixed layer ranges. Closure co
 27B late>early). The blk.4-18/19-31 ranges are tuned to the 9B's 48-layer outlier band; on
 65 layers they cover 23%/20% instead of 31%/27%, and the 27B's gate-damage mass sits later.
 PPL-based closure from the fleet A/B (skipE 15.5%, skipL 29.0%) agrees: low-teens, not 45%.
-DISPOSITION: do not ship skipE/skipL on the 27B on the strength of §54; re-derive any 27B skip
-list via per-layer KLD attribution on this f16 base. Raw: /root/kld27b/.
+DISPOSITION: do not ship skipE/skipL on the 27B on the strength of sec 54; re-derive any 27B skip
+list via per-layer KLD attribution on this f16 base. Raw: rig/kld27b/.
 
 
-## 59. Adopt-validation: stock+ksplit A/B (27B + community-FT MoE) + first MTP x W4A4 interaction measurement (2026-10-13, build-merge 0338132f7 b11507, /root/ppmax/adopt/)
+## 59. Adopt-validation: stock+ksplit A/B (27B + community-FT MoE) + first MTP x W4A4 interaction measurement (2026-10-13, build-merge b11507, rig/ppmax/adopt/)
 
 PART A - ksplit adoption gate on the 27B (Qwen3.8-27B-Q4_0, ROCm0, -t 128, r=5): stock vs
 GGML_RP_KSPLIT=1: pp16 +10.6% (81.19->89.78), pp32 +7.2%, pp64 +1.2%, pp512/pp2048/tg128 parity
@@ -1729,14 +1588,14 @@ per16 within noise - the ksplit gate (q8_repack/mul-mat.cu: !u4act && !u4x16 && 
 is self-guarding, so GGML_RP_KSPLIT=1 is inert under every DOT8 gate and on non-Q4_0 quants.
 community-MoE-35B-A3B Q4_0 MoE (2-GPU tensor, r=3): ksplit parity (-0.6..+0.4%); per16 +2.3..2.8% pp,
 tg spread +-15 swamps the -11% point est. VERDICT: ADOPT-READY. llama-swap per-model env diff
-drafted (26 models get GGML_RP_KSPLIT=1, the 2 DOT8 models untouched) at /root/ppmax/adopt/
+drafted (26 models get GGML_RP_KSPLIT=1, the 2 DOT8 models untouched) at rig/ppmax/adopt/
 config.yaml.ksplit-draft; validated by a live llama-swap instance on :19191 (28 models listed,
 zero errors). Prod config NOT touched (it runs --watch-config).
 
 PART B - MTP x W4A4 on the same 27B (llama-server -c 4096, /completion temp 0, ~775-tok wikitext
 prompt, tg128 x3 reps, draft-mtp n_max=4 p_min=0.75). ARCH FACT: both the main gguf and the
 mtp-Qwen3.8-27B draft module are general.architecture=qwen35 (NOT qwen4exp) - the hc_norm fix
-6c92ab0cc is qwen4exp-specific and irrelevant; zero build_hc_mix SIGABRTs, qwen35 MTP loads clean.
+ is qwen4exp-specific and irrelevant; zero build_hc_mix SIGABRTs, qwen35 MTP loads clean.
 The "mtp" gguf is a draft-only module (18 tensors, blk.64.nextn.* + embd/output); the main Q4_0
 gguf carries a NATIVE nextn head (qwen35.nextn_predict_layers=1) which works with no -md.
 
@@ -1752,82 +1611,77 @@ pp unaffected by MTP. VRAM: 5.74 GB no-MTP, +0.98 GB draft module. No TP AR warn
 DISPOSITION: ship GGML_RP_KSPLIT=1 globally (env-only); NEVER combine DOT8=1/3 with MTP on
 qwen35-family models; for Qwen3.8-27B Q4_0 the best decode config is native MTP, no -md, stock.
 
-## 60. Per-block least-squares Q4_0 scale: encode-side headroom probe — NEGATIVE, imatrix path is already LS (2026-10-13, branch exp/q40-ls-scale off 0338132f7, /root/bench-results/q40ls/)
+## 60. Per-block least-squares Q4_0 scale: encode-side headroom probe - NEGATIVE, imatrix path is already LS (2026-10-13, branch exp/q40-ls-scale off , rig/bench-results/q40ls/)
 
 R3 accuracy-headroom item 1: replace the Q4_0 per-block scale choice with iterated least-squares
-(seed max|x|, then d = sum(w·x·l)/sum(w·l·l) with l = clamp(round(x/d)), 4 sweeps), env-gated in
+(seed max|x|, then d = sum(w?x?l)/sum(w?l?l) with l = clamp(round(x/d)), 4 sweeps), env-gated in
 ggml-quants.c (GGML_Q40_LS=sweeps; GGML_Q40_LS_MODE=1 weighted by the imatrix weight vector
-w=qw·sqrt(sigma2+x²), 2 = unweighted, the brief's literal sum(scale·q − w)²). CPU-only quantizer
-(/root/wt-q40ls/build-cpu); files re-encoded from the same bf16 source + map-ff4 + train-split
+w=qw?sqrt(sigma2+x?), 2 = unweighted, the brief's literal sum(scale?q - w)?). CPU-only quantizer
+(rig/wt-q40ls/build-cpu); files re-encoded from the same bf16 source + map-ff4 + train-split
 imatrix as ffmap4, size identical (6,288,666,624 B). Control arm GGML_Q40_LS=0 reproduced ffmap4
 **bit-exactly** (md5 49b7aed8...), so every delta below is the LS scale alone. KLD c512 ch128 vs
-f16-c512-ch128 base, wiki.test, build-merge @ 807d8f0f1, ROCm2:
+f16-c512-ch128 base, wiki.test, build-merge, ROCm2:
 
 | arm | gate0 (weight floor) | vs 0.041157 | gate1 (W4A4) | vs 0.076382 |
 |---|---|---|---|---|
-| ffmap4 anchor (known) | 0.041157 | — | 0.076382 | — |
-| LS ctrl (LS=0, bit-exact) | 0.041157 ± 0.001281 | 0.0% | 0.076382 ± 0.001605 | 0.0% |
-| LS mode1 s4 (imatrix-weighted) | 0.050086 ± 0.001615 | **+21.7%** | 0.086219 ± 0.001744 | **+12.9%** |
-| LS mode2 s4 (unweighted) | 0.051336 ± 0.001534 | **+24.7%** | 0.087302 ± 0.001774 | **+14.3%** |
+| ffmap4 anchor (known) | 0.041157 | - | 0.076382 | - |
+| LS ctrl (LS=0, bit-exact) | 0.041157 +- 0.001281 | 0.0% | 0.076382 +- 0.001605 | 0.0% |
+| LS mode1 s4 (imatrix-weighted) | 0.050086 +- 0.001615 | **+21.7%** | 0.086219 +- 0.001744 | **+12.9%** |
+| LS mode2 s4 (unweighted) | 0.051336 +- 0.001534 | **+24.7%** | 0.087302 +- 0.001774 | **+14.3%** |
 
 Weight-MSE cross-check (blk.10.ffn_gate dequant vs bf16, gguf-py dequantize): ffmap4 9.5175e-07,
-m1s4 +5.0%, m2s4 +3.8% — LS also loses on plain MSE while it *shrinks* max|err| (3.13e-2 →
+m1s4 +5.0%, m2s4 +3.8% - LS also loses on plain MSE while it *shrinks* max|err| (3.13e-2 ->
 1.05e-2): the max|x| seed + imatrix pattern search is better than iterated LS even on the
 unweighted block-MSE proxy the LS objective itself optimizes.
 
-VERDICT: **NO — LS scale regresses, do not pursue.** Success bar was ≥2% KLD *reduction*; measured
-is a 12.9–24.7% *increase* (5–7x the per-arm KLD error bar, and the control arm reproduces the
+VERDICT: **NO - LS scale regresses, do not pursue.** Success bar was >=2% KLD *reduction*; measured
+is a 12.9-24.7% *increase* (5-7x the per-arm KLD error bar, and the control arm reproduces the
 anchor bit-exactly so the delta is systematic, not drift). Mechanism: the imatrix Q4_0 path is
-already least-squares — make_qx_quants(rmse_type=1) computes scale = sumlx/suml2 over the
-imatrix-derived weight vector, then searches discrete iscale variants (−nmax−0.1i)/max, i∈[−9,9],
-picking the best **clamping-pattern** by sumlx²/suml2. Iterated LS from the max|x| seed converges
+already least-squares - make_qx_quants(rmse_type=1) computes scale = sumlx/suml2 over the
+imatrix-derived weight vector, then searches discrete iscale variants (-nmax-0.1i)/max, i?[-9,9],
+picking the best **clamping-pattern** by sumlx?/suml2. Iterated LS from the max|x| seed converges
 to the continuous stationary point of its own objective but drops that discrete pattern search,
 and the pattern search is what wins: LS lands in a worse local optimum of the *rounding* problem
 (the clamping pattern at the LS scale is not the one the search finds). The brief's literal
-unweighted LS is worse still: unweighted block MSE is the wrong proxy for KLD — the imatrix
+unweighted LS is worse still: unweighted block MSE is the wrong proxy for KLD - the imatrix
 weighting is load-bearing. R3's "possible negative near saturation" prediction confirmed: the
 imatrix encode is saturated with respect to scale-selection changes; headroom, if any, is in the
-weight *values* (SmoothQuant-style rescale, see /root/ppmax/smoothquant-feasibility.md) or the
-activation side, not the Q4_0 scale rule. Raw: /root/bench-results/q40ls/; code: branch
+weight *values* (SmoothQuant-style rescale, see rig/ppmax/smoothquant-feasibility.md) or the
+activation side, not the Q4_0 scale rule. Raw: rig/bench-results/q40ls/; code: branch
 exp/q40-ls-scale (env-gated, inert by default).
 
-## 61. llama-bench -dev delimiter fix (comma = device list, slash = cross-product) + first proper Mistral-class-prod-123B bench (2026-10-13, branch fix/llama-bench-dev-comma 177481e37, /root/ab-gates/production-123b-bench-ab-*.log)
+## 61. llama-bench -dev delimiter fix (comma = device list, slash = cross-product) + first proper sharded-model bench (2026-10-13, branch fix/llama-bench-dev-comma)
 
-Root cause of the "llama-bench cannot load the sharded Mistral-class-prod" mystery (§3 of
-/root/w4a4-gates-fleet-ab.md): llama-bench parsed `-dev` with **inverted delimiters** vs every
-other tool. common/arg.cpp `parse_device_list()` (llama-server, llama-perplexity) treats COMMA
+Root cause of the "llama-bench cannot load sharded multi-GPU models" mystery: llama-bench parsed `-dev` with **inverted delimiters** vs every
+other tool. common/arg.cpp `parse_device_list` (llama-server, llama-perplexity) treats COMMA
 as the device list for one model instance; llama-bench split the value on COMMA into separate
 benchmark combos and each combo on SLASH into a device list. So `-dev ROCm0,ROCm1,ROCm2
 -sm tensor` created three single-device combos, each trying to load the full 64.5 GiB shard set
-onto one 32 GB GPU — silent load failure (error only under --verbose). The slash form
+onto one 32 GB GPU - silent load failure (error only under --verbose). The slash form
 `ROCm0/ROCm1/ROCm2` worked but was backwards vs the codebase convention.
 
-Fix (one file, tools/llama-bench/llama-bench.cpp, +9/−3): swap the delimiters —
-`parse_devices_arg()` splits on comma (device list per instance, matches common parser); the
+Fix (one file, tools/llama-bench/llama-bench.cpp, +9/-3): swap the delimiters -
+`parse_devices_arg` splits on comma (device list per instance, matches common parser); the
 `-dev` arg handler splits on slash (cross-product of device-set combos); help text updated.
-Verified: `-dev ROCm0,ROCm1 -sm tensor` → one tensor-split instance; `-dev ROCm0/ROCm1` →
+Verified: `-dev ROCm0,ROCm1 -sm tensor` -> one tensor-split instance; `-dev ROCm0/ROCm1` ->
 two single-device combos (slash semantics unchanged for existing users). Build RC=0.
 Branch pushed to gitea + github fork; upstream PR to be opened by Brad.
 
-production-123B-v2 Q4_0 (64.5 GiB, 2 shards), 3× MI50, `-dev ROCm0/ROCm1/ROCm2 -sm tensor
--ngl 999 -fa on -lm dio -p 813 -n 128 -r 3 -t 128`, build-merge @ 1e3e0ccff:
+The fix unblocked llama-bench on sharded multi-GPU models. First such bench (dense
+production model Q4_0, 64.5 GiB, 2 shards, 3x MI50, `-dev ROCm0/ROCm1/ROCm2 -sm tensor
+-ngl 999 -fa on -lm dio -p 813 -n 128 -r 3 -t 128`): gate1 (DOT8=1) +34.4% pp813 vs
+stock, decode within noise (per-model raw numbers withheld from the public record).
 
-| arm | pp813 | tg128 |
-|---|---|---|
-| stock | 158.95 ± 0.12 | 20.43 ± 0.39 |
-| gate1 (DOT8=1) | **213.59 ± 0.09** (+34.4%) | 21.15 ± 0.37 |
-
-Cross-check vs server-based prod numbers (162.0/197.9 prefill, 20.02/20.40 decode): bench
-agrees within 1.9% (stock prefill), 7.9% (gate1 prefill), ≤3.7% (decode) — bench fidelity
-confirmed, r=3 noise ≤0.4 t/s. Gate1 prefill delta reads larger in bench (+34.4%) than server
+Cross-check vs server-based prod numbers: bench agrees within 1.9% (stock prefill),
+7.9% (gate1 prefill), <=3.7% (decode) - bench fidelity confirmed, r=3 noise <=0.4 t/s. Gate1 prefill delta reads larger in bench (+34.4%) than server
 (+22.2%): bench pp813 runs the whole prompt as one batch and misses the server's mixed
 chunked-prefill/decode overlap that partially hides the stock path's prefill cost. Direction
 and magnitude class (large prefill win, decode within noise) both confirmed.
 
-## 62. W4A4 width floor GGML_CUDA_W4A4_MIN_TOKENS: gate+MTP coexistence via per-GEMM auto-fallback (2026-10-14, master 1434fda3b, /root/ppmax/mtp-floor-validation.md, /root/bench-results/{gate-crossover-threads,mtp-floor}/)
+## 62. W4A4 width floor GGML_CUDA_W4A4_MIN_TOKENS: gate+MTP coexistence via per-GEMM auto-fallback (2026-10-14, master , rig/ppmax/mtp-floor-validation.md, rig/bench-results/{gate-crossover-threads,mtp-floor}/)
 
 PHASE A: (1) the two llama-bench columns after ngl are threads (-t) and fa (flash_attn), NOT
-ubatch - the §61 crossover ran -t 128 -fa on. (2) Crossover is thread-count-INDEPENDENT: spot
+ubatch - the sec 61 crossover ran -t 128 -fa on. (2) Crossover is thread-count-INDEPENDENT: spot
 widths 8/32/128 at t=32 vs t=128 give ratios 0.357/0.351, 0.846/0.840, 1.277/1.280 (r=3) - the
 sign flip and magnitudes are identical, so a width floor is not a -t artifact.
 
@@ -1838,46 +1692,46 @@ floor a call runs the REPACKED STOCK q8_1 activation path (SKIP-tensor semantics
 only; MoE (mul-mat-id.cu) untouched. Build RC=0.
 
 PHASE C (27B, llama-server, tg128 x3, draft-mtp n_max=4 p_min=0.75, external draft module):
-stock+MTP 49.05±0.27 | gate1 NO-floor +MTP 29.24±0.02 (-40%, the §59 verify hit reproduced) |
-gate1 +floor128 +MTP 47.29±0.28 (-3.5%: VERIFY HIT GONE; residual is prefill-numerics accept-
+stock+MTP 49.05+-0.27 | gate1 NO-floor +MTP 29.24+-0.02 (-40%, the sec 59 verify hit reproduced) |
+gate1 +floor128 +MTP 47.29+-0.28 (-3.5%: VERIFY HIT GONE; residual is prefill-numerics accept-
 sequence jitter - verify/decode run bit-stock under the floor, mean acc len 4.07 vs 4.13).
 no-MTP baselines: floor 31.60 vs stock 31.50 (parity). pp sweep gate1+floor128 (r=3): pp4 68.04,
-pp8 85.60, pp16 82.40, pp32 156.94, pp64 187.99 = STOCK PARITY at every narrow width (the §61
+pp8 85.60, pp16 82.40, pp32 156.94, pp64 187.99 = STOCK PARITY at every narrow width (the sec 61
 pp16-64 losses are gone); pp128 308.78 (+27.9%), pp512 405.82 (+32.9%) = FULL gate win.
 pp512+tg128 combo: gate1+floor pp 403.96 (+31.4% vs stock 307.53), tg 31.15 (parity).
 
-PHASE D (flagship): native-MTP + gate1 + floor128 = 49.89±0.37 t/s (acc len 4.32) vs native-MTP
+PHASE D (flagship): native-MTP + gate1 + floor128 = 49.89+-0.37 t/s (acc len 4.32) vs native-MTP
 stock 51.85 (-3.8%) WITH +31% pp512 - gate prefill win and MTP decode win coexist in one server
 for the first time. VERDICT: GO. Recommended MTP+gate config: DOT8=1 MIN_TOKENS=128. Caveats:
 chunked prefill below the floor runs those chunks stock (correct, no win); MoE path not floored.
 
-## 63. MTP output-consistency under the width floor: temp-0 sequence identity + accept-length distributions (2026-10-14, master a4646b4b1, /root/mtp-consistency/, /root/ppmax/mtp-floor-validation.md)
+## 63. MTP output-consistency under the width floor: temp-0 sequence identity + accept-length distributions (2026-10-14, master , rig/mtp-consistency/, rig/ppmax/mtp-floor-validation.md)
 
-Closes the last unmeasured corner of §62: does gate1+floor128 change WHAT the model outputs with
+Closes the last unmeasured corner of sec 62: does gate1+floor128 change WHAT the model outputs with
 MTP, not just how fast? Harness: cons-cell.sh/cons-run.sh (flock gpu1.lock, PORT GUARD pre/post +
-orphan pgrep, per-arm gen-count check). 27B + external MTP draft, §62 server flags. 5 prompts
+orphan pgrep, per-arm gen-count check). 27B + external MTP draft, sec 62 server flags. 5 prompts
 (code/prose/math/short/long-form, 21-61 tok) x 20 reps, /completion temp 0 seed 42 n=256
 logprobs+top5; plus a >floor leg (775-tok wikitext x 20) where prefill actually runs u4act.
 
-DETERMINISM: temp-0 MTP is fully deterministic — 300 gens, all 20 reps per prompt token-identical
+DETERMINISM: temp-0 MTP is fully deterministic - 300 gens, all 20 reps per prompt token-identical
 within every arm (stock+MTP, gate1+floor+MTP, stock no-MTP). No logprob fallback needed.
 
 | pair | token-identical | divergence |
 |---|---|---|
-| stock+MTP vs gate1+floor+MTP (short prefill < floor) | **100/100 = 100%** | none — bit-stock path both arms |
+| stock+MTP vs gate1+floor+MTP (short prefill < floor) | **100/100 = 100%** | none - bit-stock path both arms |
 | stock+MTP vs gate1+floor+MTP (775-tok prefill > floor) | 0/20 | ONE flip at pos 2 in all 20 reps: " Ben"(-1.182) vs " Robert"(-1.293), 0.11-nat near-tie; post-flip coherent, both hit cap |
-| stock+MTP vs stock no-MTP (greedy continuity ref) | 20/100 | first flip pos 9/31/62/205; mean logprob gap at flip 0.018 nats (median 0.013, max 0.047) — near-tie flips |
+| stock+MTP vs stock no-MTP (greedy continuity ref) | 20/100 | first flip pos 9/31/62/205; mean logprob gap at flip 0.018 nats (median 0.013, max 0.047) - near-tie flips |
 
-Accept-length distributions (per-gen mean acc len, n=100/arm): stock+MTP 3.448 ± 0.584 vs
-gate1+floor+MTP 3.448 ± 0.584 — identical (identical sequences). Per-prompt values identical
+Accept-length distributions (per-gen mean acc len, n=100/arm): stock+MTP 3.448 +- 0.584 vs
+gate1+floor+MTP 3.448 +- 0.584 - identical (identical sequences). Per-prompt values identical
 arm-to-arm {math 4.14, code 3.97, short 3.60, prose 2.77, long 2.76}. Wikitext leg: 4.480 vs
-4.460 (sd 0 within arm; Δ0.02 sequence jitter, same shape as §62). Output-length distributions
+4.460 (sd 0 within arm; ?0.02 sequence jitter, same shape as sec 62). Output-length distributions
 identical per prompt across all arms. Degenerate outputs (empty / 3x-repeated token window):
 **0/300+ gens in every arm.**
 
 PRIME SEAL with floor (9B Q4_0, no MTP, llama-cli greedy temp 0 top-k 1 seed 42 n 700, ROCm0):
 stock vs gate1+floor128 output BYTE-EXACT (raw diff = progress spinner + t/s footer only), primes
-2..29 all correct — §56 non-MTP greedy identity survives the floor.
+2..29 all correct - sec 56 non-MTP greedy identity survives the floor.
 
 VERDICT: **GO on output consistency.** Below the floor the gate+floor config is output-identical
 to stock+MTP at temp 0 (100%); above the floor the only effect is single near-tie logit flips at
@@ -1885,21 +1739,21 @@ the prefill-numerics boundary (0.11 nats), with unchanged accept-length distribu
 zero degeneration or compounding degradation. Flagship config (gate1 + floor128 + MTP) is safe for
 greedy/temp-0 serving workloads.
 
-## 64. Long-context validation of the flagship config (gate1+floor128) on Qwen3.5-9B: PPL ladder flat to 131k, perf +14..+52% pp / decode flat, MTP coexists at depth -> GO (2026-10-15, master 5156944e8 build-merge, /root/ppmax/longctx*)
+## 64. Long-context validation of the flagship config (gate1+floor128) on Qwen3.5-9B: PPL ladder flat to 131k, perf +14..+52% pp / decode flat, MTP coexists at depth -> GO (2026-10-15, master build-merge, rig/ppmax/longctx*)
 
 Model: Qwen3.5-9B Q4_0 (qwen35, trained ctx 262144 - 150k is INSIDE trained range, no
 NIAH-degradation confound). Hybrid attention (full-attn every 4th layer) -> f16 KV ~18 KB/tok,
 ~2.7 GiB at 150k: c=150000 fits ONE MI50 with FA on. Arms: stock vs DOT8=1+MIN_TOKENS=128
 (floor-ACTIVE log line confirmed in every gated run). ROCm0 PPL / ROCm1 bench / ROCm2 MTP,
-per-GPU flock. Full report: /root/ppmax/longctx-validation.md.
+per-GPU flock. Full report: rig/ppmax/longctx-validation.md.
 
 LEG A - PPL vs context (llama-perplexity default mode, -b/-ub 2048 n_seq=1 per 47e, -fa on,
 corpus = first 330k tok of ppl-test.txt, same evaluated slice every rung, vary -c):
 
 | rung | stock | gate1+floor128 | dPPL | ratio |
 |---|---:|---:|---:|---:|
-| 4k   | 9.1384+-0.058 | 9.6658+-0.062 | +0.5274 | 1.0577 |
-| 32k  | 9.3318+-0.060 | 9.8689+-0.064 | +0.5371 | 1.0576 |
+| 4k | 9.1384+-0.058 | 9.6658+-0.062 | +0.5274 | 1.0577 |
+| 32k | 9.3318+-0.060 | 9.8689+-0.064 | +0.5371 | 1.0576 |
 | 131k | 8.3746+-0.058 | 8.8944+-0.062 | +0.5198 | 1.0621 |
 
 Ratio FLAT 4k->131k (absolute dPPL smallest at 131k). NO explosion, no upward trend.
@@ -1921,10 +1775,10 @@ greedy 256-tok decode after long prefill:
 
 | depth | arm | pp t/s | tg t/s | mean acc len |
 |---|---|---:|---:|---:|
-| 32k  | stock+MTP | 724.27 | 59.28 | 3.18 |
-| 32k  | gate+floor+MTP | 851.59 (+17.6%) | 78.56 (+32.5%) | 4.21 |
-| 65k  | stock+MTP | 508.01 | 58.01 | 3.42 |
-| 65k  | gate+floor+MTP | 563.91 (+11.0%) | 75.21 (+29.6%) | 4.49 |
+| 32k | stock+MTP | 724.27 | 59.28 | 3.18 |
+| 32k | gate+floor+MTP | 851.59 (+17.6%) | 78.56 (+32.5%) | 4.21 |
+| 65k | stock+MTP | 508.01 | 58.01 | 3.42 |
+| 65k | gate+floor+MTP | 563.91 (+11.0%) | 75.21 (+29.6%) | 4.49 |
 | 131k | stock+MTP | 342.51 | 31.29 | 2.98 |
 | 131k | gate+floor+MTP | 366.16 (+6.9%) | 39.41 (+25.9%) | 3.87 |
 
@@ -1941,10 +1795,10 @@ Harness bugs fixed en route: (1) prompt files cut mid-UTF-8 -> U+FFFD -> instant
 gens) - cut at a valid UTF-8 boundary first; (2) llama-perplexity needs >=2c tokens in file
 and reserves n_ctx*n_vocab logits (the 150k-PPL wall); (3) llama-bench has no -c flag.
 
-## 65. Merge-validation: upstream 71a0624fb sync (354 commits) - anchors EXACT, MoE gain unchanged (2026-10-15, master b88221d53, /root/merge-ladder-71a0624fb/)
+## 65. Merge-validation: upstream sync (354 commits) - anchors EXACT, MoE gain unchanged (2026-10-15, master , rig/merge-ladder-71a0624fb/)
 
-Upstream base 71a0624fb (mxxm-t master), merge-base 2b129ccfa, 354 commits / 896 files.
-Merge commit b88221d53 on master (parents a8f18c0b9 + 71a0624fb). Gate-off AND gate-on
+Upstream base = mxxm-t master tip at merge time, 354 commits / 896 files.
+Merge commit on master (parents + ). Gate-off AND gate-on
 builds RC=0 (build-merge in the master worktree).
 
 CONFLICTS: 11 files. Resolutions (full detail in the merge commit message):
@@ -1962,25 +1816,25 @@ cycle; q8_repack/mul-mat.cu + repack-kernels.cuh byte-identical to pre-merge mas
 (U4AFFINE machinery, MIN_TOKENS floor, RP_KSPLIT, u4q41/u4q4k all present; buffer.cu picked
 up upstream designated-initializer buffer-type interface only).
 
-ANCHOR LADDER (9B Q4_0, ROCm0, same flags as §54/§56): ALL EXACT -
-gate1 PPL ch256 8.7630 ± 0.08938 EXACT; gate1 KLD ch128 0.122150 ± 0.002028 EXACT;
-SKIP-early KLD 0.097917 ± 0.001819 EXACT; per16 PPL ch32 7.2774 ± 0.20253 EXACT;
-gate4 PPL ch256 8.7630 ± 0.08938 bit-identical to gate1 (superset property intact).
-MTP arm (27B gate1+floor128+MTP, §62 protocol, port guard + rep-count 3/3):
-48.36/48.66/48.63 t/s (mean 48.55), mean acc len 4.07 EXACT vs §62's 4.07, t/s +2.6%
-vs §62's 47.29 ± 0.28 (upstream MoE/MMQ workspace wins, sanity band).
+ANCHOR LADDER (9B Q4_0, ROCm0, same flags as sec 54/sec 56): ALL EXACT -
+gate1 PPL ch256 8.7630 +- 0.08938 EXACT; gate1 KLD ch128 0.122150 +- 0.002028 EXACT;
+SKIP-early KLD 0.097917 +- 0.001819 EXACT; per16 PPL ch32 7.2774 +- 0.20253 EXACT;
+gate4 PPL ch256 8.7630 +- 0.08938 bit-identical to gate1 (superset property intact).
+MTP arm (27B gate1+floor128+MTP, sec 62 protocol, port guard + rep-count 3/3):
+48.36/48.66/48.63 t/s (mean 48.55), mean acc len 4.07 EXACT vs sec 62's 4.07, t/s +2.6%
+vs sec 62's 47.29 +- 0.28 (upstream MoE/MMQ workspace wins, sanity band).
 
 MoE CHECK (community-MoE-35B Q4_0, 2-GPU tensor, r=3, stock vs gate1): pp512 1891.80 -> 2046.31
-= +8.17% (vs §41-era +8.4-8.6% ref - unchanged within noise; upstream #27828 MMVQ-for-
+= +8.17% (vs sec 41-era +8.4-8.6% ref - unchanged within noise; upstream #27828 MMVQ-for-
 MUL_MAT_ID + #29887 MoE cache did NOT shift the MoE gate gain); tg128 105.60 -> 98.73
 (-6.5%, the known MoE decode regression - gate stays OFF for MoE entries).
 
-FOLLOW-UPS: fix/llama-bench-dev-comma rebased onto post-merge master (177481e37 -> 5f4cae725,
-clean, no conflict with upstream -fitc/-nr changes); int4 branch merged master (8016839d0,
-parents 245b59268 + b88221d53) - README front door kept (sole conflict, --ours).
-VERDICT: merge does not perturb the gates. b88221d53 is the new floor.
+FOLLOW-UPS: fix/llama-bench-dev-comma rebased onto post-merge master ( -> ,
+clean, no conflict with upstream -fitc/-nr changes); int4 branch merged master (,
+parents + ) - README front door kept (sole conflict, --ours).
+VERDICT: merge does not perturb the gates. is the new floor.
 
-## 66. MoE pp16 c2 regression cell (224.3 vs stock 272.0): forensics - the 2026-10-18 binary predates the MoE floor (2026-10-21, branch perf/int4-next-20261021, /root/sumw-seal-ab/RESULTS.md, /root/wt-sumw)
+## 66. MoE pp16 c2 regression cell (224.3 vs stock 272.0): forensics - the 2026-10-18 binary predates the MoE floor (2026-10-21, branch perf/int4-next-20261021, rig/sumw-seal-ab/RESULTS.md, rig/wt-sumw)
 
 The 2026-10-18 five-config matrix (INT4-FINDINGS-2026-10-18.md) left one
 unexplained cell: MoE qwen3-30b-a3b pp16 with the full production config c2
@@ -1988,21 +1842,21 @@ unexplained cell: MoE qwen3-30b-a3b pp16 with the full production config c2
 (-17.6%), a width where the floor should have forced the stock path.
 
 FORENSICS (this section, verified 2026-10-21):
-- The c2 MoE rows in /root/sumw-seal-ab/RESULTS.md (m-bench-c2-g1,
-  m-bench-c2-g2, timestamps 2026-10-18T20:43Z) record build_commit
-  93c65aa1b - the perf/sumw-plane staging binary.
-- 93c65aa1b (2026-10-15 15:41:13 -0700, tip of wt-sumw on mi50) does NOT
-  contain the MoE floor: `git merge-base --is-ancestor 25192179d HEAD` is
-  false in /root/wt-sumw, and mul-mat-id.cu in that tree carries NO
-  min_tokens clause (grep empty). The MoE floor commit 25192179d
-  (2026-10-15 15:11:49 -0700, "apply the width floor to the MoE u4
-  predicate") lives on the int4 lineage only.
+- The c2 MoE rows in rig/sumw-seal-ab/RESULTS.md (m-bench-c2-g1,
+ m-bench-c2-g2, timestamps 2026-10-18T20:43Z) record build_commit
+ - the perf/sumw-plane staging binary.
+- (2026-10-15 15:41:13 -0700, tip of wt-sumw on mi50) does NOT
+ contain the MoE floor: `git merge-base --is-ancestor HEAD` is
+ false in rig/wt-sumw, and mul-mat-id.cu in that tree carries NO
+ min_tokens clause (grep empty). The MoE floor commit
+ (2026-10-15 15:11:49 -0700, "apply the width floor to the MoE u4
+ predicate") lives on the int4 lineage only.
 - Therefore hypothesis (a) of the next-work brief is CONFIRMED: the floor
-  could not have engaged in that run; per-32 u4act ran ungated at pp16 on
-  MoE and paid the documented narrow-width loss (cf. section 61
-  crossover: u4 below stock below ne11 ~128).
+ could not have engaged in that run; per-32 u4act ran ungated at pp16 on
+ MoE and paid the documented narrow-width loss (cf. section 61
+ crossover: u4 below stock below ne11 ~128).
 
-RESULT (2026-10-21, 5fad030fc build, ROCm0, -t 128, 3 interleaved rounds,
+RESULT (2026-10-21, build, ROCm0, -t 128, 3 interleaved rounds,
 sigma < 0.4%): attribution CONFIRMED with a refinement. Three arms:
 stock / c2+floor (REPACK=1 DOT8=1 MIN_TOKENS=128 KSPLIT=1) / c2-nofloor.
 pp16: 303.5 / 222.1 / 198.0. The floor recovers +12.2% of the narrow
@@ -2019,10 +1873,10 @@ admission carries a ~-26% narrow-prefill (pp16-32) cost in the single-GPU
 -t128 regime that NO gate combination removes - narrow-prefill-sensitive
 deployments on repacked Q4_0 files trade that for the +9-11% tg/pp512
 wins. Regime caveat: all single-GPU; the 2026-10-18 3-GPU layer-split
-matrix absolutes are not comparable (deltas within-session only). NOTE (dates, not ancestry, per rule): 25192179d postdates the dense
+matrix absolutes are not comparable (deltas within-session only). NOTE (dates, not ancestry, per rule): postdates the dense
 floor 4abc9d735/1434fda3b (2026-10-14) by one day - the deployed
 build-merge binary carries the dense floor only per section 65-era
-validation; any MoE floor claim must come from a build at/after 25192179d
+validation; any MoE floor claim must come from a build at/after
 or its scrubbed descendant 2992b4275.
 
 ## 67. NVFP4 repack port, Phase 0: identity sealed exact on CPU; NO-GO for Phase 1 (2026-10-21, branch perf/int4-next-20261021, seals/seal_nvfp4_identity.cc, /home/brad/workspace/nvfp4-phase0/)
@@ -2031,27 +1885,27 @@ Phase 0 (CPU-only, per plan; full note + per-regime tables in the workspace
 dir): the E2M1 x UE4M3 integer identity for an NVFP4 repack path is derived,
 sealed, and falsifiable:
 - Decode: k = kvalues_fp4[code] in int8, |k| <= 12 (= 2 x E2M1 value),
-  re-derived from the bit layout (mag = (e==0)? m : (2+m)<<(e-1); sign-mag
-  FP, no bias - the Q4_0 XOR 0x88 trick does NOT apply).
+ re-derived from the bit layout (mag = (e==0)? m : (2+m)<<(e-1); sign-mag
+ FP, no bias - the Q4_0 XOR 0x88 trick does NOT apply).
 - D = sum(a_i k_i) exact in i32 (|D|max 24384 int8-act / 1536 int4-act;
-  88069x / 1.4Mx margin to 2^31).
+ 88069x / 1.4Mx margin to 2^31).
 - Epilogue exact in fp32 (NOT fp16): D needs 15 bits and UE4M3 mantissa 4,
-  19 <= 24 fp32 bits; fp16 fold rejected (15 > 11 bits; 1536*224 > 65504).
-  CORRECTION to the plan hint: UE4M3 scales are NOT powers of two (3-bit
-  mantissa; d=0x0B -> 11*2^-10); exactness survives via the M <= 15 bound.
+ 19 <= 24 fp32 bits; fp16 fold rejected (15 > 11 bits; 1536*224 > 65504).
+ CORRECTION to the plan hint: UE4M3 scales are NOT powers of two (3-bit
+ mantissa; d=0x0B -> 11*2^-10); exactness survives via the M <= 15 bound.
 - Undefined scale bytes d >= 0x7F ALIAS (bit7 shifted out; 0xFF -> 240 but
-  0x7F -> 0 via the NaN check): a port must reject/normalize them at
-  repack admission.
+ 0x7F -> 0 via the NaN check): a port must reject/normalize them at
+ repack admission.
 - Seal: 1296 trials (1000 random + adversarial regimes + sweeps), EXACT
-  equality vs an independent double reference, 0 failures; independently
-  reproduced by a separate Python implementation; falsified 3 ways
-  (decode-table off-by-one, dropped /2 fold, dropped sign) - all FAIL
-  loudly. Worst per-regime vacuous-trial fraction 0.9961
-  (all-subnormal-nibbles, adversarial-only by design); every regime has
-  >= 5 realized hits.
+ equality vs an independent double reference, 0 failures; independently
+ reproduced by a separate Python implementation; falsified 3 ways
+ (decode-table off-by-one, dropped /2 fold, dropped sign) - all FAIL
+ loudly. Worst per-regime vacuous-trial fraction 0.9961
+ (all-subnormal-nibbles, adversarial-only by design); every regime has
+ >= 5 realized hits.
 
 UPSTREAM STATE (verified in-tree, this branch): GGML_TYPE_NVFP4 = 40 and
-kvalues_fp4 are native in the fork's master via the 71a0624fb sync;
+kvalues_fp4 are native in the fork's master via the sync;
 upstream PRs #29173 (merged 2026-10-01) and #29857 (merged 2026-10-05)
 are already absorbed. The port would carry no local format patch - but
 section 45's generic-MMQ NVFP4 baseline (972.5 pp8192) is STALE: upstream
@@ -2069,44 +1923,44 @@ build. If the perf question is ever reopened, the defensible step is a
 measured micro-GEMM A/B on a post-sync build (probe, not commitment).
 The identity retains value for Blackwell-side FP4-MMA work.
 
-## 68. MIN_TOKENS floor extension to u4x16/u4q41: gates PASS, floor-invariance exact on two files, pp16 anomaly attributed to repack (2026-10-21, branch perf/int4-next-20261021 @ 5fad030fc, build /root/floor-u4x16/build (11758), /root/floor-u4x16/{ledger2,ledger3}.txt)
+## 68. MIN_TOKENS floor extension to u4x16/u4q41: gates PASS, floor-invariance exact on two files, pp16 anomaly attributed to repack (2026-10-21, branch perf/int4-next-20261021, build rig/floor-u4x16/build (11758), rig/floor-u4x16/{ledger2,ledger3}.txt)
 
-CHANGE (5fad030fc): the width floor (GGML_CUDA_W4A4_MIN_TOKENS) now gates ALL
+CHANGE : the width floor (GGML_CUDA_W4A4_MIN_TOKENS) now gates ALL
 u4 predicates in the dense dispatch (mul-mat.cu): u4act (per-32), u4x16
 (per-16 GEMM) and u4q41 (Q4_1 dp8a) each gain `ne11 >= min_tokens`;
 constant-true when unset (floor==0 byte-identical by construction). MoE site
 unchanged (u4act-only, already floored). Marker text + README tuning row
 updated to "covers every u4 path".
 
-GATES (all on 5fad030fc, ROCm0, -fa on -lm dio, -t 128, single GPU):
+GATES (all on , ROCm0, -fa on -lm dio, -t 128, single GPU):
 - Build gate: ggml+llama rc=0.
 - Marker gate: llama-perplexity DOT8=3+MIN_TOKENS=128 prints
-  "GGML_CUDA_W4A4_MIN_TOKENS=128 floor ACTIVE [explicit] (every u4 path
-  (u4act/u4x16/u4q41) falls back to stock q8_1 below this batch width)".
+ "GGML_CUDA_W4A4_MIN_TOKENS=128 floor ACTIVE [explicit] (every u4 path
+ (u4act/u4x16/u4q41) falls back to stock q8_1 below this batch width)".
 - Greedy seals (temp 0 top-k 1, re.findall number-sequence compare):
-  SEAL-1 short prompt, DOT8=3+floor128+REPACK vs stock: IDENTICAL
-  [1,1,2,3,4,5] - the floor forces the stock path below width 128.
-  SEAL-2 long prompt (>=300 tok), floor128 vs floor-unset: IDENTICAL - wide
-  per-16 path untouched. SEAL-3 negative control (short, floor-unset vs
-  stock): DIVERGES (extra trailing token) - proves the u4 decode path was
-  actually engaged in the comparison (non-vacuous harness).
+ SEAL-1 short prompt, DOT8=3+floor128+REPACK vs stock: IDENTICAL
+ [1,1,2,3,4,5] - the floor forces the stock path below width 128.
+ SEAL-2 long prompt (>=300 tok), floor128 vs floor-unset: IDENTICAL - wide
+ per-16 path untouched. SEAL-3 negative control (short, floor-unset vs
+ stock): DIVERGES (extra trailing token) - proves the u4 decode path was
+ actually engaged in the comparison (non-vacuous harness).
 - Engagement witness: 'q8_repack: repacking q4_0 tensors' present on every
-  gated leg, absent on stock legs. NOTE: GGML_CUDA_REPACK_Q4_0=1 is REQUIRED
-  for Q4_0 u4 on this build (opt-in admission; the 2026-10-18 matrix builds
-  admitted Q4_0 natively at the gate - a first perf spot without REPACK was
-  VACUOUS, all arms stock, caught by the ~0% deltas + missing witness).
+ gated leg, absent on stock legs. NOTE: GGML_CUDA_REPACK_Q4_0=1 is REQUIRED
+ for Q4_0 u4 on this build (opt-in admission; the 2026-10-18 matrix builds
+ admitted Q4_0 natively at the gate - a first perf spot without REPACK was
+ VACUOUS, all arms stock, caught by the ~0% deltas + missing witness).
 - KLD (c512 -b 2048 -ub 512 --chunks 128, f16 base):
-  floor-invariance EXACT on two files: upstream pure-Q4_0 floor128 vs
-  floor-unset = 0.090147 +- 0.001853 BOTH (PPL(Q) 8.559974 both); bartowski
-  mixed file 0.066060 +- 0.001572 BOTH. Anchor class reproduced: 0.090147
-  vs historical 0.090161 - residual (1.4e-5) attributed to the REGENERATED
-  f16 base (see incident note; base PPL 8.020648 vs 8.020672 historical).
-  The bartowski file is a MIXED quant (q4_0 + q6_K attn + q8_0 ssm_out
-  repacked per its log) - NOT pure Q4_0; its lower KLD vs f16 is a file
-  property, not a config effect. Public claims stay on the upstream file.
+ floor-invariance EXACT on two files: upstream pure-Q4_0 floor128 vs
+ floor-unset = 0.090147 +- 0.001853 BOTH (PPL(Q) 8.559974 both); bartowski
+ mixed file 0.066060 +- 0.001572 BOTH. Anchor class reproduced: 0.090147
+ vs historical 0.090161 - residual (1.4e-5) attributed to the REGENERATED
+ f16 base (see incident note; base PPL 8.020648 vs 8.020672 historical).
+ The bartowski file is a MIXED quant (q4_0 + q6_K attn + q8_0 ssm_out
+ repacked per its log) - NOT pure Q4_0; its lower KLD vs f16 is a file
+ property, not a config effect. Public claims stay on the upstream file.
 - Perf spot (3 interleaved rounds x 3 arms, means): stock pp16 305.3 /
-  pp512 941.0 / tg128 71.6; per16 (DOT8=3, no floor) 240.9 / 994.8 / 80.6;
-  floor128 226.5 / 993.1 / 79.0.
+ pp512 941.0 / tg128 71.6; per16 (DOT8=3, no floor) 240.9 / 994.8 / 80.6;
+ floor128 226.5 / 993.1 / 79.0.
 
 PP16 ANOMALY ATTRIBUTED (4-arm probe, ledger3): repackonly (REPACK_Q4_0=1,
 no gate) pp16 = 225.7 +- 0.2 - statistically identical to floor-per32
@@ -2131,37 +1985,37 @@ pre-flight check. k1/k2 results predate the clobber and remain valid.
 ## 69. W4A8 ASM census: NO-GO on the production GEMM - the i8-activation form already exists as the stock q8_1 kernel and is the heavier one (2026-10-21, branch perf/int4-next-20261021, docs/w4a8-census.md, mi50:/tmp/w4a8-census/)
 
 Census of all 10 Q4_0 repacked kernels (code objects 48/49 of 144) in the
-5fad030fc build's libggml-hip.so.0, per the program census discipline
+ build's libggml-hip.so.0, per the program census discipline
 (roc-obj-ls -> dd per-object ELFs -> llvm-objdump -d --mcpu=gfx906; YAML
 .note spill counters cross-checked against scratch ops). Full table:
 docs/w4a8-census.md.
 
 - The W4A8 shape (i8 activations, v_dot4_i32_i8) ALREADY EXISTS in the
-  binary: the stock q8_1 GEMM is exactly that kernel. Production w64 GEMM
-  hot loop: dot4 form = 256 v_dot4 in 653 instrs (39.1% dot density,
-  67 loads, 128 VGPR + 20 VGPR SPILLS, 6 scratch ops in-loop) vs
-  dot8/u4act form = 128 v_dot8 in 647 (19.8%, 42 loads, 127 VGPR,
-  ZERO spills). Same MACs, strictly more instructions and bytes.
+ binary: the stock q8_1 GEMM is exactly that kernel. Production w64 GEMM
+ hot loop: dot4 form = 256 v_dot4 in 653 instrs (39.1% dot density,
+ 67 loads, 128 VGPR + 20 VGPR SPILLS, 6 scratch ops in-loop) vs
+ dot8/u4act form = 128 v_dot8 in 647 (19.8%, 42 loads, 127 VGPR,
+ ZERO spills). Same MACs, strictly more instructions and bytes.
 - The go criterion ("u4 hot loops bandwidth-dominated -> doubling dots is
-  nearly free") FAILS on the production GEMM: it is dot-dense at the spill
-  cliff. The only kernels passing the criterion are the mat-vecs (4-15%
-  density, zero spills) - not where prefill wall time lives.
+ nearly free") FAILS on the production GEMM: it is dot-dense at the spill
+ cliff. The only kernels passing the criterion are the mat-vecs (4-15%
+ density, zero spills) - not where prefill wall time lives.
 - The trade has in fact been MEASURED all along: every gate-vs-stock bench
-  (e.g. section 61: gate +27..+32% pp at ne11 >= 128) is dot8-form vs
-  dot4-form on the same shapes. W4A8's Phase-1 kernel would land on the
-  measured-slower side.
+ (e.g. section 61: gate +27..+32% pp at ne11 >= 128) is dot8-form vs
+ dot4-form on the same shapes. W4A8's Phase-1 kernel would land on the
+ measured-slower side.
 - Toolchain: v_dot4_i32_i8 EMITS (probe + --save-temps, bogus-symbol
-  control failed-compile as required). Operand pairing VERIFIED EMPIRICALLY
-  on hardware (ROCm0 probe, flock'd): little-endian byte order, exact
-  (hw=192 vs LE prediction 192, reversed-order 48 rejected).
+ control failed-compile as required). Operand pairing VERIFIED EMPIRICALLY
+ on hardware (ROCm0 probe, flock'd): little-endian byte order, exact
+ (hw=192 vs LE prediction 192, reversed-order 48 rejected).
 - VERDICT: NO-GO for a Phase-1 W4A8 kernel proposal on the throughput
-  premise. What remains is a PURE ACCURACY trade: an 8-bit activation path
-  would halve the ~45% activation-error class (accuracy brief R3) at the
-  measured cost of the stock-q8_1 GEMM shape (dot-dense + spilled, and
-  ~22-27% slower prefill than the u4 form at wide widths per the gate
-  benches). That is the owner's Pareto call, not a census question.
+ premise. What remains is a PURE ACCURACY trade: an 8-bit activation path
+ would halve the ~45% activation-error class (accuracy brief R3) at the
+ measured cost of the stock-q8_1 GEMM shape (dot-dense + spilled, and
+ ~22-27% slower prefill than the u4 form at wide widths per the gate
+ benches). That is the owner's Pareto call, not a census question.
 
-## 70. Dense SUMW interleaved cell: documented null-to-negative - tg flat, pp512 consistent -2.15% (0/15 positive); NOT a dense default-on candidate (2026-10-21, branch perf/int4-next-20261021 @ 5fad030fc, /root/floor-u4x16/{ledger4.txt,dense-sumw/})
+## 70. Dense SUMW interleaved cell: documented null-to-negative - tg flat, pp512 consistent -2.15% (0/15 positive); NOT a dense default-on candidate (2026-10-21, branch perf/int4-next-20261021, rig/floor-u4x16/{ledger4.txt,dense-sumw/})
 
 Design: 15 interleaved paired rounds on ONE card (ROCm0; card-split regime
 - the original 3-card x 15 design adapted), arms identical except
@@ -2213,11 +2067,11 @@ STATUS: parked. To unpark needs (1) owner go-ahead to design the per-width
 signal-isolated revisit state machine (multi-day, new subsystem, not the
 brief's "half a day"), and (2) a >=2-card TP window for the losslessness
 gauntlet (causal-flip classification + CPU-sampler-line grep mandatory).
-Related untested branch noted: fix/mtp-sampler-guard-t1 (68ba197d1) targets
+Related untested branch noted: fix/mtp-sampler-guard-t1 targets
 the set_sampler CPU-sampler hard-guard root cause; needs its own >=2-card
 window and the same gauntlet.
 
-## 72. Layer-selective activation granularity - CHEAP PRIOR: FAILS the 50% bar (43.5% best), benefit is proportional to tensor fraction, not concentrated -> NULL, no mechanism built (2026-10-21, branch perf/int4-next-20261021, /root/floor-u4x16/ledger6.txt)
+## 72. Layer-selective activation granularity - CHEAP PRIOR: FAILS the 50% bar (43.5% best), benefit is proportional to tensor fraction, not concentrated -> NULL, no mechanism built (2026-10-21, branch perf/int4-next-20261021, rig/floor-u4x16/ledger6.txt)
 
 Four KLD cells, dense Qwen3.5-9B upstream pure Q4_0, c512 -b 2048 -ub 512
 --chunks 128 vs the repaired f16 base, REPACK=1 KSPLIT=1 floor128, all
@@ -2226,11 +2080,11 @@ GGML_W4A4_ONLY=attn|ffn under DOT8=3 (gate-3 semantics: the filter selects
 which tensors get the per-16 GEMM; non-matching tensors keep per-32 u4act
 - exactly the mixed cells needed).
 
-  cell                        Mean KLD      recovery of full per-16 gain
-  per-32 (DOT8=1, full)       0.122150      -
-  per-16 (DOT8=3, full)       0.090147      100% (gap 0.032003)
-  per-16 attn + per-32 ffn    0.111959      31.8%
-  per-32 attn + per-16 ffn    0.108239      43.5%
+ cell Mean KLD recovery of full per-16 gain
+ per-32 (DOT8=1, full) 0.122150 -
+ per-16 (DOT8=3, full) 0.090147 100% (gap 0.032003)
+ per-16 attn + per-32 ffn 0.111959 31.8%
+ per-32 attn + per-16 ffn 0.108239 43.5%
 
 ANCHOR CROSS-CHECK: per-32 reproduces 0.122150 EXACTLY (6 decimals, the
 historical anchor). per-16 reads 0.090147 vs the historical 0.090161 -
@@ -2249,7 +2103,7 @@ GGML_CUDA_W4A4_DOT16_ONLY code, no sweep needed). Owner may tune the 50%
 threshold; at 31.8/43.5 the frontier point is poor either way: per-16 on
 ffn alone pays per-16 prefill on half the tensors for 43.5% of the gain.
 
-## 73. Stock-form w64 GEMM spill fix: THREE approaches, all bit-exact-or-rejected; NO-GO on adoption - the spills are latency, not throughput (2026-10-22, branch perf/int4-next-20261021, scratch trees mi50:/root/floor-u4x16/{src-spillfix,build-spillfix}, ledger7.txt)
+## 73. Stock-form w64 GEMM spill fix: THREE approaches, all bit-exact-or-rejected; NO-GO on adoption - the spills are latency, not throughput (2026-10-22, branch perf/int4-next-20261021, scratch trees rig/floor-u4x16/{src-spillfix,build-spillfix}, ledger7.txt)
 
 Target: the stock-form q8_1-activation `mmq_gemm_repacked` (the kernel behind every floored narrow-width fallback, the MTP verify pass and SKIP tensors; 128 VGPR / 20 vgpr spills / 52 B private segment / 6 in-loop scratch ops per the section 69 census). Success criterion: spills materially down with dot density unchanged AND bit-exact math. Seal gate: greedy temp-0 top-k-1 seed-42, floor env (REPACK_Q4_0=1 DOT8=1 MIN_TOKENS=128 KSPLIT=1), short + ~300-token prompts.
 
@@ -2261,7 +2115,7 @@ Target: the stock-form q8_1-activation `mmq_gemm_repacked` (the kernel behind ev
 
 PROGRAM CONCLUSION: the stock-form GEMM's 20 spills are NOT a throughput lever. Close the queue item opened by the section 69 external review. If the fallback path ever needs to be faster, the lever is the LDS/prefetch schedule (A3 shows it dominates), not register pressure. Reproduction: the A1 diff is one line (`__launch_bounds__` second arg 2 -> 1 at repack-kernels.cuh:1887) and the A3 diff is the two `wlo`/`whi` prefetch blocks; both scratch trees are on mi50.
 
-## 74. MoE activation-granularity mandate, RESOLVED: accuracy is monotone in granularity (per-8 < per-16 < per-32) but no profile dominates; per-32 stays default, per-8 becomes the quality profile (2026-10-22, branch perf/int4-next-20261021, mi50:/root/floor-u4x16/{moe-base-kld.sh,moe-kld-self.sh,moe-mode-bench.sh}, ledgers ledger-moe-kld*.txt + ledger-moe-mode-bench.txt)
+## 74. MoE activation-granularity mandate, RESOLVED: accuracy is monotone in granularity (per-8 < per-16 < per-32) but no profile dominates; per-32 stays default, per-8 becomes the quality profile (2026-10-22, branch perf/int4-next-20261021, rig/floor-u4x16/{moe-base-kld.sh,moe-kld-self.sh,moe-mode-bench.sh}, ledgers ledger-moe-kld*.txt + ledger-moe-mode-bench.txt)
 
 Model: Qwen3-30B-A3B BASE (qwen3moe, 128 experts / 8 active, 48 blocks). Base = bf16 converted from the HF repo (Qwen/Qwen3-30B-A3B), llama-perplexity ch64 c512 wikitext, PPL(base) = 8.8240 +/- 0.20984, logits 4.96 GB with sha256 recorded (moe30b-bf16-c512-ch64.logits).
 
@@ -2288,19 +2142,19 @@ No profile dominates: m2 wins accuracy and loses wide prefill; m1 wins wide pref
 
 VERDICT - NO MANDATE, and m3 is dominated: keep DOT8=1 (per-32 u4) as the MoE default for prompt-heavy throughput, publish DOT8=2 (per-8 u4p) as the quality-first MoE profile (-25.6% KLD for -4.7% pp512, decode unchanged), and drop per-16 from MoE consideration - it is strictly beaten by per-8 on accuracy and gives back half the wide-prefill win. The per-16-vs-per-32 question that section 72 left open for MoE is answered by granularity monotonicity: the choice is a per-deployment point on a single quality/speed curve, not a mandate.
 
-## 75. TP2 serving UNBLOCKED (the hang was a build config, not the code); spec-decode MTP gauntlet: +65-99% but NOT reliably lossless (2026-10-22, branch perf/int4-next-20261021, build-rccl on mi50, logs /root/t6, /root/t6s)
+## 75. TP2 serving UNBLOCKED (the hang was a build config, not the code); spec-decode MTP gauntlet: +65-99% but NOT reliably lossless (2026-10-22, branch perf/int4-next-20261021, build-rccl on mi50, logs rig/t6, rig/t6s)
 
-**PART A - the TP2 hang, root-caused to the BUILD.** Every `-sm tensor` run on /root/floor-u4x16/build hung, spun at 339% CPU, ignored TERM, leaked VRAM proportional to the resident model (14.4 GB/card for a 27B Q8, 3.4 GB/card for a 9B Q4_0, no kfd holder) and wedged the SMC (rocminfo 0 agents, dmesg `Failed to send message 0x2a, response 0xfc`), needing a host POWER CYCLE each time (5 wedges). Cause: that build has `GGML_HIP_RCCL:BOOL=OFF` and links NO librccl (`ldd libggml-hip.so | grep -c rccl` = 0), so any TP collective outside the custom-AR fast path waits forever. The previously validated TP2 build (/root/mx-merge-src/build-merge, the one that measured +13.9% tg / +37% pp) has `GGML_HIP_RCCL=ON`. llama-bench masked it (its shapes all ride custom AR); llama-cli samples per token and hit the missing fallback. Ruled out along the way: shexp-split (LLAMA_SHEXP_SPLIT=0 engaged, hang persisted), custom AR (ON BY DEFAULT per ggml-cuda.cu:1102, so the "clean" leg already had it), the 27B MTP vehicle (9B cli wedged too), and HIP_VISIBLE_DEVICES as sole cause (it independently breaks TP - always pass devices via `-dev`).
-FIX, verified end to end: build with `-DGGML_HIP_RCCL=ON` (build-rccl) AND run with TheRock nightly libs first in LD_LIBRARY_PATH, per the rig's RCCL rule: with the apt 7.2.3 stack the same binary SIGSEGVs inside libamdhip64 during `ggml_backend_cuda_comm_init` (gdb backtrace, /root/gdb.log). With `LD_LIBRARY_PATH=/root/therock-venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib:_rocm_sdk_core/lib` the 9B runs clean on TP2: gen 85.3 t/s, prompt 32.5 t/s, rc=0, 3 agents and 10.8 MB VRAM after - no leak, no wedge.
+**PART A - the TP2 hang, root-caused to the BUILD.** Every `-sm tensor` run on rig/floor-u4x16/build hung, spun at 339% CPU, ignored TERM, leaked VRAM proportional to the resident model (14.4 GB/card for a 27B Q8, 3.4 GB/card for a 9B Q4_0, no kfd holder) and wedged the SMC (rocminfo 0 agents, dmesg `Failed to send message 0x2a, response 0xfc`), needing a host POWER CYCLE each time (5 wedges). Cause: that build has `GGML_HIP_RCCL:BOOL=OFF` and links NO librccl (`ldd libggml-hip.so | grep -c rccl` = 0), so any TP collective outside the custom-AR fast path waits forever. The previously validated TP2 build (rig/mx-merge-src/build-merge, the one that measured +13.9% tg / +37% pp) has `GGML_HIP_RCCL=ON`. llama-bench masked it (its shapes all ride custom AR); llama-cli samples per token and hit the missing fallback. Ruled out along the way: shexp-split (LLAMA_SHEXP_SPLIT=0 engaged, hang persisted), custom AR (ON BY DEFAULT per ggml-cuda.cu:1102, so the "clean" leg already had it), the 27B MTP vehicle (9B cli wedged too), and HIP_VISIBLE_DEVICES as sole cause (it independently breaks TP - always pass devices via `-dev`).
+FIX, verified end to end: build with `-DGGML_HIP_RCCL=ON` (build-rccl) AND run with TheRock nightly libs first in LD_LIBRARY_PATH, per the rig's RCCL rule: with the apt 7.2.3 stack the same binary SIGSEGVs inside libamdhip64 during `ggml_backend_cuda_comm_init` (gdb backtrace, rig/gdb.log). With `LD_LIBRARY_PATH=rig/therock-venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib:_rocm_sdk_core/lib` the 9B runs clean on TP2: gen 85.3 t/s, prompt 32.5 t/s, rc=0, 3 agents and 10.8 MB VRAM after - no leak, no wedge.
 STANDING RULE: any TP binary here must be RCCL-built AND run against the nightly libs; verify with `ldd | grep -E "rccl|amdhip64"` before the first run. A missing/wrong RCCL does not fail loudly - it deadlocks or segfaults and takes the host with it.
 
 **PART B - Task 6 spec-decode gauntlet on TP2 (27B MTP internal vehicle, Q8_0, build-rccl + nightly, LLAMA_SHEXP_SPLIT=0, greedy temp 0 top-k 1, -n 64 / -n 128, single prompt then a 3-prompt suite).**
 Speed (t/s generation, TP2, ROCm0+ROCm1): control 30.4 / 30.5 / 30.7 x3 = 30.4-30.7; MTP unset 52.7; MTP_SAFE=1 52.6; MTP_SAFE=2 52.3; suite MTP 50.6 / 57.7 / 61.2. So MTP is +65% to +99% over control, and MTP_SAFE=1 costs nothing measurable here (52.6 vs 52.7) - the recorded -10.4% lock-off penalty did NOT reproduce on this build. MTP_SAFE=2 reads identical to unset, consistent with section 71 (mode 2 is a log line, not an implementation).
 CPU-sampler fallback: grep for "CPU sampler|using CPU" = 0 across all 11 legs, so the historically cited disqualifier is NOT what is happening on this build.
 Losslessness (the binding gate): control determinism verified identical (1172 chars, two runs). Single prompt: MTP, MTP_SAFE=1 and MTP_SAFE=2 are ALL byte-identical to control. Three-prompt suite at -n 128: prompt3 IDENTICAL; prompt1 and prompt2 DIVERGE late (first difference at char 1075/1299 and 1122/1304, i.e. roughly 85% through, on near-tie wording such as "mechanics/engineering)" vs "mechanics/engineering basics)"). No first-token flips observed.
-VERDICT: MTP on TP2 is a large real speed win and its divergences are late near-tie flips, not early corruption - but the lossless contract is NOT met at temp 0 as measured (1/3 prompts identical). Per the gauntlet's own classification rule these must be classified BENIGN vs FUNDAMENTAL from per-token top-20 logprobs, which needs the llama-server path; that classification, not more cli comparisons, is the next step. This also matches the 68ba197d1 commit note: the residual speculative divergence on this rig is the verify-kernel batch-invariance class (upstream #25618), not the sampler guard. Adopting MTP for production is therefore still an owner decision on a quantified near-tie rate, not a settled win.
+VERDICT: MTP on TP2 is a large real speed win and its divergences are late near-tie flips, not early corruption - but the lossless contract is NOT met at temp 0 as measured (1/3 prompts identical). Per the gauntlet's own classification rule these must be classified BENIGN vs FUNDAMENTAL from per-token top-20 logprobs, which needs the llama-server path; that classification, not more cli comparisons, is the next step. This also matches the commit note: the residual speculative divergence on this rig is the verify-kernel batch-invariance class (upstream #25618), not the sampler guard. Adopting MTP for production is therefore still an owner decision on a quantified near-tie rate, not a settled win.
 
-## 76. Spec-decode classification (server logprobs path): MTP on TP2 shows ZERO fundamental flips - both divergences are near-ties the base itself could not call (2026-10-22, build-rccl + TheRock nightly, /root/t6srv, classifier /root/t6-classify.py)
+## 76. Spec-decode classification (server logprobs path): MTP on TP2 shows ZERO fundamental flips - both divergences are near-ties the base itself could not call (2026-10-22, build-rccl + TheRock nightly, rig/t6srv, classifier rig/t6-classify.py)
 
 Method (the gauntlet's distributional gate, finally run on the server path): llama-server on build-rccl, TP2 via `-dev ROCm0,ROCm1 -sm tensor`, TheRock nightly libs first in LD_LIBRARY_PATH, LLAMA_SHEXP_SPLIT=0, port 8099, one server start per leg (TERM after capture, never KILL). Three prompts x {control, --spec-type draft-mtp} = 6 legs, greedy (`temperature 0`, `top_k 1`, `seed 42`, `n_predict 128`), each requesting `logprobs: true, top_logprobs: 20`. All 6 legs rc=0, HTTP 200, 18-21 s per leg, 3 gfx906 agents before and after every leg, VRAM back to 10.8 MB/card, no wedge. Classification rule: first token divergence only (causal flip); BENIGN if base margin <= 0.5 nats AND the spec pick is in the base top-3; FUNDAMENTAL if margin > 1.0 OR the pick is outside top-20; else MIXED. Post-flip positions are trajectory drift, counted separately and never as flips.
 
@@ -2318,7 +2172,7 @@ VERDICT: the spec-decode losslessness gap on this rig is NOT corruption - it is 
 
 HARNESS NOTES (for whoever reruns this): `rocminfo | grep -c gfx906` returns 6, not 3 - each card contributes a `Name: gfx906` line AND an ISA line, so the correct gate is `rocminfo | awk '$1=="Name:" && $2=="gfx906"' | wc -l` = 3. A 3-card gate written the naive way aborts the whole run at leg 1 (cost: two no-op runs). The classifier takes `--dir`, not a positional path.
 
-## 77. MoE K-split factorial half (Task 2 closed): K-split HELPS MoE narrow prefill - +7.4% pp16 / +6.0% pp32, opposite direction from the dense side (2026-10-22, build-rccl, ROCm0, /root/moe-ksplit/)
+## 77. MoE K-split factorial half (Task 2 closed): K-split HELPS MoE narrow prefill - +7.4% pp16 / +6.0% pp32, opposite direction from the dense side (2026-10-22, build-rccl, ROCm0, rig/moe-ksplit/)
 
 The last unanswered cell of the 2026-10-18 knob matrix: the MoE half of the {KSPLIT 0/1} x {per-32} factorial never ran (the dense side showed K-split SUBSTITUTES for per-16 - both attack narrow-width scale-plane bandwidth - and "NULL at per-16"). Open question per the brief: MoE narrow prefill contains K-split-covered DENSE linears (q/k/v/o) plus expert GEMMs the K-split guard cannot touch - what share is dense-tensor work?
 
@@ -2336,17 +2190,15 @@ CROSS-CHECK: KS1 today (207.32-208.58 pp16) reproduces section 74's independentl
 
 VERDICT: MoE narrow prefill DOES contain enough K-split-covered dense-tensor work for the split to pay: +7.4% pp16 / +6.0% pp32 at per-32, wide widths and decode untouched. This is the OPPOSITE direction from the dense finding (where K-split merely substituted for per-16 and was null at per-16) - on MoE there was no per-16 alternative in play, so the dense-linears share of narrow prefill is directly visible. PRACTICAL: keep GGML_RP_KSPLIT=1 in every MoE per-32 configuration (the `speed` profile already does); there is no regime where it loses. Task 2 is now fully closed: part 1 = the pp16 mystery was the missing MoE floor (section 66), part 2 = this factorial.
 
-## 78. Outside-the-brief batch: TP3 measured (flat at 9B), sampler-guard fix declared MOOT with evidence, near-tie rate tightened to n=10 (zero fundamental flips in 2560 tokens) (2026-10-22, build-rccl + nightly libs, /root/tp3-bench/, /root/t6srv2/)
+## 78. Outside-the-brief batch: TP3 measured (flat at 9B), near-tie rate tightened to n=10 (zero fundamental flips in 2560 tokens) (2026-10-22, build-rccl + nightly libs)
 
 **A. TP3 vs TP2 (9B Q4_0, `-sm tensor`, 3 interleaved rounds, 6 legs all rc=0).** pp512: TP2 942.21 vs TP3 941.51 (-0.07%). tg128: 70.90 vs 70.86 (-0.06%). TP2_R1 was a cold-start outlier (695/55.8) correctly dropped by medians. VERDICT: the third card adds nothing at 9B Q4 - the model is too small for a 3-way split to amortize; TP2 remains the TP recommendation at this size. OPEN: TP3 on the 27B/30B class (fits 3x32 GB) is the interesting cell and is unmeasured. Rig note: llama-swap auto-loaded the production 27B onto ROCm0/1 ~29 s after the bench exited (observed 15 GB/card, pid traced to llama-swap) - check for that before diagnosing "orphaned VRAM" after a bench; it unloaded again later.
 
-**B. The 68ba197d1 sampler-guard fix (mx-int4, unmerged) is MOOT for this build's serving path.** Evidence chain, all verified on the box: (1) zero guard hits in all 17 leg stderr logs from today; (2) the RCCL build carries the OLD hard-refusal guard verbatim (`bin/libllama.so.0.6.0` contains "backend sampling not supported with SPLIT_MODE_TENSOR; using CPU") - so the zero-hit baseline is explained by unreachability, NOT by the fix being applied; (3) source: the guard lives at llama-context.cpp:1676-1687 (hard `return false` under SPLIT_MODE_TENSOR). Callers: llama-server calls `llama_set_sampler` only when per-request `backend_sampling` is true (default FALSE, common.h:299) - no server leg exercised it; the only live caller is the MTP draft offload (speculative.cpp:1866, `backend_sampling` default TRUE), and it PASSES the guard because `ctx_dft` is single-lane, not tensor-split. VERDICT: the fix changes nothing for `llama-server + -sm tensor` as exercised; it would only matter if a request set backend_sampling=true against a tensor-split target or the draft were loaded under tensor split. Do not spend time merging it for the TP deadlock/hang story - that story was RCCL (section 75). The residual spec-decode divergence is the verify-kernel batch-invariance class (upstream #25618), per the fix's own commit note.
-
-**C. Near-tie rate, n=10 prompts x 256 tokens (up from n=3 x 128).** 20 server legs, all rc=0 / HTTP 200 / 3 agents, ~3 min wall. Classifier: **LOSSLESS=3, BENIGN=7, MIXED=0, FUNDAMENTAL=0**; every one of the 7 divergences is a rank-2 pick with base margin 0.01-0.06 nats (examples: p4 `invest` -0.814 vs `buy` -0.833; p8 `\n` -0.671 vs `\n\n` -0.716; p10 `each` -0.693 vs `a` -0.699); 1081 post-flip drift tokens excluded as non-flips. QUOTABLE RATE: zero fundamental divergence across 2560 generated tokens; ~70% of prompts contain exactly one near-tie flip where the base's own top-2 are <= 0.06 nats apart. Combined with section 75 speed (+65-99%), MTP on TP2 is now fully characterized for an adoption decision. CAVEAT: one vehicle (27B MTP internal), one seed; rerun the suite per model before generalizing.
+**B. Near-tie rate, n=10 prompts x 256 tokens (up from n=3 x 128).** 20 server legs, all rc=0 / HTTP 200 / 3 agents, ~3 min wall. Classifier: **LOSSLESS=3, BENIGN=7, MIXED=0, FUNDAMENTAL=0**; every one of the 7 divergences is a rank-2 pick with base margin 0.01-0.06 nats (examples: p4 `invest` -0.814 vs `buy` -0.833; p8 `\n` -0.671 vs `\n\n` -0.716; p10 `each` -0.693 vs `a` -0.699); 1081 post-flip drift tokens excluded as non-flips. QUOTABLE RATE: zero fundamental divergence across 2560 generated tokens; ~70% of prompts contain exactly one near-tie flip where the base's own top-2 are <= 0.06 nats apart. Combined with section 75 speed (+65-99%), MTP on TP2 is now fully characterized for an adoption decision. CAVEAT: one vehicle (27B MTP internal), one seed; rerun the suite per model before generalizing.
 
 HARNESS NOTES: the classifier's PROMPT_IDS was hardcoded (1,2,3) - now auto-detects prompt ids from the directory (set-deduped; a first-run double-count bug from matching ctrl+mtp files per id was fixed). The naive `rocminfo | grep -c gfx906` agent count returns 6 and even name-line greps must anchor the value (ISA lines match loosely); the reliable count is `awk '$1=="Name:" && $2=="gfx906"'`. The TP3 ledger's per-leg `agents=` column recorded 2 on TP2 legs (device-count of that leg, not the rig) - a script quirk, not a rig state.
 
-## 79. THE STACKED NUMBER: all shipped levers at once vs stock on the dense 9B - +17.7% decode, and the composition is super-additive (2026-10-22, build-rccl, ROCm0, /root/stacked/)
+## 79. THE STACKED NUMBER: all shipped levers at once vs stock on the dense 9B - +17.7% decode, and the composition is super-additive (2026-10-22, build-rccl, ROCm0, rig/stacked/)
 
 The run the brief never contained: one binary (build-rccl), one model (dense 9B Q4_0), 4 arms x 3 interleaved rounds, 12 legs all rc=0. Arms: stock (no env); mtp (--spec-type draft-mtp, native head); speed (REPACK_Q4_0=1 + DOT8=1 + MIN_TOKENS=128 + KSPLIT=1 + SUMW=1 - the full `speed` profile); speed_mtp (speed + draft-mtp). Greedy, single ~50-token technical prompt, -n 128. Gate engagement VERIFIED post-hoc: the sweep's .err files were empty because this build's llama-cli FILTERS GGML_LOG_WARN without -v (same verbosity-filter class as llama-bench; upstream fixed it for ERROR only, #28229 lineage) - a -v rerun with the identical env shows all markers (`GGML_CUDA_REPACK_Q4_0 gate ACTIVE`, `W4A4_SUMW gate ACTIVE`, repacking q4_0/q6_K/q8_0). STANDING RULE EXTENDED: gate witnesses require -v on llama-cli too, not just llama-bench.
 
@@ -2366,7 +2218,7 @@ READINGS:
 
 CONTEXT AND HONEST SCOPE: this is the dense 9B at short-prompt/128-token decode - the cheapest clean A/B, not the production config. The production-relevant numbers that already exist: MoE 30B stacked (per-32+floor+ksplit) vs stock = +11.8% pp512 / +9.1% tg / -26% pp16 (section 74); MTP on TP2 27B = +65-99% decode with benign-only flips (sections 75/76/78); K-split adds +7.4% pp16 on MoE (section 77). What is still NOT measured stacked: MTP on the MoE (no native MTP head on the base 30B - would need a draft), and any stacked config on TP2/TP3.
 
-## 80. MoE + MTP stacked sweep on the CLEAN Q4_0 35B: MTP ALONE is the best MoE config - the gate stack SUBTRACTS 4.3% from MTP, inverting the dense composition rule (2026-10-22, build-rccl, ROCm0, /root/moe35clean/)
+## 80. MoE + MTP stacked sweep on the CLEAN Q4_0 35B: MTP ALONE is the best MoE config - the gate stack SUBTRACTS 4.3% from MTP, inverting the dense composition rule (2026-10-22, build-rccl, ROCm0, benchmarks/qwen35-35b-a3b/moe-baseline-RESULTS.md)
 
 The capstone cell: dense 9B showed the gate stack and MTP composing SUPER-additively (+17.7%, section 79). This section ran the identical 4-arm protocol on the MoE that can actually run every lever: CLEAN Qwen3.6-35B-A3B Q4_0 (bartowski, 87.6% of weight bytes in Q4_0, native nextn MTP head) + its official MTP sidecar draft (1.19 GB). 12 legs, 3 interleaved rounds, all rc=0, gate witness 5/5 on speed arms and 0 on stock/mtp as designed, box clean after.
 
@@ -2390,7 +2242,7 @@ RECIPE NOTE: bartowski splits the MTP head into a sidecar GGUF - the spec arms n
 
 SCOPE/CAVEATS: single vehicle (clean base 35B - good provenance), one prompt, 3 rounds, one seed, 225 W caps (host was cycled; within-session paired deltas valid, absolutes not comparable to 175 W sections). The 4.3% gate penalty on MTP is one measurement on one MoE; rerun per model before generalizing - but the DIRECTION is mechanistically explained and matches section 74's encoder accounting.
 
-## 81. MTP-overhead suite PORTED from CV - and the A/B verdict is a clean NULL: zero gain on our fork, output byte-identical everywhere (2026-10-22, branch perf/cv-mtp-overhead @ 2fd439f14, gitea, /root/tp-cvab/)
+## 81. MTP-overhead suite PORTED from CV - and the A/B verdict is a clean NULL: zero gain on our fork, output byte-identical everywhere (2026-10-22, branch perf/cv-mtp-overhead, gitea, rig/tp-cvab/)
 
 Items 1 (LLAMA_GRAPH_CACHE2, +84/-1 in llama-context.{h,cpp}) and 3 (LLAMA_CKPT_LAST_VERIFY, server-side) ported to branch perf/cv-mtp-overhead; item 2 (LLAMA_SPEC_MTP_MERGE) correctly STOPPED - our common/speculative.cpp draft_mtp diverged structurally from CV's (no process_impl/deferred_batch/set_dft_full_ckpt; we use deferred_prefill/prefill_chunks), so porting meant rewriting the feature. Build rc=0 including llama-server. Default-off seal: token-identical. Pushed to gitea.
 
@@ -2404,9 +2256,9 @@ STATUS/DECISION: branch perf/cv-mtp-overhead stays on gitea (harmless: default-o
 
 MEASUREMENT NOTES: the timing line in this build's llama-cli prints to stdout and the first comparison pass flagged a false DIFFERS from the build banner (`b11758` vs `b11785`) at char 264 - always strip the banner block before byte-comparing runs from different binaries. Absolute gen level this session (30.8 t/s) is well below section 75's 52.7 t/s for the same model/config - same-session deltas are valid, but the level gap is an open question (power caps read 225 W = uncapped after the host cycle; thermal or state differences suspected, unresolved).
 
-## 81a. CORRECTION to section 81: the first A/B accidentally ran WITHOUT spec decode; with MTP active the ported suite's default-on path CRASHES deterministically under TP2 (2026-10-22, /root/tp-cvab/)
+## 81a. CORRECTION to section 81: the first A/B accidentally ran WITHOUT spec decode; with MTP active the ported suite's default-on path CRASHES deterministically under TP2 (2026-10-22, rig/tp-cvab/)
 
-The 9-leg A/B in section 81 was INVALID: the launcher omitted `--spec-type draft-mtp`, so PRE/OFF/ON were three identical plain-decode arms (~30.8 t/s, "speculative": false in the diagnostic) - that is also why everything read byte-identical and why the gen level was 30.8 instead of the ~47-52 expected under MTP. Caught by a verbose diagnostic; invalid legs archived at /root/tp-cvab/nospec/.
+The 9-leg A/B in section 81 was INVALID: the launcher omitted `--spec-type draft-mtp`, so PRE/OFF/ON were three identical plain-decode arms (~30.8 t/s, "speculative": false in the diagnostic) - that is also why everything read byte-identical and why the gen level was 30.8 instead of the ~47-52 expected under MTP. Caught by a verbose diagnostic; invalid legs archived at rig/tp-cvab/nospec/.
 
 RE-RUN with MTP active (27B internal vehicle Q8_0, TP2 ROCm0+ROCm1, nightly libs, greedy, -n 128, 3 interleaved rounds, 9 legs):
 - PRE (pre-port build-rccl): 47.6 t/s gen median (47.5-47.8), prompt 89.2-93.2 - consistent with section 75.
@@ -2416,28 +2268,28 @@ RE-RUN with MTP active (27B internal vehicle Q8_0, TP2 ROCm0+ROCm1, nightly libs
 REVISED VERDICT (supersedes section 81's "harmless no-op"): the port is INCOMPLETE for our serving path. CV's graph_cache2 works against CV's scheduler/meta configuration; against OUR meta-backend under TP2 + draft-mtp, activating the second slot hits an unpopulated backend-copy/join node array. Status: **default-off is the only safe state; default-on must not ship until the meta-backend graph-cache2 path is fixed** (the assert site is the debugging entry point - the MTP draft graph's backend-copy/join node array is not populated when the alt slot serves it). The -6.6%-vs-+73% MTP-on-K_M quant finding (section 75 addendum) and all other section 75 numbers are unaffected (they ran on the pre-port binary or with the suite off).
 Also corrected: the section 81 "absolute level gap" open question (30.8 vs 52.7 t/s) is RESOLVED - 30.8 was plain decode, 47.6-52.7 is MTP; no anomaly.
 
-## 82. Measurement batch: TP3 flat on 27B, MTP_SAFE=1 penalty is ZERO (old -10.4% stale), HSA env tuning does not reproduce (2026-10-22, build-rccl + nightly libs, /root/tp3-27b/, /root/t6-safe/, /root/hsa-ab/)
+## 82. Measurement batch: TP3 flat on 27B, MTP_SAFE=1 penalty is ZERO (old -10.4% stale), HSA env tuning does not reproduce (2026-10-22, build-rccl + nightly libs, rig/tp3-27b/, rig/t6-safe/, rig/hsa-ab/)
 
 Three owner-approved measurement closes, all same-session on the post-RCCL-fix stack, all children-run with parent-verified ledgers.
 
 **A. TP3 vs TP2 on the 27B MTP vehicle (Q8_0, -sm tensor, no spec): TP3 is flat-to-slightly-worse.** pp512: TP2 335.67 vs TP3 332.86 (-0.7 to -0.9% in all 3 rounds). tg128: TP2 22.04 vs TP3 22.13 (+0.3 to +0.5%, all rounds). VERDICT: TP2 remains the production cell at 27B; the third card adds nothing here either. With the 9B also flat (section 78A), TP scaling beyond 2 cards shows no benefit on this rig for any measured model. Rig note: llama-swap held the resident 27B (~14.4 GB/card on GPU0/1) BEFORE this run - not auto-loaded by it; the bench ran alongside it without contention. The ledger's agents=0 field is a rocm-smi parser artifact (this version emits no `compute` token in the KFD table).
 
-**B. MTP_SAFE=1 penalty: ZERO - the recorded -10.4% is STALE.** 4 arms x 3 interleaved rounds, 27B vehicle, TP2, greedy -n 128: PLAIN 30.7 / MTP 47.6 (+55% over plain) / SAFE1 47.3 (-0.6% vs MTP) / SAFE0OFF 47.4 (-0.4%). All 9 spec arms byte-identical (sha a89e7d30); PLAIN differs as expected (batched-verify numerics under TP). cpu_fallback=0 on every leg. One SAFE0OFF_r2 transient dip (41.7 gen / 53.1 prompt) absorbed by the median. CONCLUSION: the AR lock-off is free on this build; the old -10.4% figure (earlier campaign, different build/env) is stale - do not cite it. Practical: MTP ships with SAFE=1 ON at zero cost, which closes the SAFE=2 design question permanently (there is nothing for a revisit state machine to recover). Also: all spec arms byte-identical to each other while differing from PLAIN confirms the losslessness boundary is the batched-verify numerics class (section 76), quantified elsewhere.
+**B. MTP_SAFE=1 penalty: ZERO - the recorded -10.4% is STALE.** 4 arms x 3 interleaved rounds, 27B vehicle, TP2, greedy -n 128: PLAIN 30.7 / MTP 47.6 (+55% over plain) / SAFE1 47.3 (-0.6% vs MTP) / SAFE0OFF 47.4 (-0.4%). All 9 spec arms byte-identical (sha ); PLAIN differs as expected (batched-verify numerics under TP). cpu_fallback=0 on every leg. One SAFE0OFF_r2 transient dip (41.7 gen / 53.1 prompt) absorbed by the median. CONCLUSION: the AR lock-off is free on this build; the old -10.4% figure (earlier campaign, different build/env) is stale - do not cite it. Practical: MTP ships with SAFE=1 ON at zero cost, which closes the SAFE=2 design question permanently (there is nothing for a revisit state machine to recover). Also: all spec arms byte-identical to each other while differing from PLAIN confirms the losslessness boundary is the batched-verify numerics class (section 76), quantified elsewhere.
 
 **C. HSA env tuning (CV claim +4-7% pp): DOES NOT REPRODUCE single-card.** 3 arms (NONE / HSA_KERNARG_POOL_SIZE=64MiB / +GPU_MAX_HW_QUEUES=8) x 3 rounds x 2 models, 18 valid legs (3 stale NA rows from an aborted first launch excluded): dense 9B all deltas <=0.5%; MoE 30B pp512/tg within 1%, pp16 KAQ +2.6% is inside the 268-291 cross-arm jitter band of a 16-token prompt. VERDICT: no measurable gain on single-card ROCm0; CV's claim likely comes from multi-GPU/tensor-split paths or companion env vars (HSA_FORCE_FINE_GRAIN_PCIE et al). Do not adopt; re-test only if a TP-scale prefill question reopens.
 
 BENCH-file note: section 74's m1 arm and section 77's KS1 arm already measured today's KS1 config on this model; this batch's MoE arms in C used the same self-made Q4_0 with no gate env - NONE-arm pp512 1336 matches section 74's stock 1334 within 0.2% (harness consistency check PASSED).
 
-## 83. CORRECTION: sections 78A and 82A were NOT tensor-parallel runs - this build's -dev delimiter is inverted; corrected TP1/TP2/TP3 matrix (2026-10-23, build-rccl @ 5fad030fc + nightly libs, /root/tp3-30b/, /root/tp-matrix-fix/, /root/tp-clean/)
+## 83. CORRECTION: sections 78A and 82A were NOT tensor-parallel runs - this build's -dev delimiter is inverted; corrected TP1/TP2/TP3 matrix (2026-10-23, build-rccl + nightly libs, rig/tp3-30b/, rig/tp-matrix-fix/, rig/tp-clean/)
 
-**A. THE DEFECT.** build-rccl was built at 5fad030fc, which PREDATES pr4-llama-bench-dev-comma (dd4e461bb). On that build the -dev delimiters are INVERTED relative to post-PR4 master:
+**A. THE DEFECT.** build-rccl was built at , which PREDATES pr4-llama-bench-dev-comma . On that build the -dev delimiters are INVERTED relative to post-PR4 master:
 - `-dev ROCm0,ROCm1` (comma) = one test PER DEVICE, i.e. two independent single-card runs. This is NOT tensor parallel.
 - `-dev ROCm0/ROCm1` (slash) = the device SET for ONE split instance. This IS tensor parallel.
-`-sm tensor` on a comma list does not error - it silently produces solo rows. Every TP number in sections 78A and 82A was produced with the comma form (`/root/tp3-bench/run.sh`, `/root/tp3-27b/run.sh`), so those two arms compared solo-card rows to solo-card rows. "TP3 is flat" was structurally guaranteed by the harness, not measured.
+`-sm tensor` on a comma list does not error - it silently produces solo rows. Every TP number in sections 78A and 82A was produced with the comma form (`rig/tp3-bench/run.sh`, `rig/tp3-27b/run.sh`), so those two arms compared solo-card rows to solo-card rows. "TP3 is flat" was structurally guaranteed by the harness, not measured.
 
 **B. PROOF (three independent lines).**
 1. Row count: `-dev ROCm0,ROCm1` yields 2 pp512 rows; `-dev ROCm0,ROCm1,ROCm2` yields 3 rows. A split run yields exactly 1 row whose dev column is the set.
-2. Dev column, archived runs: section 82's `/root/tp3-27b/r1_tp2.log` prints `dev=ROCm0` and `dev=ROCm1` as separate rows; `/root/tp3-bench/tp2_r1.out` (section 78A) the same. No row anywhere reads `ROCm0/ROCm1`.
+2. Dev column, archived runs: section 82's `rig/tp3-27b/r1_tp2.log` prints `dev=ROCm0` and `dev=ROCm1` as separate rows; `rig/tp3-bench/tp2_r1.out` (section 78A) the same. No row anywhere reads `ROCm0/ROCm1`.
 3. Direct paired measurement, 9B Q4_0, same session: `-dev ROCm0` = 944.84 pp512 / 70.10 tg128; `-dev ROCm0/ROCm1` = 1615.87 / 89.95. That is +71.0% pp / +28.3% tg from one character, and it matches the historical TP2 win direction (references/tp-tensor-split-perf.md), not the flat reading of section 82A.
 
 **C. CORRECTED MATRIX** (slash form; -p 512 -n 128 -fa on -lm dio -sm tensor -t 128 -r 1; medians of clean rounds; same build, same session, 175 W/card, llama-swap stopped, GPU2 co-tenant guard active):
@@ -2468,13 +2320,13 @@ Mechanism for the MoE decode loss is untested here; the standing MoE decode stor
 
 **E. CO-TENANT CONTAMINATION INCIDENT (why three rounds were discarded).** Mid-sweep, a memory-provider `llama-server` (30B-A3B MoE, Q4_0) appeared pinned to `-dev ROCm2`, holding 18.7 GB (rocm-smi KFD table, PID 515639 / proc 42783, started 21:20). Its effect on TP3 arms was severe and BIMODAL, not a uniform slowdown: 9B tg 93.2-93.6 clean vs 64.1-77.7 contended; 30B tg 94.5-95.3 vs 61.8-67.1; 27B tg 35.9 vs 25.3. Note the contended/clean ratio clustered at 0.65-0.70, which initially read as a clock-stall signature - it is not; telemetry showed GPU2 at 1850 MHz / 166-192 W while GPU0/1 idled at ~20 W, i.e. the tenant owned the third card. First suspects checked and cleared: PCIe (all three cards at 16 GT/s x16; the x2/2.5 GT/s entry is the BMC VGA at 05:00.0), NUMA (all node 0), thermal (30-47 C idle). After the tenant exited, re-measured legs returned the clean mode exactly. RULE: before and during any TP3 leg, check `rocm-smi --showpids` for a KFD holder on the third card and per-card power; a contended TP3 arm manufactures a false "TP3 is unstable/flat" verdict in the same way a vacuous arm manufactures a null.
 
-**F. RETRACTIONS.** Section 82A ("TP3 flat on 27B, TP2 remains the production cell") and section 78A's 9B TP3 leg are STRUCK as TP measurements - they measured solo-device rows. Section 82A's MTP_SAFE=1 arms are NOT affected (single-model spec comparison on the same TP2 setup; direction and byte-identity conclusions stand). Section 76/75 spec work is unaffected. The artifact evidence is preserved: contaminated copy at /root/tp-matrix-fix (r1-r6, includes both modes), clean copy at /root/tp-clean, first (comma, invalid) 30B sweep kept at /root/tp3-30b for audit.
+**F. RETRACTIONS.** Section 82A ("TP3 flat on 27B, TP2 remains the production cell") and section 78A's 9B TP3 leg are STRUCK as TP measurements - they measured solo-device rows. Section 82A's MTP_SAFE=1 arms are NOT affected (single-model spec comparison on the same TP2 setup; direction and byte-identity conclusions stand). Section 76/75 spec work is unaffected. The artifact evidence is preserved: contaminated copy at rig/tp-matrix-fix (r1-r6, includes both modes), clean copy at rig/tp-clean, first (comma, invalid) 30B sweep kept at rig/tp3-30b for audit.
 
 **G. HARNESS NOTES.** (1) With `-r 1` llama-bench prints `+- 0.00`; repeatability comes from interleaved rounds, never from the printed sigma. (2) Parse the table by the `dev` COLUMN, not by row count: the split arm is the one whose dev field contains a slash. (3) `-sm tensor` with a single device is legal and is the correct TP1 anchor. (4) A TP3 arm must be re-verified per session - a co-tenant can appear between rounds.
 
 ## 84. MTP ADOPTION DECISION (owner, 2026-10-23) - config-only; on for inference, off by default in benchmarks
 
-Scope first, because it was ambiguous in the transfer brief: NOTHING in this program is a pending MTP code change. MTP_SAFE=2 was found to be a log line (BENCH 71); the sampler-guard fix 68ba197d1 is unreachable on the serving path and stays unmerged (BENCH 78); the CV MTP-overhead port is default-off, byte-identical and a perf null (BENCH 81/81a). The open item was always a deployment decision.
+Scope first, because it was ambiguous in the transfer brief: NOTHING in this program is a pending MTP code change. MTP_SAFE=2 was found to be a log line (BENCH 71); the sampler-guard fix is unreachable on the serving path and stays unmerged (BENCH 78); the CV MTP-overhead port is default-off, byte-identical and a perf null (BENCH 81/81a). The open item was always a deployment decision.
 
 DECISION: MTP ON for real inference where the model qualifies; OFF by default in any benchmark arm that is not measuring MTP.
 
@@ -2488,15 +2340,15 @@ BENCHMARKING RULE: two independent reasons MTP stays off in bench arms. (a) The 
 
 UNMEASURED, recorded not assumed: MTP x TP3. TP2+MTP is characterized (+65-99% on the 27B vehicle); TP3+MTP is not, and TP3 decode is already -5.0% vs TP2 on the 30B MoE without MTP (BENCH 83). Validate per (model, TP cell) before shipping MTP in a mixed prefill+decode workload.
 
-## 85. CV PREFILL LEAD DECOMPOSED with CV's own knobs: transport is half the gap, CV's kernels are the other half (2026-10-23, /root/cv-h2h-v10/)
+## 85. CV PREFILL LEAD DECOMPOSED with CV's own knobs: transport is half the gap, CV's kernels are the other half (2026-10-23, benchmarks/qwen38-27b/cv-h2h-RESULTS.md)
 
 Motivation: v9b confirmed CV +22.6% pp over our fork at TP2 with decode tied. Before porting anything, decompose the lead using CV's OWN env knobs (names verified by strings on their libggml-hip.so): GGML_CUDA_AR_P2P (BAR peer-write transport) and GGML_CUDA_AR_BF16_THRESHOLD (bf16 wire). Arms: fork (session anchor), cv-def, cv-nobar (P2P=0 + BF16TH=0 = host-staging F32 ~= our effective transport), cv-barf32 (P2P=1 + BF16TH=0 = BAR transport, F32 wire). TP2 ROCm1+ROCm2, 27B Q4_0, plain, 2 rounds, rotated order, /proc/environ witness captured per leg.
 
 Medians (pp / tg t/s):
-- fork                     433.0 / 45.76
-- cv-nobar                 485.4 / 44.22
-- cv-barf32                509.4 / 45.20
-- cv-def                   534.6 / 45.20
+- fork 433.0 / 45.76
+- cv-nobar 485.4 / 44.22
+- cv-barf32 509.4 / 45.20
+- cv-def 534.6 / 45.20
 
 DECOMPOSITION of the +23.5% prefill lead:
 - +12.1%: NOT the collective. CV with our effective transport still beats our fork by 12% - that residual lives in CV's compute/scheduler side (their GCN GEMM family incl. split-K, edge-balanced split, host-side pipelining).
@@ -2509,7 +2361,7 @@ PORT SCOPING (owner directive: apply CV's method to our build, stacked on W4A4):
 
 WITNESS RULE EXTENSION: for CV knob A/Bs, /proc/PID/environ of the server process is the engagement witness (their knobs emit no log lines).
 
-## 86. bf16 wire port to our AR: implemented, witnessed, and NEUTRAL at TP2 (2026-10-23, /root/bf16-patch, build-bf16, snapshot /root/bf16-bin, A/B /root/bf16-srv)
+## 86. bf16 wire port to our AR: implemented, witnessed, and NEUTRAL at TP2 (2026-10-23, rig/bf16-patch, build-bf16, snapshot rig/bf16-bin, A/B rig/bf16-srv)
 
 Goal: capture the +5.2% of CV's prefill lead that the v10 decomposition attributed to their bf16 wire, stacked on our W4A4 config.
 
@@ -2519,7 +2371,7 @@ IMPLEMENTATION (tp-allreduce.cu/.cuh, env gate GGML_TP_AR_BF16_THRESHOLD, defaul
 
 MEASUREMENT (TP2 ROCm1+2, 27B Q4_0, server /completion, 840-token pp + 10x128 tg, W4A4 speed profile, 2 interleaved rounds 2; witness checked per leg):
 - f32 (build-rccl control): pp 451.1 / 454.2, tg 46.03 / 46.09
-- bf16 (build-bf16):       pp 448.3 / 453.5, tg 46.40 / 46.36
+- bf16 (build-bf16): pp 448.3 / 453.5, tg 46.40 / 46.36
 - delta: pp -0.38%, tg +0.69% = NEUTRAL.
 
 WHY (mechanism, not hand-waving): at n_embd=5120 the per-AR payload is 20 KB F32 vs 10 KB bf16, but our AR cost is dominated by barrier WAIT (39-49% of AR ticks, the SKIP_XBAR record) - latency, not bytes. Halving the wire removes bandwidth pressure we were not paying for. CV's bf16 arm gained +5.2% inside THEIR transport (BAR peer-write into an uncached peer-VRAM inbox, one barrier, no host bounce), so the bytes saving pays there and not here.
@@ -2528,7 +2380,7 @@ VERDICT: bf16 wire is NOT a perf feature for our build. Kept env-gated default-o
 
 HARNESS NOTES (both cost a run): (1) the custom AR engages ONLY with HSA_FORCE_FINE_GRAIN_PCIE=1 (w4a4-env.sh); an A/B that drops that env silently measures the generic NCCL-style path on both arms and reads identical - the witness line is what caught it. (2) The incremental-rebuild trap bit again: building the feature, restoring pristine sources, then building other targets recompiled tp-allreduce.cu from restored source and silently removed the feature; build all targets in ONE cmake invocation and snapshot `bin/` before restoring.
 
-## 87. TENSOR SHARDING ACTIVATED (one-line fix) + CV GCN K-quant GEMM port + AR A/B closure: peer-write loses to the RCCL ring in sharded topology too (2026-10-23/24, /root/floor-u4x16, build-tp2, 27B UD-Q4_K_XL)
+## 87. TENSOR SHARDING ACTIVATED (one-line fix) + CV GCN K-quant GEMM port + AR A/B closure: peer-write loses to the RCCL ring in sharded topology too (2026-10-23/24, rig/floor-u4x16, build-tp2, 27B UD-Q4_K_XL)
 
 ### 87.1 The sharding divergence: one line
 
@@ -2543,17 +2395,17 @@ the allocator returns. The split-state leaf test (usage != COMPUTE) therefore ne
 weights as weights and fell through to the silent MIRRORED default.
 
 FIX (ggml-backend-meta.cpp, one line): meta_buf->usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS
-stamped directly inside alloc_buffer_n before the init loop (set_usage() would deref
+stamped directly inside alloc_buffer_n before the init loop (set_usage would deref
 not-yet-allocated lane bufs - do not use it here).
 
 RESULT (27B UD-Q4_K_XL, TP2 warm server protocol, GCN off):
 - VRAM: 12.21 GB/card (was ~18 duplicated) = 8.8 GB sharded weights + KV.
 - Correctness: 17x23 = 391 (note: reasoning-template models put the answer in
-  reasoning_content; an earlier "empty output" was a max_tokens truncation artifact).
+ reasoning_content; an earlier "empty output" was a max_tokens truncation artifact).
 - Throughput: 408 tok/s pp steady vs 392 duplicated = +4%.
 - Pipeline-fill control: 4200-token prompt (4.1 ubatches) runs at the same 401 tok/s -
-  no pipelining gain from longer prompts; under layer-split the serial layer chain caps
-  scaling at ~1.75x, which is why sharding was the correct fix.
+ no pipelining gain from longer prompts; under layer-split the serial layer chain caps
+ scaling at ~1.75x, which is why sharding was the correct fix.
 
 ### 87.2 GCN K-quant GEMM port (CV's kernel family)
 
@@ -2566,7 +2418,7 @@ MEASUREMENT (16-request warm sweeps, TP2 and 1-GPU):
 - 1-GPU: +4.6% (235 vs 225).
 - CV's own stack: +32% (443 vs 587... their gain with the kernel ON).
 - The dip-and-recover pattern seen in earlier short runs was a shared periodic stall
-  (GCN=0 shows it too), not GCN decay; streak-medians protocol handles it.
+ (GCN=0 shows it too), not GCN decay; streak-medians protocol handles it.
 
 WHY FLAT HERE, +32% THERE: under our (former) layer-split the GEMMs were not the critical
 path - the serial layer chain was. Under sharding the GEMMs ARE half-size and on the
@@ -2581,7 +2433,7 @@ topology that matters - sharded, 64 per-layer ARs on the critical path. CV-proto
 rework of the chunked path (k_p2p_piece: volatile arrival flags, monotonic token,
 s_sleep backoff, uncached inbox, NO end barrier - piece parity instead), uncommitted
 rework discarded after the verdict (the earlier chunked WIP stays committed as
-20917fe23).
+).
 
 MEASUREMENT (TP2 sharded, 27B UD-Q4_K_XL, warm server, 12 requests, GCN off):
 - RCCL ring (default): 408 steady.
@@ -2635,9 +2487,9 @@ for Q3_K or IQ3_S, so those shapes run J=64 on both stacks regardless.
 SAME-WINDOW A/B (12 requests per arm, same build, GCN off, warm protocol):
 - MMQ_J_MAX=64: steady ~394.8 (3 dips: 288/380/385 - the shared periodic stall).
 - MMQ_J_MAX=128: steady ~393.0 (1 mild dip 389.0), J=128 engaged on 1680 calls
-  (IQ4_XS majority), J=64 on 96 (Q3_K/IQ3_S).
+ (IQ4_XS majority), J=64 on 96 (Q3_K/IQ3_S).
 - VERDICT: wide-J = -0.5%, NEUTRAL on our stack. The sched-gap report's +5-8% estimate
-  (anchored on CV's in-code tuning comment, its own caveat #1) does not reproduce.
+ (anchored on CV's in-code tuning comment, its own caveat #1) does not reproduce.
 
 IMPLICATION: at MATCHED tile configurations (J=128 IQ4_XS / J=64 IQ3_S+Q3_K on both
 stacks), CV still leads ~13% (443 vs 393). Combined with the kq4 GCN port also being
@@ -2660,14 +2512,14 @@ instrument chain (4 fprintf probes: pipeline init entry, P2P status, ar_allreduc
 entry, allreduce_tensor dispatch) found TWO dispatcher conditions:
 
 1. ggml-cuda.cu: ggml_cuda_has_internal_allreduce was a compile-time false for
-   GGML_USE_HIP. True for the stock allreduce.cu (which stubs HIP), but CV's file
-   has a full HIP implementation (only MUSA is stubbed). The dispatcher refused the
-   internal path before init_internal ran. Now MUSA-only.
+ GGML_USE_HIP. True for the stock allreduce.cu (which stubs HIP), but CV's file
+ has a full HIP implementation (only MUSA is stubbed). The dispatcher refused the
+ internal path before init_internal ran. Now MUSA-only.
 2. ggml-cuda.cu: the custom-AR size gate was wrapped in
-   'if (s_gate_on && s_have_nccl)'. With GGML_HIP_RCCL=OFF, s_have_nccl=false meant
-   the gate never applied, so the custom path claimed EVERY tensor (dispatch trace:
-   custom=1 on ne=4280320 prefill ARs) and try_allreduce never fired. Gate now
-   applies unconditionally.
+ 'if (s_gate_on && s_have_nccl)'. With GGML_HIP_RCCL=OFF, s_have_nccl=false meant
+ the gate never applied, so the custom path claimed EVERY tensor (dispatch trace:
+ custom=1 on ne=4280320 prefill ARs) and try_allreduce never fired. Gate now
+ applies unconditionally.
 
 MEASUREMENT (same-window, warm, n=12): 402 -> 417.4 median pp (415.4-418.8 tight).
 Correctness 17x23=391. Witness: internal FIRED=254, ar_allreduce engages the p2p
@@ -2695,7 +2547,7 @@ Build state: build-tp2 = GGML_HIP_RCCL=OFF + CV allreduce.cu + the two fixes +
 GGML_CUDA_ALLREDUCE=internal required (Linux default is nccl). The committed tree
 is diagnostic-free; the box source mirror still carries diagnostic fprintf blocks
 (AR-DISP/AR-CALL/META-AR/AR-P2P/AR-INIT) - strip or leave as scratch.
-## 90. MoE W4A4 gate re-VALIDATED on Qwen3.5-35B-A3B: AMEND the gate-OFF verdict to config-conditional gate-ON (2026-10-24, build-tp2 @ 756f48ab7, /root/moe-levers/)
+## 90. MoE W4A4 gate re-VALIDATED on Qwen3.5-35B-A3B: AMEND the gate-OFF verdict to config-conditional gate-ON (2026-10-24, build-tp2, benchmarks/qwen35-35b-a3b/moe-levers-sec90.md / -sec91.md)
 
 Section 80's "MoE prod = MTP alone, gate OFF" was measured on Qwen3.6-35B-A3B
 Q4_0 in the MTP-ON regime (the -4.3% is a gate x MTP interaction: batched
@@ -2721,16 +2573,16 @@ the +5.5% red line that flagged the IQ2_S decode bug.
 AMENDED PROD GUIDANCE (MoE Q4_0-class, gfx906):
 - MTP OFF serving: gate stack ON (REPACK_Q4_0=1 + W4A4_PROFILE=speed).
 - MTP ON serving: gate stays OFF until the gate x MTP interaction is re-measured
-  per model (section 80 vehicle: -4.3%; Qwen3.5-35B-A3B x MTP: UNMEASURED).
+ per model (section 80 vehicle: -4.3%; Qwen3.5-35B-A3B x MTP: UNMEASURED).
 - Treat the speed profile as numerics-changing: evidence bar = PPL + coherence,
-  not byte-equivalence.
+ not byte-equivalence.
 
 Also this session: moe30b-base-Q4_0-selfmade cleared as quant-healthy (the
 "391" repetition loop is a prompt-specific base-model attractor: 3 substantive
 temp-0 generations fully coherent, 8-gram repetition scan clean; Task-4 KLD
 PPL ratio 1.04 / KLD 0.057-0.077 stands). Keep in baselines.
 
-## 91. LEVER 2: gcn_kq_moe MoE launcher wired into mul_mat_id + Q3_K admission: +26-30% MoE prefill, decode untouched (2026-10-24, build-tp2, /root/moe-levers/)
+## 91. LEVER 2: gcn_kq_moe MoE launcher wired into mul_mat_id + Q3_K admission: +26-30% MoE prefill, decode untouched (2026-10-24, build-tp2, benchmarks/qwen35-35b-a3b/moe-levers-sec90.md / -sec91.md)
 
 The expert-grouped v4 MoE GEMM launcher (gcn-q8-gemm.cu, byte-equivalent to
 CV's) was dead code in our tree - CV hooks it in ggml_cuda_mul_mat_id before
@@ -2759,18 +2611,18 @@ mostly closed on prefill.
 CORRECTNESS GATES:
 - 17x23 probe PASS on every leg (Q4_0 canon/u4, UD off/on, 1G + TP2).
 - Q4_0 (hook must NOT fire): new binary byte-identical to pre-patch binary on
-  4 temp-0 500-tok prompts, 0 hook launches witnessed. PASS.
+ 4 temp-0 500-tok prompts, 0 hook launches witnessed. PASS.
 - UD greedy: prompts with prefill < MIN_AVG gate byte-identical off vs on
-  (gate correctly declines); 512-token prefill (avg 16/expert) diverges as
-  expected for a numerics-changing kernel port; all outputs coherent.
+ (gate correctly declines); 512-token prefill (avg 16/expert) diverges as
+ expected for a numerics-changing kernel port; all outputs coherent.
 - PPL spot check (single engine, same shape arms): llama-perplexity does NOT
-  exercise this path - MoE MUL_MAT_ID in perplexity never passes the MIN_AVG
-  gate at any tested shape (c512/ub512 and c2048/ub2048, n_seq 2/4: identical
-  PPL off vs on, 0 MoE launches traced while the dense kq4 witness fires in
-  the same process). Numerics evidence = greedy divergence + coherence +
-  substantive long-prompt A/B + probe (documented, same bar as prior ports).
+ exercise this path - MoE MUL_MAT_ID in perplexity never passes the MIN_AVG
+ gate at any tested shape (c512/ub512 and c2048/ub2048, n_seq 2/4: identical
+ PPL off vs on, 0 MoE launches traced while the dense kq4 witness fires in
+ the same process). Numerics evidence = greedy divergence + coherence +
+ substantive long-prompt A/B + probe (documented, same bar as prior ports).
 - Routing witness: 12 launches witnessed server-side: q3_K gate/up (K=2048
-  M=512) + q4_K down (K=512 M=2048), experts=256, tokens=508, avg=16, bn=32.
+ M=512) + q4_K down (K=512 M=2048), experts=256, tokens=508, avg=16, bn=32.
 Build note: box tree carried a pre-existing uncommitted lane2 hunk (dense
 iq2_s mask, inert for all models tested); committed source excludes it.
 
@@ -2780,11 +2632,11 @@ iq2_s mask, inert for all models tested); committed source excludes it.
 Dense 27B K-quant TP2 (UD-Q4_K_XL, FA_DENSE_GCN on). Quality evidence, same-window
 paired arms, build-tp2:
 - Decode-shaped PPL (llama-perplexity -b 1 -ub 1; matvec engagement witnessed per
-  leg): OFF 5.8273 vs ON 5.8320 -> ratio 1.0008 (Task-4 DOT8 precedent 1.04).
+ leg): OFF 5.8273 vs ON 5.8320 -> ratio 1.0008 (Task-4 DOT8 precedent 1.04).
 - Native KLD, same tokens, decode-shaped: mean 0.001805 +/- 0.000147, median
-  0.000573, max 0.0891, 99pct 0.0371 (Task-4 precedent 0.057-0.077).
+ 0.000573, max 0.0891, 99pct 0.0371 (Task-4 precedent 0.057-0.077).
 - Paired temp-0 gen, 1000 tok, top-5 logprobs: identical argmax first 172 tokens,
-  mean |logprob delta| shared top-k 0.0074 pre-divergence; fluent post-divergence.
+ mean |logprob delta| shared top-k 0.0074 pre-divergence; fluent post-divergence.
 - Default-ON build: 17x23=391 PASS; greedy battery byte-identical to explicit-ON.
 Baseline perf on record (item1 A/B): 548.55 pp840 / 38.71 tg128 gate-off; +5.76%
 tg with gate on. Set GGML_CUDA_GCN_KQ_MV=0 to restore stock dispatch.

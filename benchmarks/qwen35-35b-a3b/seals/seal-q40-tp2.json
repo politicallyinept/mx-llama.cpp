@@ -1,0 +1,48 @@
+{
+ "cases": {
+ "long-pp-r01": {
+ "sha256": "bd179188648fc74f3aab831d211b2dd7e5c0e36db6af91af32024cdbeedfd412",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text labeled `[eval r01] Reference note for this evaluation pass: prefix caches key on the exac",
+ "tokens": 48
+ },
+ "long-pp-r02": {
+ "sha256": "2ef8738adc2be5fc842ba427bdebf41ec73edf36d5ca28cba29a7983966e897d",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text segment labeled `[eval r02] Reference note for this evaluation pass...`.\n * Content: ",
+ "tokens": 48
+ },
+ "long-pp-r03": {
+ "sha256": "0818dd4f4b590a9f842e02bc3981bd16f92b2ec9b1db5f94e3ce0cabacdadf1d",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: A text passage describing a rigorous benchmarking and reproducibility protocol for LLM inference ",
+ "tokens": 48
+ },
+ "primes8": {
+ "sha256": "7f8fcbbddf1f3dcdcbf633318c4bc5590031075e9f6939317db29c90ad5f3c81",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:** The user wants a list of the first eight prime numbers, formatted with one number per line.\n\n2. **Identify Prim",
+ "tokens": 64
+ },
+ "secs-conv": {
+ "sha256": "d52628b1adc0bc10e31f38320bcd0e7747f415478a65992fad7df54315fb76a8",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Input: 3100 seconds.\n * Task:",
+ "tokens": 32
+ },
+ "tensor-def": {
+ "sha256": "4b5bc3be1e56f53386bbbc334da34e29057d593fae336c68d2307262b4e28a0f",
+ "text_excerpt": "Thinking Process:\n\n1. **Analyze the Request:**\n * Target: Explain what a tensor is.\n * Constraint: Use exactly one sentence.\n\n2. **Identify Key Conc",
+ "tokens": 64
+ }
+ },
+ "created_utc": "2026-10-27T11:19:40Z",
+ "fingerprint": {
+ "topology": "tp2:ROCm1,ROCm2 -sm tensor -fit off -ngl 99",
+ "bench_shape": "-b 4096 -ub 1024",
+ "build_path": "rig/build-adopt",
+ "build_rev": "she-fusion (adoption, default-ON; stacked base)",
+ "build_mtime": "2026-10-27 18:02:04 -0700",
+ "model_file": "bench-quants/bartowski/Qwen_Qwen3.5-35B-A3B-GGUF/Qwen_Qwen3.5-35B-A3B-Q4_0.gguf",
+ "model_size_bytes": 20836243264,
+ "gates": "GGML_CUDA_GCN_KQ_MOE=1;GGML_CUDA_MOE_DEC_MAX_TOKENS=8;GGML_CUDA_MOE_FUSE=1;GGML_CUDA_MOE_VEC=1;GGML_CUDA_REPACK_KQUANT=0;GGML_GDN_COLTHREAD=1;GGML_ENABLE_CUSTOM_AR=1;HSA_FORCE_FINE_GRAIN_PCIE=1;HSA_XNACK=0"
+ },
+ "reason": "post-adoption re-seal on rig/build-adopt (she-fusion default-ON), harness-canonical, stock-arbitrated + lineage-bisected (rig/q40-longpp-bisect/report.md). Short cases + long-pp-r01 match stock. long-pp-r02/r03 diverge from stock by CONSCIOUS re-baseline: the drift is additive over three perf-motivated default flips (FA_DENSE_GCN ON ; DOT8 preset 1->3 ; Q8_0 repack ON->opt-in ) - no single culprit commit. Stock-semantics escape hatch (verified): GGML_CUDA_FA_DENSE_GCN=0 GGML_CUDA_W4A4_DOT8=1 GGML_CUDA_REPACK_Q8_0=1 restores r02=stock, decode-neutral, costs the pp wins those flips were sealed for. r03 is repack-non-neutral under ALL fork configs ( reproduced 4x fresh Q4_0 captures - p0f-era cross-suite-contamination claim RETRACTED). Red line for q40 long-pp: adopt hashes; any further deviation from these = RED.",
+ "schema": "benchgate.baseline.v2",
+ "suite": "seal-q40-tp2"
+}

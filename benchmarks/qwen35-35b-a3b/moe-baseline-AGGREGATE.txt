@@ -1,0 +1,64 @@
+| build | model | pp840 t/s (cold TTFT) | pp512 t/s (cold TTFT) | tg256 t/s | warm TTFT pp840 ms | run_ids (pp840/pp512/tg256) |
+|---|---|---|---|---|---|---|
+| stock | Q4_0 | 1447 (580 ms) | 979 (523 ms) | 99.4 | 123 | 20261026T023243Z-f13b/20261026T023318Z-c603/20261026T023213Z-935b |
+| stock | UD-Q4_K_XL | 1353 (621 ms) | 916 (559 ms) | 103.4 | 124 | 20261026T025837Z-2401/20261026T025912Z-1e68/20261026T025739Z-f2f6 |
+| fork | Q4_0 | 1628 (516 ms) | 1064 (481 ms) | 107.7 | 125 | 20261026T023537Z-3669/20261026T023609Z-0136/20261026T022622Z-6f6a |
+| fork | UD-Q4_K_XL | 1685 (498 ms) | 1128 (454 ms) | 107.6 | 126 | 20261026T024832Z-dbd8/20261026T024907Z-b7a3/20261026T030920Z-16f8 |
+| fork | Q8_0 | -- | -- | -- | -- | RED/RED/RED |
+| cv | Q4_0 | 1853 (453 ms) | 1275 (402 ms) | 107.0 | 89 | 20261026T022950Z-e5d5/20261026T023022Z-fe35/20261026T022922Z-3448 |
+| cv | UD-Q4_K_XL | 1922 (437 ms) | 1313 (390 ms) | 111.7 | 86 | 20261026T025128Z-0b0a/20261026T025159Z-8928/20261026T025650Z-4081 |
+
+All runs:
+  20261026T022221Z-23ce  fork-mi50-tp2-q35-35b-q4_0          pp840-dec256       RED   dec= 105.47 ttft=  124.3 cv=3.01
+  20261026T022250Z-6954  fork-mi50-tp2-q35-35b-q4_0          short-512          GREEN dec= 106.45 ttft=  125.1 cv=0.5
+  20261026T022319Z-11dc  fork-mi50-tp2-q35-35b-q4_0          tg256              GREEN dec= 106.93 ttft=  122.8 cv=0.3
+  20261026T022525Z-e71c  fork-mi50-tp2-q35-35b-q4_0          pp840-dec256       RED   dec= 106.86 ttft=  121.2 cv=3.9
+  20261026T022553Z-6bf3  fork-mi50-tp2-q35-35b-q4_0          short-512          GREEN dec= 107.05 ttft=  121.2 cv=1.63
+  20261026T022622Z-6f6a  fork-mi50-tp2-q35-35b-q4_0          tg256              GREEN dec= 107.71 ttft=  118.5 cv=1.03
+  20261026T022650Z-3895  fork-mi50-tp2-q35-35b-q4_0          pp840-dec256-cold  RED   dec= 106.74 ttft=  513.9 cv=2.39
+  20261026T022722Z-03bb  fork-mi50-tp2-q35-35b-q4_0          short-512-cold     RED   dec= 105.83 ttft=  472.2 cv=6.9
+  20261026T022823Z-0e91  cv-mi50-tp2-q35-35b-q4_0            pp840-dec256       RED   dec= 106.46 ttft=   88.7 cv=23.86
+  20261026T022855Z-5c11  cv-mi50-tp2-q35-35b-q4_0            short-512          GREEN dec= 106.46 ttft=   91.5 cv=0.27
+  20261026T022922Z-3448  cv-mi50-tp2-q35-35b-q4_0            tg256              GREEN dec= 107.03 ttft=   87.8 cv=0.2
+  20261026T022950Z-e5d5  cv-mi50-tp2-q35-35b-q4_0            pp840-dec256-cold  GREEN dec= 105.85 ttft=  453.2 cv=0.34
+  20261026T023022Z-fe35  cv-mi50-tp2-q35-35b-q4_0            short-512-cold     GREEN dec= 106.11 ttft=  401.6 cv=0.43
+  20261026T023112Z-6c75  stock-mi50-tp2-q35-35b-q4_0         pp840-dec256       GREEN dec=  98.82 ttft=  122.9 cv=0.15
+  20261026T023143Z-5f21  stock-mi50-tp2-q35-35b-q4_0         short-512          GREEN dec=  98.93 ttft=  121.0 cv=0.63
+  20261026T023213Z-935b  stock-mi50-tp2-q35-35b-q4_0         tg256              GREEN dec=  99.42 ttft=  120.8 cv=0.3
+  20261026T023243Z-f13b  stock-mi50-tp2-q35-35b-q4_0         pp840-dec256-cold  GREEN dec=  98.95 ttft=  580.4 cv=0.22
+  20261026T023318Z-c603  stock-mi50-tp2-q35-35b-q4_0         short-512-cold     GREEN dec=  99.09 ttft=  523.0 cv=0.12
+  20261026T023440Z-2652  fork-mi50-tp2-q35-35b-q4_0          tg256              GREEN dec= 107.64 ttft=  120.6 cv=0.21
+  20261026T023508Z-db31  fork-mi50-tp2-q35-35b-q4_0          pp840-dec256       GREEN dec= 106.75 ttft=  124.9 cv=0.19
+  20261026T023537Z-3669  fork-mi50-tp2-q35-35b-q4_0          pp840-dec256-cold  GREEN dec= 106.79 ttft=  515.9 cv=0.17
+  20261026T023609Z-0136  fork-mi50-tp2-q35-35b-q4_0          short-512-cold     GREEN dec= 106.28 ttft=  481.3 cv=0.43
+  20261026T023703Z-232b  cv-mi50-tp2-q35-35b-q4_0            tg256              RED   dec= 107.25 ttft=   86.1 cv=11.59
+  20261026T023732Z-9d72  cv-mi50-tp2-q35-35b-q4_0            pp840-dec256       GREEN dec= 106.79 ttft=   89.0 cv=0.24
+  20261026T024657Z-d391  fork-mi50-tp2-q35-35b-ud-q4kxl      tg256              GREEN dec=   95.0 ttft=  119.9 cv=0.16
+  20261026T024728Z-48c2  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512          GREEN dec=  94.57 ttft=  122.9 cv=0.18
+  20261026T024800Z-0486  fork-mi50-tp2-q35-35b-ud-q4kxl      pp840-dec256       GREEN dec=  93.87 ttft=  126.3 cv=0.24
+  20261026T024832Z-dbd8  fork-mi50-tp2-q35-35b-ud-q4kxl      pp840-dec256-cold  GREEN dec=  94.25 ttft=  498.4 cv=0.88
+  20261026T024907Z-b7a3  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512-cold     GREEN dec=  94.57 ttft=  454.0 cv=0.24
+  20261026T025005Z-479f  cv-mi50-tp2-q35-35b-ud-q4kxl        tg256              RED   dec= 111.36 ttft=   84.0 cv=21.07
+  20261026T025034Z-aa3d  cv-mi50-tp2-q35-35b-ud-q4kxl        short-512          GREEN dec= 111.07 ttft=   84.9 cv=0.12
+  20261026T025101Z-c768  cv-mi50-tp2-q35-35b-ud-q4kxl        pp840-dec256       GREEN dec= 111.22 ttft=   85.6 cv=0.28
+  20261026T025128Z-0b0a  cv-mi50-tp2-q35-35b-ud-q4kxl        pp840-dec256-cold  GREEN dec= 110.32 ttft=  437.0 cv=0.19
+  20261026T025159Z-8928  cv-mi50-tp2-q35-35b-ud-q4kxl        short-512-cold     GREEN dec= 110.61 ttft=  389.9 cv=0.37
+  20261026T025252Z-863a  stock-mi50-tp2-q35-35b-ud-q4kxl     tg256              GREEN dec= 103.28 ttft=  120.7 cv=0.31
+  20261026T025322Z-0fb7  stock-mi50-tp2-q35-35b-ud-q4kxl     short-512          RED   dec=  96.58 ttft=  126.5 cv=16.08
+  20261026T025354Z-565f  stock-mi50-tp2-q35-35b-ud-q4kxl     pp840-dec256       GREEN dec= 102.62 ttft=  124.4 cv=0.84
+  20261026T025423Z-c58b  stock-mi50-tp2-q35-35b-ud-q4kxl     pp840-dec256-cold  RED   dec= 102.75 ttft=  616.3 cv=6.19
+  20261026T025458Z-849b  stock-mi50-tp2-q35-35b-ud-q4kxl     short-512-cold     RED   dec= 102.83 ttft=  553.0 cv=4.04
+  20261026T025622Z-5121  cv-mi50-tp2-q35-35b-ud-q4kxl        short-512          RED   dec= 111.27 ttft=   87.9 cv=13.53
+  20261026T025650Z-4081  cv-mi50-tp2-q35-35b-ud-q4kxl        tg256              GREEN dec= 111.68 ttft=   85.1 cv=0.16
+  20261026T025739Z-f2f6  stock-mi50-tp2-q35-35b-ud-q4kxl     tg256              GREEN dec= 103.42 ttft=  122.9 cv=0.21
+  20261026T025808Z-5c66  stock-mi50-tp2-q35-35b-ud-q4kxl     short-512          GREEN dec= 103.08 ttft=  128.4 cv=0.15
+  20261026T025837Z-2401  stock-mi50-tp2-q35-35b-ud-q4kxl     pp840-dec256-cold  GREEN dec= 102.11 ttft=  620.9 cv=1.24
+  20261026T025912Z-1e68  stock-mi50-tp2-q35-35b-ud-q4kxl     short-512-cold     GREEN dec= 102.79 ttft=  559.0 cv=1.72
+  20261026T030823Z-416a  fork-mi50-tp2-q35-35b-ud-q4kxl      pp840-dec256       GREEN dec= 106.29 ttft=  124.7 cv=0.19
+  20261026T030852Z-325d  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512          GREEN dec= 106.91 ttft=  122.6 cv=0.21
+  20261026T030920Z-16f8  fork-mi50-tp2-q35-35b-ud-q4kxl      tg256              GREEN dec= 107.63 ttft=  118.3 cv=0.15
+  20261026T030948Z-f67e  fork-mi50-tp2-q35-35b-ud-q4kxl      pp840-dec256-cold  RED   dec= 106.81 ttft=  537.5 cv=0.14
+  20261026T031020Z-4f6c  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512-cold     RED   dec= 106.85 ttft=  483.8 cv=0.17
+  20261026T031957Z-9c11  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512          GREEN dec= 106.33 ttft=  120.8 cv=0.2
+  20261026T032025Z-aeb8  fork-mi50-tp2-q35-35b-ud-q4kxl      pp840-dec256-cold  RED   dec= 105.85 ttft=  543.6 cv=0.27
+  20261026T032058Z-f131  fork-mi50-tp2-q35-35b-ud-q4kxl      short-512-cold     RED   dec= 105.98 ttft=  483.0 cv=1.81

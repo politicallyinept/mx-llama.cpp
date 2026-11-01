@@ -1,0 +1,8 @@
+cell=perf-forkw4a4-q38-27b-q4_0 leg=forkw4a4 model=q38-27b-q4_0 mode=perf status=partial note= pp840-dec256:rc2 pp840-dec256-cold:rc2 short-512:rc2 short-512-cold:rc2 tg256:rc2
+vram_before=10866688 vram_after=11120640
+build=250d100ccb779ef34c54889f0867cc051a055712
+env=[GPU_MAX_HW_QUEUES=8 HSA_XNACK=0 GGML_ENABLE_CUSTOM_AR=1 VIRTUAL_ENV=rig/therock-venv GGML_CUDA_REPACK_Q4_0=1 GGML_TP_AR_SKIP_XBAR=1 VIRTUAL_ENV_PROMPT=(therock-venv)\  LD_LIBRARY_PATH=rig/therock-venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib:rig/therock-venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:/opt/rocm-7.2.3/lib PATH=/opt/rocm-7.2.3/bin:rig/therock-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin HSA_FORCE_FINE_GRAIN_PCIE=1  GGML_GDN_COLTHREAD=1 GGML_CUDA_REPACK_KQUANT=0 GGML_CUDA_W4A4_PROFILE=speed]
+	libhipblas.so.3 => /opt/rocm-7.2.3/lib/libhipblas.so.3 (0x0000722c1b03b000)
+	librocblas.so.5 => /opt/rocm-7.2.3/lib/librocblas.so.5 (0x0000722c12600000)
+	libamdhip64.so.7 => /opt/rocm-7.2.3/lib/libamdhip64.so.7 (0x0000722c10c00000)
+	librocsolver.so.0 => /opt/rocm-7.2.3/lib/librocsolver.so.0 (0x0000722bdd000000)
