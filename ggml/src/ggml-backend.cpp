@@ -997,7 +997,7 @@ struct ggml_backend_sched {
         uint64_t hash;
         uint64_t uid;
     };
-    static const int UID_CACHE_SIZE = 8;
+    static const int UID_CACHE_SIZE = 64;
     uid_cache_entry uid_cache[UID_CACHE_SIZE] = {};
     int uid_cache_next = 0;
 
@@ -1668,6 +1668,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         const char * e = getenv("GGML_SCHED_STABLE_UID");
         return e != NULL && atoi(e) != 0;
     }();
+    uint64_t whole_h = 0;
     if (s_stable_uid) {
         uint64_t h = 1469598103934665603ULL; // FNV-1a 64
         auto mix = [&h](uint64_t v) {
@@ -1685,6 +1686,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             mix((uint64_t) (uintptr_t) graph->nodes[i]);
             mix((uint64_t) graph->nodes[i]->op);
         }
+        // Data pointers, not just tensor structs: a captured token graph bakes
+        // the device addresses the kernels read. Struct pointers can stay put
+        // (res arena) while tensor->data moves (backend scratch reallocated
+        // after an allocator perturbation), and replaying on moved data faults.
+        // A hash match must therefore pin data+buffer too.
+        for (int i = 0; i < graph->n_leafs; i++) {
+            mix((uint64_t) (uintptr_t) graph->leafs[i]->data);
+            mix((uint64_t) (uintptr_t) graph->leafs[i]->buffer);
+        }
+        for (int i = 0; i < graph->n_nodes; i++) {
+            mix((uint64_t) (uintptr_t) graph->nodes[i]->data);
+            mix((uint64_t) (uintptr_t) graph->nodes[i]->buffer);
+        }
+        whole_h = h;
         graph->uid = 0;
         for (int i = 0; i < ggml_backend_sched::UID_CACHE_SIZE; i++) {
             if (sched->uid_cache[i].hash == h && h != 0) {
@@ -2261,8 +2276,58 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     ggml_backend_sched_mark_read_inputs(sched);
 
     // set ids for all splits
+    // GGML_SCHED_STABLE_UID: the meta token-graph cache is keyed on the uid of the
+    // graph that actually reaches the backend, i.e. the split graph. The MTP draft
+    // context re-splits every step (alternating shapes), so even with a stable
+    // whole-graph uid a fresh split uid here kept every draft token-graph cold.
+    // Hash the split graph the same self-verifying way: a hash match implies
+    // identical node/leaf tensor addresses, so captured graphs stay valid; any
+    // layout change hashes differently and yields a fresh uid -> meta rebuild.
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        if (s_stable_uid) {
+            struct ggml_cgraph * sg = &sched->splits[i].graph;
+            uint64_t h = 1469598103934665603ULL; // FNV-1a 64
+            auto mixs = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+            mixs(0x5A117E5ULL + (uint64_t) i); // split discriminator
+            mixs(whole_h); // whole-graph struct+data hash: split uid stable => whole graph stable
+            mixs((uint64_t) sg->n_nodes);
+            mixs((uint64_t) sg->n_leafs);
+            mixs((uint64_t) ggml_cgraph_get_flags(sg));
+            for (int k = 0; k < sg->n_leafs; k++) {
+                mixs((uint64_t) (uintptr_t) sg->leafs[k]);
+                mixs((uint64_t) sg->leafs[k]->op);
+                mixs((uint64_t) (uintptr_t) sg->leafs[k]->data);
+            }
+            for (int k = 0; k < sg->n_nodes; k++) {
+                mixs((uint64_t) (uintptr_t) sg->nodes[k]);
+                mixs((uint64_t) sg->nodes[k]->op);
+                mixs((uint64_t) (uintptr_t) sg->nodes[k]->data);
+            }
+            sg->uid = 0;
+            for (int c = 0; c < ggml_backend_sched::UID_CACHE_SIZE; c++) {
+                if (sched->uid_cache[c].hash == h && h != 0) {
+                    sg->uid = sched->uid_cache[c].uid;
+                    break;
+                }
+            }
+            if (sg->uid == 0) {
+                sg->uid = ggml_graph_next_uid();
+                sched->uid_cache[sched->uid_cache_next].hash = h;
+                sched->uid_cache[sched->uid_cache_next].uid = sg->uid;
+                sched->uid_cache_next = (sched->uid_cache_next + 1) % ggml_backend_sched::UID_CACHE_SIZE;
+            }
+            static const bool s_uid_split_dbg = getenv("GGML_SCHED_STABLE_UID_DEBUG") != NULL;
+            if (s_uid_split_dbg) {
+                static long s_uid_split_dbg_n = 0;
+                if (s_uid_split_dbg_n++ < 4000) {
+                    fprintf(stderr, "[uidsplitdbg] i=%d nn=%d nl=%d h=%llx uid=%llu sched=%p\n",
+                            i, sg->n_nodes, sg->n_leafs, (unsigned long long) h,
+                            (unsigned long long) sg->uid, (void *) sched);
+                }
+            }
+        } else {
+            sched->splits[i].graph.uid = ggml_graph_next_uid();
+        }
     }
 }
 
