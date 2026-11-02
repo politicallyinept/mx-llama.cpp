@@ -4322,12 +4322,12 @@ static int ggml_cuda_try_gdn_cache_scatter(
 // chains with ONE kernel that scatters all snapshot rows straight from the concat buffer (the concat
 // itself stays: ssm_conv consumes it). Pure data movement: same floats, same rows as the chain it
 // replaces => byte-identical by construction, ring rollback semantics unchanged. Gate
-// GGML_CUDA_GDN_CONV_SCATTER, default OFF (=1 enables) for the A/B. Admission mirrors the snapshot
+// GGML_CUDA_GDN_CONV_SCATTER, default ON (=0 disables). Admission mirrors the snapshot
 // scatter gate: single seq, decode size (n_new < 8), f32 cache with contiguous rows, per-snap i32
 // ids graph inputs.
 static int ggml_cuda_try_gdn_conv_scatter(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_conv_scatter_args & out) {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_CONV_SCATTER"); return e && atoi(e) != 0; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_CONV_SCATTER"); return !e || atoi(e) != 0; }();
     static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
     if (!enabled) {
         return 0;
@@ -5467,7 +5467,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // ring mode: concat -> [view -> cont -> set_rows] x n_written conv-state scatter, replaced by
-    // one kernel after the normal concat (env-gated, default OFF for the A/B)
+    // one kernel after the normal concat (env-gated, default ON; =0 disables)
     if (node->op == GGML_OP_CONCAT) {
         ggml_cuda_gdn_conv_scatter_args conv_scatter_args{};
         const int nodes_to_skip_conv = ggml_cuda_try_gdn_conv_scatter(cgraph, i, conv_scatter_args);

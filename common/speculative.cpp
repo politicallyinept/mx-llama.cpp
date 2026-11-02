@@ -1881,7 +1881,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // [mtp-pipe] LLAMA_MTP_FAST_SAMPLE replaces the backend top-k chain with a direct
         // scan in draft(); skip chain creation when enabled so the fast path engages
         // (matches CV TP2, where set_sampler fails under SPLIT_MODE_TENSOR and fast-sample runs).
-        static const bool fast_sample_init = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return e && atoi(e) != 0; }();
+        static const bool fast_sample_init = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return !e || atoi(e) != 0; }();
         if (this->params.backend_sampling && !fast_sample_init) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -2358,12 +2358,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     g_spec_t.t_sync += ggml_time_us() - tw0;
                 }
                 const int64_t ts0 = g_spec_t.on ? ggml_time_us() : 0;
-                // LLAMA_MTP_FAST_SAMPLE=1 (default off): the draft only uses the top candidate and its probability
+                // LLAMA_MTP_FAST_SAMPLE (default on; =0 disables): the draft only uses the top candidate and its probability
                 // under the top-10 softmax, so scan for the top 10 directly instead of running the sampler chain
                 // over the whole vocab row. Same id and p as common_sampler_sample + get_candidates(top_k 10).
                 // [ported from castagna-veloce; skipped when the backend sampler is attached or rejection
                 //  sampling needs the full candidate distribution]
-                static const bool fast_sample = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return e && atoi(e) != 0; }();
+                static const bool fast_sample = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return !e || atoi(e) != 0; }();
                 const bool use_fast = fast_sample && backend_chains[seq_id] == nullptr
                         && dparams.at(seq_id).result_q == nullptr;
 
