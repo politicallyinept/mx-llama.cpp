@@ -117,6 +117,7 @@ static void ggml_cuda_repack_moe_fusion_count(ggml_type type, int cols) {
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/gdn-conv-scatter.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -4315,6 +4316,144 @@ static int ggml_cuda_try_gdn_cache_scatter(
     return j_set - node_idx;
 }
 
+// ring-mode counterpart of ggml_cuda_try_gdn_cache_scatter for the conv state: build_conv_state stages
+// each snapshot window of the concat (conv_input) via ggml_cont + ggml_set_rows into the ring conv
+// cache. Match CONCAT -> [VIEW -> CONT -> [RESHAPE] -> SET_ROWS] x n_written and replace the staging
+// chains with ONE kernel that scatters all snapshot rows straight from the concat buffer (the concat
+// itself stays: ssm_conv consumes it). Pure data movement: same floats, same rows as the chain it
+// replaces => byte-identical by construction, ring rollback semantics unchanged. Gate
+// GGML_CUDA_GDN_CONV_SCATTER, default OFF (=1 enables) for the A/B. Admission mirrors the snapshot
+// scatter gate: single seq, decode size (n_new < 8), f32 cache with contiguous rows, per-snap i32
+// ids graph inputs.
+static int ggml_cuda_try_gdn_conv_scatter(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_conv_scatter_args & out) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_GDN_CONV_SCATTER"); return e && atoi(e) != 0; }();
+    static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
+    if (!enabled) {
+        return 0;
+    }
+
+    const ggml_tensor * cat = cgraph->nodes[node_idx];
+    // conv_input: f32 contiguous [k1 + n_new, C, n_seqs, 1] (dim0 = time)
+    if (cat->op != GGML_OP_CONCAT || cat->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(cat) || ((uintptr_t) cat->data) % 16 != 0) {
+        return 0;
+    }
+    const int64_t C      = cat->ne[1];
+    const int64_t n_seqs = cat->ne[2];
+    if (n_seqs != 1 || C % 4 != 0 || cat->ne[3] != 1 || cat->ne[0] < 2) {
+        return 0;
+    }
+
+    int64_t k1 = -1, n_new = -1;
+    int   n_written = 0;
+    int   last_set  = -1;
+    const ggml_tensor *   cache = nullptr;
+    const int32_t *       ids[GDN_CONV_SCATTER_MAX_SNAPS] = { nullptr };
+
+    const int end = std::min(cgraph->n_nodes, node_idx + 64);
+    int j = node_idx + 1;
+    while (j < end && n_written < GDN_CONV_SCATTER_MAX_SNAPS) {
+        // chain head: VIEW of the concat at the snap-th window offset
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op != GGML_OP_VIEW || t->view_src != cat) {
+            break; // no (more) chains: span ends at the last matched SET_ROWS
+        }
+        const int64_t wk = t->ne[0];
+        if (wk < 1 || t->ne[1] != C || t->ne[2] != n_seqs || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+        if (k1 < 0) {
+            k1    = wk;
+            n_new = cat->ne[0] - k1;
+            if (n_new < 1 || n_new >= 8) {
+                return 0; // decode-size only (mirrors the snapshot scatter admission)
+            }
+        } else if (wk != k1) {
+            return 0;
+        }
+        if (t->view_offs != (size_t) (n_new - n_written) * sizeof(float)) {
+            return 0; // windows must be the consecutive snapshot tail, snap == chain index
+        }
+        const ggml_tensor * view = t;
+        ++j;
+        if (j >= end || cgraph->nodes[j]->op != GGML_OP_CONT || cgraph->nodes[j]->src[0] != view) {
+            return 0;
+        }
+        const ggml_tensor * cont = cgraph->nodes[j];
+        ++j;
+        if (j < end && cgraph->nodes[j]->op == GGML_OP_RESHAPE && cgraph->nodes[j]->src[0] == cont) {
+            ++j;
+        }
+        if (j >= end || cgraph->nodes[j]->op != GGML_OP_SET_ROWS) {
+            return 0;
+        }
+        const ggml_tensor * srows  = cgraph->nodes[j];
+        const ggml_tensor * svals  = srows->src[0];
+        const ggml_tensor * sids   = srows->src[1];
+        const ggml_tensor * scache = srows->src[2];
+        if (svals != cont && !(svals->op == GGML_OP_RESHAPE && svals->src[0] == cont)) {
+            return 0;
+        }
+        if (sids->type != GGML_TYPE_I32 || sids->ne[0] != n_seqs || !ggml_is_contiguous(sids) ||
+            sids->data == nullptr) {
+            return 0;
+        }
+        const int64_t row_count = k1 * C;
+        if (scache->type != GGML_TYPE_F32 || scache->ne[0] != row_count ||
+            scache->nb[1] != (size_t) row_count * sizeof(float) || ((uintptr_t) scache->data) % 16 != 0) {
+            return 0;
+        }
+        if (cache != nullptr && cache != scache) {
+            return 0; // all snapshots of one layer must land in the same cache
+        }
+        cache = scache;
+        // the staged rows buffer must feed nothing but the matched SET_ROWS
+        for (int x = node_idx + 1; x < cgraph->n_nodes; ++x) {
+            const ggml_tensor * n = cgraph->nodes[x];
+            if (n == srows || n == svals) {
+                continue;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (n->src[s] == cont) {
+                    return 0;
+                }
+            }
+            if (n->op == GGML_OP_VIEW && n->view_src == cont) {
+                return 0;
+            }
+        }
+        ids[n_written] = (const int32_t *) sids->data;
+        last_set = j;
+        ++n_written;
+        ++j;
+    }
+    if (n_written == 0) {
+        return 0;
+    }
+
+    out.src       = (const float *) cat->data;
+    out.dst       = (float *) cache->data;
+    for (int s = 0; s < n_written; ++s) {
+        out.ids[s] = ids[s];
+    }
+    out.n_written = n_written;
+    out.n_seqs    = n_seqs;
+    out.T         = cat->ne[0];
+    out.k1        = k1;
+    out.C         = C;
+    out.n_new     = n_new;
+    out.row_count = k1 * C;
+
+    static const bool s_conv_scatter_witness = [] { GGML_LOG_WARN("[gdn-conv-scatter] conv-state direct scatter ACTIVE\n"); return true; }();
+    (void) s_conv_scatter_witness;
+    if (dbg) {
+        fprintf(stderr, "[gdn-conv-scatter] node %d %s: fused conv-state direct scatter n_written=%d k1=%lld C=%lld n_new=%lld\n",
+                node_idx, cat->name, n_written, (long long) k1, (long long) C, (long long) n_new);
+    }
+    return last_set - node_idx;
+}
+
 // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
 static int ggml_cuda_try_ssm_scan_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
@@ -5320,6 +5459,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (nodes_to_skip_scatter > 0) {
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip_scatter;
+        }
+    }
+
+    // ring mode: concat -> [view -> cont -> set_rows] x n_written conv-state scatter, replaced by
+    // one kernel after the normal concat (env-gated, default OFF for the A/B)
+    if (node->op == GGML_OP_CONCAT) {
+        ggml_cuda_gdn_conv_scatter_args conv_scatter_args{};
+        const int nodes_to_skip_conv = ggml_cuda_try_gdn_conv_scatter(cgraph, i, conv_scatter_args);
+        if (nodes_to_skip_conv > 0) {
+            ggml_cuda_op_concat(*cuda_ctx, node);
+            ggml_cuda_gdn_conv_scatter(*cuda_ctx, conv_scatter_args);
+            return nodes_to_skip_conv;
         }
     }
 
