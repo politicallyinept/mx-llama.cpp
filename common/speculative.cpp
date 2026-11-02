@@ -1878,7 +1878,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
+        // [mtp-pipe] LLAMA_MTP_FAST_SAMPLE replaces the backend top-k chain with a direct
+        // scan in draft(); skip chain creation when enabled so the fast path engages
+        // (matches CV TP2, where set_sampler fails under SPLIT_MODE_TENSOR and fast-sample runs).
+        static const bool fast_sample_init = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return e && atoi(e) != 0; }();
+        if (this->params.backend_sampling && !fast_sample_init) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
