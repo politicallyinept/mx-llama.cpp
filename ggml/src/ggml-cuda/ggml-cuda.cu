@@ -1329,7 +1329,11 @@ static bool ggml_backend_cuda_comm_allreduce_custom_prepare(
             &comm_ctx->ar_plan)) {
         // Avoid retrying an allocation that already failed under a stable
         // model/context footprint. The configured regular path remains valid.
-        comm_ctx->use_custom_ar = false;
+        // A CSAR capture-time refusal is transient (this call only): the custom
+        // path stays enabled for the eager and per-subgraph-replay callers.
+        if (!comm_ctx->ar_plan.transient_refusal) {
+            comm_ctx->use_custom_ar = false;
+        }
         return false;
     }
 

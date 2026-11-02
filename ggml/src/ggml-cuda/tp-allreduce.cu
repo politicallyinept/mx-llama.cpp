@@ -1092,6 +1092,18 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
 
     if (!ctx->initialized) return;
 
+    // free the capture-safe AR pools (after this point no graph can outlive us)
+    for (auto * p : ctx->csar_pools) {
+        for (int rank = 0; rank < ctx->nranks; rank++) {
+            ggml_cuda_set_device(ctx->dev_ids[rank]);
+            if (p->staging[rank])    { cudaFree(p->staging[rank]); }
+            if (p->d_signals[rank])  { cudaFree(p->d_signals[rank]); }
+            if (p->d_rank_data[rank]) { cudaFree(p->d_rank_data[rank]); }
+        }
+        delete p;
+    }
+    ctx->csar_pools.clear();
+
     for (int rank = 0; rank < ctx->nranks; rank++) {
         ggml_cuda_set_device(ctx->dev_ids[rank]);
         if (ctx->events[rank]) {
@@ -1124,6 +1136,177 @@ void tp_custom_ar_destroy(CustomARContext * ctx) {
     ctx->initialized = false;
 }
 
+// ============================================================================
+// Capture-safe AR (GGML_TP_AR_CSAR=1) — per-width state pools
+// ============================================================================
+// Port of the CV hcp_ar capture-safety idea (hc-persist.cu hcp_ar_*): all
+// per-call sequencing state must be device-side so captured graphs replay
+// correctly forever, and no state layout may depend on the *other* width's
+// calls. CV uses a fixed-size inbox; we key a complete state pool (staging +
+// signals + rank-data) by (path, n_elements) instead. Pools are created on
+// first sight of a width (always during eager warmup, never inside a stream
+// capture — refused there) and never freed until the context is destroyed, so
+// pointers baked into captured graphs stay valid across replays of any width.
+static bool csar_enabled() {
+    static const bool en = []{
+        const char * e = getenv("GGML_TP_AR_CSAR");
+        return e && e[0] && e[0] != '0';
+    }();
+    return en;
+}
+
+static bool csar_any_stream_capturing(cudaStream_t * streams, int nranks) {
+#if defined(GGML_USE_HIP)
+    using capture_status_t = hipStreamCaptureStatus;
+    const auto status_none = hipStreamCaptureStatusNone;
+    const auto get_info    = hipStreamGetCaptureInfo;
+#else
+    using capture_status_t = cudaStreamCaptureStatus;
+    const auto status_none = cudaStreamCaptureStatusNone;
+    const auto get_info    = cudaStreamGetCaptureInfo;
+#endif
+    for (int r = 0; r < nranks; r++) {
+        capture_status_t st = status_none;
+        if (get_info(streams[r], &st, nullptr) == cudaSuccess && st != status_none) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Returns true when the call is fully served from a per-width pool (plan is
+// filled and the caller must return). On false with plan->transient_refusal
+// set, the refusal is capture-scoped: the caller must fall back for THIS call
+// only and keep the custom path enabled.
+static bool csar_prepare_pool(CustomARContext * ctx,
+                              float ** input_ptrs, float ** output_ptrs,
+                              int64_t n_elements, int nranks,
+                              cudaStream_t * streams, CustomARPlan * plan,
+                              bool bf16) {
+    static const int s_xbar = []{
+        const char * e = getenv("GGML_TP_AR_SKIP_XBAR");
+        return (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }();
+    static const int s_uncached = []{
+        const char * e = getenv("GGML_TP_AR_UNCACHED");
+        return (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }();
+
+    ARWidthPool * pool = nullptr;
+    for (auto * p : ctx->csar_pools) {
+        if (p->n_elements == n_elements && p->bf16 == bf16) { pool = p; break; }
+    }
+    if (pool == nullptr) {
+        if (csar_any_stream_capturing(streams, nranks)) {
+            plan->transient_refusal = true;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                GGML_LOG_WARN("TP custom AR [CSAR]: width %lld first seen inside stream capture; "
+                              "refusing custom AR for this call (no regression, capture fails as before)\n",
+                              (long long) n_elements);
+            }
+            return false;
+        }
+        const size_t per_slot = bf16 ? (size_t) n_elements * sizeof(uint16_t)
+                                     : (size_t) n_elements * sizeof(float);
+        const size_t bytes    = per_slot * (size_t) nranks * (s_xbar ? 2 : 1);
+        pool = new ARWidthPool();
+        pool->n_elements = n_elements;
+        pool->bf16 = bf16;
+        bool ok = true;
+        for (int rank = 0; rank < nranks && ok; rank++) {
+            ggml_cuda_set_device(ctx->dev_ids[rank]);
+            void * ptr = nullptr;
+#if defined(GGML_USE_HIP)
+            if (hipExtMallocWithFlags(&ptr, bytes,
+                    s_uncached ? hipDeviceMallocUncached : hipDeviceMallocFinegrained) != hipSuccess) {
+                ok = false; break;
+            }
+            void * sgn = nullptr;
+            if (hipExtMallocWithFlags(&sgn, sizeof(Signal), hipDeviceMallocUncached) != hipSuccess) {
+                ok = false; break;
+            }
+            pool->d_signals[rank] = (Signal *) sgn;
+#else
+            if (cudaMalloc(&ptr, bytes) != cudaSuccess) { ok = false; break; }
+            if (cudaMalloc((void **) &pool->d_signals[rank], sizeof(Signal)) != cudaSuccess) { ok = false; break; }
+#endif
+            pool->staging[rank] = (float *) ptr;
+            CUDA_CHECK(cudaMemset(pool->d_signals[rank], 0, sizeof(Signal)));
+            CUDA_CHECK(cudaMalloc((void **) &pool->d_rank_data[rank], sizeof(RankData)));
+            pool->rank_signals.signals[rank] = pool->d_signals[rank];
+        }
+        if (!ok) {
+            for (int rank = 0; rank < nranks; rank++) {
+                ggml_cuda_set_device(ctx->dev_ids[rank]);
+                if (pool->staging[rank])  { cudaFree(pool->staging[rank]); }
+                if (pool->d_signals[rank]) { cudaFree(pool->d_signals[rank]); }
+                if (pool->d_rank_data[rank]) { cudaFree(pool->d_rank_data[rank]); }
+            }
+            delete pool;
+            return false;  // allocation failure: caller's sticky fallback is correct here
+        }
+        // upload this pool's staging bases once (illegal inside capture — guarded above)
+        RankData h_data;
+        for (int i = 0; i < kMaxRanks; i++) { h_data.ptrs[i] = nullptr; }
+        for (int i = 0; i < nranks; i++) {
+            h_data.ptrs[i] = pool->staging[i];
+            pool->cached_ptrs[i] = pool->staging[i];
+        }
+        for (int rank = 0; rank < nranks; rank++) {
+            ggml_cuda_set_device(ctx->dev_ids[rank]);
+            CUDA_CHECK(cudaMemcpy(pool->d_rank_data[rank], &h_data, sizeof(RankData), cudaMemcpyHostToDevice));
+        }
+        ctx->csar_pools.push_back(pool);
+        if (getenv("GGML_TP_AR_DEBUG") != nullptr) {
+            fprintf(stderr, "[csar] pool created: n_elements=%lld bf16=%d bytes=%zu\n",
+                    (long long) n_elements, (int) bf16, (size_t) 0);
+        }
+    }
+
+    // device-symbol flags the kernels read (same uploads the legacy path does)
+    if (s_xbar) {
+        static bool csar_uploaded = false;
+        if (!csar_uploaded) {
+            csar_uploaded = true;
+            static const int one = 1;
+            for (int r = 0; r < nranks; r++) {
+                ggml_cuda_set_device(ctx->dev_ids[r]);
+                CUDA_CHECK(AR_MEMCPY_TO_SYMBOL(g_ar_xbar_on, &one, sizeof(int)));
+            }
+        }
+    }
+
+    static const int s_blocks_override_csar = []{
+        const char * e = getenv("GGML_TP_AR_BLOCKS");
+        if (!e || !e[0]) return 0;
+        int v = atoi(e);
+        return (v > 0 && v <= kMaxBlocks) ? v : 0;
+    }();
+    const int blocks_cap = s_blocks_override_csar ? s_blocks_override_csar : kDefaultBlocks;
+    const int blocks = std::min(blocks_cap,
+                                std::max(1, (int) ((n_elements / 4 + kThreads - 1) / kThreads)));
+
+    plan->ctx        = ctx;
+    plan->pool       = pool;
+    plan->n_elements = n_elements;
+    plan->nranks     = nranks;
+    plan->blocks     = blocks;
+    plan->twoshot    = false;
+    plan->broadcast  = true;
+    plan->bf16       = bf16;
+    plan->chunked    = false;
+    plan->piece_elems = 0;
+    plan->ag_offset  = 0;
+    for (int rank = 0; rank < nranks; rank++) {
+        plan->inputs [rank] = input_ptrs [rank];
+        plan->outputs[rank] = output_ptrs[rank];
+        plan->streams[rank] = streams    [rank];
+    }
+    return true;
+}
+
 bool tp_custom_ar_prepare(CustomARContext * ctx,
                           float ** input_ptrs,
                           float ** output_ptrs,
@@ -1133,6 +1316,8 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
                           CustomARPlan * plan) {
     GGML_ASSERT(ctx->initialized);
     GGML_ASSERT(nranks == ctx->nranks);
+    plan->transient_refusal = false;
+    plan->pool = nullptr;
     if (getenv("GGML_TP_AR_DEBUG") != nullptr) {
         fprintf(stderr, "[ar-debug] prepare enter: staging_size=%zu slots=%d n_elements=%lld\n",
                 ctx->staging_size, ctx->staging_slots, (long long) n_elements);
@@ -1267,6 +1452,25 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
                               : s_twoshot ? 2
                               : (s_broadcast ? ctx->nranks * (s_xbar ? 2 : 1) : 1);
     const size_t need_bytes = per_slot * need_slots;
+
+    // Capture-safe AR (GGML_TP_AR_CSAR=1): the broadcast path is served from
+    // per-width pools so draft/verify width transitions never share staging,
+    // signal or rank-data state (see csar_prepare_pool). Non-broadcast paths
+    // (twoshot/one-shot/chunked) keep the old MTP_SAFE lock semantics: once a
+    // width transition has been seen they refuse, exactly as the sticky lock
+    // did before CSAR existed.
+    if (csar_enabled()) {
+        if (s_broadcast && !s_twoshot && !s_chunked) {
+            if (csar_prepare_pool(ctx, input_ptrs, output_ptrs, n_elements, nranks,
+                                  streams, plan, s_bf16)) {
+                return true;
+            }
+            return false;
+        }
+        if (ctx->width_transition_seen) {
+            return false;
+        }
+    }
 
     if (getenv("GGML_TP_AR_DEBUG") != nullptr && (ctx->staging_slots != need_slots || ctx->staging_size < need_bytes)) {
         fprintf(stderr, "[ar-debug] staging realloc: need_bytes=%zu staging_size=%zu need_slots=%d staging_slots=%d n_elements=%lld bf16=%d twoshot=%d\n",
@@ -1431,6 +1635,14 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
     const int     blocks     = plan->blocks;
     const int64_t n_elements = plan->n_elements;
 
+    // Capture-safe AR: a pooled plan carries its own signals and rank-data; the
+    // pointers are pass-by-value at launch, so a captured graph bakes the pool's
+    // state and replays it unchanged (pools are never freed before destroy).
+    ARWidthPool * const pool = plan->pool;
+    RankData * const    rank_data = pool ? pool->d_rank_data[rank] : ctx->d_rank_data[rank];
+    const RankSignals & rank_signals = pool ? pool->rank_signals : ctx->rank_signals;
+    Signal * const      self_signals = pool ? pool->d_signals[rank] : ctx->d_signals[rank];
+
     ggml_cuda_set_device(ctx->dev_ids[rank]);
 
     if (plan->zero_ptr[rank] != nullptr) {
@@ -1446,26 +1658,26 @@ void tp_custom_ar_launch_rank(const CustomARPlan * plan, int rank) {
         constexpr int N = decltype(N_CONST)::value;
         if constexpr (N < 2) {
             GGML_ABORT("TP custom AR: unsupported nranks=%d (must be 2..%d)\n", nranks, kMaxRanks);
-        } else if (nranks == N) {
+        } else        if (nranks == N) {
             if (!plan->broadcast) {
                 k_cross_device_reduce_1stage<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    rank_data, rank_signals, self_signals,
                     plan->outputs[rank], rank, n_elements);
             } else if (plan->chunked) {
                 k_broadcast_chunked<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    rank_data, rank_signals, self_signals,
                     plan->inputs[rank], plan->outputs[rank], rank, n_elements, plan->piece_elems);
             } else if (plan->twoshot) {
                 k_twoshot_f32<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    rank_data, rank_signals, self_signals,
                     plan->inputs[rank], plan->outputs[rank], rank, n_elements, plan->ag_offset);
             } else if (plan->bf16) {
                 k_broadcast_reduce_bf16<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    rank_data, rank_signals, self_signals,
                     plan->inputs[rank], plan->outputs[rank], rank, n_elements);
             } else {
                 k_broadcast_reduce<N><<<blocks, kThreads, 0, plan->streams[rank]>>>(
-                    ctx->d_rank_data[rank], ctx->rank_signals, ctx->d_signals[rank],
+                    rank_data, rank_signals, self_signals,
                     plan->inputs[rank], plan->outputs[rank], rank, n_elements);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -1493,6 +1705,18 @@ bool tp_custom_ar_allreduce(CustomARContext * ctx,
 }
 
 bool tp_custom_ar_mtp_safe_transition(CustomARContext * ctx, int64_t n_elements) {
+    // Capture-safe AR: per-width pools make the broadcast path width-transition
+    // safe, so the sticky lock is not needed there. We keep tracking the
+    // transition so the non-pool paths (twoshot/one-shot/chunked) refuse exactly
+    // as the lock did; the lock itself is never armed while CSAR is on.
+    if (csar_enabled()) {
+        const int64_t prev = ctx->last_ne;
+        ctx->last_ne = n_elements;
+        if (prev >= 0 && prev != n_elements) {
+            ctx->width_transition_seen = true;
+        }
+        return false;
+    }
     static const int s_mtp_safe = []{
         const char * e = getenv("GGML_TP_AR_MTP_SAFE");
         if (!e || !e[0] || e[0] == '0') return 0;
