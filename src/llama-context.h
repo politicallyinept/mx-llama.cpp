@@ -530,3 +530,8 @@ private:
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
 };
+
+// Internal (exported for unit tests, see tests/test-async-ckpt-staging.cpp): pinned staging
+// allocation used by the async state-save path. LLAMA_TEST_ASYNC_STAGING_FAIL=1 forces a null
+// return to exercise the failure path (default unset: no effect, byte-identical behavior).
+LLAMA_API ggml_backend_buffer_t llama_state_async_alloc_staging(ggml_backend_buffer_type_t buft, size_t size);

@@ -701,13 +701,16 @@ bool ggml_cuda_gdn_state_rows_ok(const ggml_tensor * get_rows, const ggml_tensor
         gdn->type == GGML_TYPE_F32, v->ne[0] == 128,
         v->ne[2] < 8, v->ne[3] == 1, cache->type == GGML_TYPE_F32, cache->ne[0] == D,
         cache->nb[1] == (size_t) D*sizeof(float), ids->type == GGML_TYPE_I32, ids->ne[0] >= 1,
-        true, ((uintptr_t) cache->data) % 16 == 0 };
+        // F3: the matcher captures cache/ids data pointers at match time; a null data used to pass
+        // the %16 check below as 0 - reject it explicitly instead (never happens in practice: the
+        // gather inputs are materialized; behavior is byte-identical whenever data is non-null)
+        cache->data != nullptr && ids->data != nullptr, ((uintptr_t) cache->data) % 16 == 0 };
     static const char * names[] = {
         "gate-enabled", "!kda", "K<=KMAX",
         "gdn-f32", "v-ne0==128",
         "v-ne2<8", "v-ne3==1", "cache-f32", "cache-ne0==D",
         "cache-nb1", "ids-i32", "ids-ne0>=1",
-        "rows-any", "cache-16B" };
+        "data-nonnull", "cache-16B" };
     for (unsigned i = 0; i < sizeof(conds)/sizeof(conds[0]); ++i) {
         if (!conds[i]) {
             if (dbg) fprintf(stderr, "[gdn-state-rows] reject: %s (gdn %s v[%lld,%lld,%lld,%lld] g[%lld,%lld,%lld,%lld] cache[%lld,%lld,%lld,%lld] ids-ne0 %lld K %d)\n",
