@@ -988,6 +988,19 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // GGML_SCHED_STABLE_UID: recent (graph structure hash -> uid) entries so a
+    // rebuilt-but-structurally-identical graph keeps its uid. A stable uid means
+    // identical tensor addresses (the hash covers them), so captured graphs keyed
+    // on the uid stay valid; a different layout hashes differently and gets a
+    // fresh uid, making the cache self-verifying. See split_graph.
+    struct uid_cache_entry {
+        uint64_t hash;
+        uint64_t uid;
+    };
+    static const int UID_CACHE_SIZE = 8;
+    uid_cache_entry uid_cache[UID_CACHE_SIZE] = {};
+    int uid_cache_next = 0;
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -1644,6 +1657,48 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     graph->uid = ggml_graph_next_uid();
+
+    // GGML_SCHED_STABLE_UID=1: keep the uid across rebuilds of a structurally
+    // identical graph (same node/leaf tensor addresses, ops, counts, flags).
+    // The MTP draft context alternates two shapes through one res arena, so
+    // every step re-splits and the meta token-graph cache (keyed by uid) never
+    // warms. A hash match guarantees the addresses a captured graph baked are
+    // still the live ones; any difference yields a new uid and a meta rebuild.
+    static const bool s_stable_uid = [] {
+        const char * e = getenv("GGML_SCHED_STABLE_UID");
+        return e != NULL && atoi(e) != 0;
+    }();
+    if (s_stable_uid) {
+        uint64_t h = 1469598103934665603ULL; // FNV-1a 64
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ULL;
+        };
+        mix((uint64_t) graph->n_nodes);
+        mix((uint64_t) graph->n_leafs);
+        mix((uint64_t) ggml_cgraph_get_flags(graph));
+        for (int i = 0; i < graph->n_leafs; i++) {
+            mix((uint64_t) (uintptr_t) graph->leafs[i]);
+            mix((uint64_t) graph->leafs[i]->op);
+        }
+        for (int i = 0; i < graph->n_nodes; i++) {
+            mix((uint64_t) (uintptr_t) graph->nodes[i]);
+            mix((uint64_t) graph->nodes[i]->op);
+        }
+        graph->uid = 0;
+        for (int i = 0; i < ggml_backend_sched::UID_CACHE_SIZE; i++) {
+            if (sched->uid_cache[i].hash == h && h != 0) {
+                graph->uid = sched->uid_cache[i].uid;
+                break;
+            }
+        }
+        if (graph->uid == 0) {
+            graph->uid = ggml_graph_next_uid();
+            sched->uid_cache[sched->uid_cache_next].hash = h;
+            sched->uid_cache[sched->uid_cache_next].uid  = graph->uid;
+            sched->uid_cache_next = (sched->uid_cache_next + 1) % ggml_backend_sched::UID_CACHE_SIZE;
+        }
+    }
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {

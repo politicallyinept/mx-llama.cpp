@@ -1,6 +1,8 @@
 #pragma once
 #include "common.cuh"
 
+#include <vector>
+
 // Custom AllReduce for Tensor Parallelism — GPU-side synchronization only.
 // Adapted from vLLM's custom_all_reduce.cuh for llama.cpp's single-process architecture.
 //
@@ -76,6 +78,24 @@ struct __align__(16) RankSignals {
     Signal * signals[kMaxRanks];
 };
 
+// Capture-safe AR (GGML_TP_AR_CSAR=1): one complete state pool per (path, width).
+// The CV hcp_ar design makes width transitions safe by using a fixed-size inbox;
+// our AR serves arbitrary widths per site, so instead each width gets its own
+// staging + signal + rank-data space. Cross-width pairing becomes structurally
+// impossible (disjoint flag spaces, disjoint staging layouts, per-width device
+// _flag parity), and because pools are never freed while the context lives, the
+// pointers a captured graph bakes stay valid across replays of any other width.
+// Within a width the existing single-steady-width safety proof applies unchanged.
+struct ARWidthPool {
+    int64_t     n_elements;                    // the width this pool serves
+    bool        bf16;                          // wire format tag (part of the key)
+    float *     staging  [kMaxRanks] = {};     // fine-grained/uncached, 2 parity sets under XBAR
+    Signal *    d_signals[kMaxRanks] = {};     // per-width barrier flags + _flag counters
+    RankData *  d_rank_data[kMaxRanks] = {};   // per-width staging bases, read at replay
+    RankSignals rank_signals       = {};       // passed by value at launch -> baked into graphs
+    void *      cached_ptrs[kMaxRanks] = {};   // RankData upload cache for this pool
+};
+
 // Custom AllReduce context — persistent across evals.
 struct CustomARContext {
     int      nranks      = 0;
@@ -131,11 +151,18 @@ struct CustomARContext {
     bool prefer_small_twoshot = false;
     bool logged_small_twoshot = false;
 
-    // MTP lossless guard state (GGML_TP_AR_MTP_SAFE=1/2): element count of
+    // MTP lossless guard (GGML_TP_AR_MTP_SAFE=1/2): element count of
     // the last AR served by the custom path, and the sticky lock flag. See
     // tp_custom_ar_mtp_safe_transition() for the rationale.
     int64_t last_ne = -1;
     bool    mtp_safe_locked = false;
+
+    // Capture-safe AR (GGML_TP_AR_CSAR=1): per-width state pools, see ARWidthPool.
+    // Never freed until tp_custom_ar_destroy so pointers baked into captured
+    // graphs stay valid. width_transition_seen keeps the old lock semantics for
+    // paths the pools do not cover (twoshot/one-shot/chunked).
+    std::vector<ARWidthPool *> csar_pools;
+    bool    width_transition_seen = false;
 
     // Physical CUDA/HIP device id for each rank. The single-stage TP case has
     // dev_ids[r] == r, but multi-stage TP (vLLM-style TP x PP) gives each stage
@@ -228,6 +255,12 @@ struct CustomARPlan {
     // broadcast kernel looped over fixed PIECE-sized chunks with fixed staging.
     bool              chunked    = false;
     int64_t           piece_elems = 0;
+    // Capture-safe AR (GGML_TP_AR_CSAR=1): the per-width pool serving this call
+    // (null = the legacy single-staging context state).
+    ARWidthPool *     pool = nullptr;
+    // Set when prepare refused only because state could not be created inside a
+    // stream capture: the caller must not permanently disable the custom path.
+    bool              transient_refusal = false;
 };
 
 // Returns false when the staging allocation cannot be satisfied. No kernels
