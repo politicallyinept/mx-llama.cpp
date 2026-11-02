@@ -4812,6 +4812,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         if (fp_skip) { backend_ctx->p2_n_skip++; } else { backend_ctx->p2_n_rebuild++; }
     }
 
+    // Propagate the graph-level batch-type hint (GGML_CGRAPH_FLAG_SPEC_VERIFY) to the
+    // per-lane subgraphs. The lane backends only ever see cgraph_ij, so a hint stamped
+    // on the outer graph is otherwise lost under tensor split: verify-only kernels
+    // gated on it (coal MoE, mul-mat-id.cu) never engage on TP2 while they fire on
+    // tp1, where the CUDA backend receives the stamped graph directly. Set on every
+    // call, not just at rebuild: a fingerprint-skipped rebuild reuses the subgraph
+    // objects across graphs whose hints can differ (same-shape prefill tail vs a
+    // verify batch). Numerically inert while no consumer is enabled (coal is env-gated
+    // OFF by default); the CUDA graph-key hash simply folds the same hint tp1 folds.
+    for (size_t j = 0; j < n_backends; j++) {
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
+            backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->flags = cgraph->flags;
+        }
+    }
+
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
 
