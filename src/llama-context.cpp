@@ -1822,7 +1822,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
+    auto * res = get_gf_res_prev(ubatch.n_tokens);
     auto * gf  = res->get_gf();
 
     // the new graph parameters
@@ -3155,8 +3155,31 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-llm_graph_result * llama_context::get_gf_res_prev() {
-    auto & res = gf_res_prev[n_outputs > 0];
+llm_graph_result * llama_context::get_gf_res_prev(uint32_t n_tokens) {
+    // LLAMA_GRAPH_RES_PER_SHAPE=1: one res arena per graph shape (has-output x
+    // n_tokens bucket). The MTP draft context alternates a wide catch-up graph
+    // and a T=1 draft graph through the same slot every verify step; sharing one
+    // arena forces a rebuild + scheduler re-split (fresh cgraph uid) on every
+    // flip, which defeats graph reuse and the meta token-graph warm-up. Separate
+    // arenas let each shape keep stable tensor addresses. Default OFF: the
+    // legacy 2-slot (has-output) split is untouched when the gate is unset.
+    static const bool s_per_shape = [] {
+        const char * e = getenv("LLAMA_GRAPH_RES_PER_SHAPE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    size_t slot = n_outputs > 0;
+    if (s_per_shape) {
+        const size_t bucket =
+            n_tokens <= 1  ? 0 :
+            n_tokens == 2  ? 1 :
+            n_tokens == 3  ? 2 :
+            n_tokens == 4  ? 3 :
+            n_tokens <= 8  ? 4 :
+            n_tokens <= 16 ? 5 :
+            n_tokens <= 32 ? 6 : 7;
+        slot = (n_outputs > 0 ? 8 : 0) + bucket;
+    }
+    auto & res = gf_res_prev[slot];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
     }

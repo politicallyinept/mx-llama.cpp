@@ -296,7 +296,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(uint32_t n_tokens = 0);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -479,7 +479,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // LLAMA_GRAPH_RES_PER_SHAPE=1 widens this to (has-output x n_tokens bucket) so the MTP
+    // draft context's alternating shapes stop evicting each other's graphs (uid churn).
+    std::array<llm_graph_result_ptr, 16> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     // Unique sequence layout submitted by the previous asynchronous graph.
