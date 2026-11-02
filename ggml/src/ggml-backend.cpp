@@ -2907,19 +2907,43 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
     return err;
 }
 
+static int64_t g_st_t_alloc = 0, g_st_t_splits = 0, g_st_n = 0, g_st_splits_sum = 0, g_st_nodes_sum = 0;
+static int64_t g_st_t_reset = 0;
+
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    static const bool st_on = [] { const char * e = getenv("GGML_SCHED_TIMING"); return e && atoi(e) != 0; }();
+    const int64_t t0 = st_on ? ggml_time_us() : 0;
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
+    const int64_t t1 = st_on ? ggml_time_us() : 0;
 
     if (!sched->is_alloc) {
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
         }
     }
+    const int64_t t2 = st_on ? ggml_time_us() : 0;
 
-    return ggml_backend_sched_compute_splits(sched);
+    const enum ggml_status rc = ggml_backend_sched_compute_splits(sched);
+    if (st_on) {
+        const int64_t t3 = ggml_time_us();
+        static int64_t bk_t[6] = {}, bk_n[6] = {}, bk_nodes[6] = {}, bk_alloc[6] = {};
+        const int nb = ggml_graph_n_nodes(graph) < 200 ? 0 : ggml_graph_n_nodes(graph) < 1000 ? 1 :
+                       ggml_graph_n_nodes(graph) < 2500 ? 2 : ggml_graph_n_nodes(graph) < 3500 ? 3 :
+                       ggml_graph_n_nodes(graph) < 5000 ? 4 : 5;
+        bk_t[nb] += t3 - t2; bk_alloc[nb] += t2 - t1; bk_n[nb]++; bk_nodes[nb] += ggml_graph_n_nodes(graph);
+        g_st_n++;
+        if (g_st_n % 100 == 0) {
+            for (int b = 0; b < 6; ++b) if (bk_n[b]) {
+                fprintf(stderr, "sched bucket nodes~%.0f x%lld: alloc %.3f + splits %.3f ms\n",
+                    bk_nodes[b]/(double)bk_n[b], (long long)bk_n[b], bk_alloc[b]/1e3/bk_n[b], bk_t[b]/1e3/bk_n[b]);
+                bk_t[b] = bk_alloc[b] = bk_n[b] = bk_nodes[b] = 0;
+            }
+        }
+    }
+    return rc;
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

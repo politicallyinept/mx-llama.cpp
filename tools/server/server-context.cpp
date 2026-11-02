@@ -42,6 +42,39 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// LLAMA_SERVER_TIMING=1: wall-clock split of the generation loop (update_slots) per 200 iterations: draft, the target
+// decode + sync, the verify/accept step, and everything else  [mtp-pipe: ported verbatim from castagna-veloce]
+struct server_loop_timing {
+    bool on = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); return e && atoi(e) != 0; }();
+    int period = [] { const char * e = getenv("LLAMA_SERVER_TIMING"); const int v = e ? atoi(e) : 0; return v > 1 ? v : 200; }(); // =N: report every N iterations
+    int64_t t_iter = 0, t_draft = 0, t_dec = 0, t_acc = 0, t_submit = 0, n = 0, t0 = 0;
+    int64_t t_pre = 0, t_mid = 0, t_post = 0, t_mark = 0; // the "other" time: before the draft, draft -> decode, decode -> accept
+    void mark(int64_t & b) { if (on && t_mark) { const int64_t now = ggml_time_us(); b += now - t_mark; t_mark = now; } }
+    void restart() { if (on) { t_mark = ggml_time_us(); } }
+    int64_t t_dec_k[9] = {}, n_dec_k[9] = {}; // target decode + sync by batch size
+    int64_t t_inner_k[9] = {}, t_lat_k[9] = {}; // inside the yield: decode+sync; and yield start -> work start
+    void begin() { if (on) { t0 = ggml_time_us(); t_mark = t0; } }
+    void end() {
+        if (!on || t0 == 0) { return; }
+        t_iter += ggml_time_us() - t0; t0 = 0;
+        if (++n % period == 0) {
+            fprintf(stderr, "server loop timing: per iteration %.2f ms = draft %.2f + target decode+sync %.2f (host submit %.2f) + verify/accept %.2f + other %.2f\n",
+                t_iter/1e3/n, t_draft/1e3/n, t_dec/1e3/n, t_submit/1e3/n, t_acc/1e3/n, (t_iter - t_draft - t_dec - t_acc)/1e3/n);
+            fprintf(stderr, "server loop timing:   other: before the draft %.2f, draft -> decode %.2f, decode -> accept %.2f ms\n",
+                t_pre/1e3/n, t_mid/1e3/n, t_post/1e3/n);
+            t_pre = t_mid = t_post = 0;
+            for (int k = 1; k <= 8; ++k) {
+                if (n_dec_k[k]) { fprintf(stderr, "server loop timing:   target decode+sync of %d tokens: %.2f ms (x%lld); inside the yield %.2f ms (work started after %.3f ms)\n",
+                        k, t_dec_k[k]/1e3/n_dec_k[k], (long long) n_dec_k[k], t_inner_k[k]/1e3/n_dec_k[k], t_lat_k[k]/1e3/n_dec_k[k]); }
+                t_dec_k[k] = n_dec_k[k] = t_inner_k[k] = t_lat_k[k] = 0;
+            }
+            t_iter = t_draft = t_dec = t_acc = t_submit = n = 0;
+        }
+    }
+};
+static server_loop_timing g_srv_t;
+
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -3223,6 +3256,8 @@ private:
 #endif
 
     void update_slots() {
+        g_srv_t.begin();
+        struct srv_t_end { ~srv_t_end() { g_srv_t.end(); } } srv_t_end_guard;
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3484,9 +3519,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            g_srv_t.mark(g_srv_t.t_pre);
+            const int64_t tdr = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            g_srv_t.t_draft += ggml_time_us() - tdr;
+            g_srv_t.restart();
         }
 
         // make checkpoints if needed
@@ -4301,12 +4340,24 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        g_srv_t.mark(g_srv_t.t_mid);
+        const int64_t tdc = ggml_time_us();
+        int64_t tw_beg = 0, tw_end = 0;
         queue_tasks.yield_to_queue([&]() {
+            tw_beg = ggml_time_us();
             ret = reserve_prompt_graph(off) ? llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get()) : -2;
+            g_srv_t.t_submit += ggml_time_us() - tdc;
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            tw_end = ggml_time_us();
         });
+        g_srv_t.t_dec += ggml_time_us() - tdc;
+        g_srv_t.restart();
+        if (batch.view.size() >= 1 && batch.view.size() <= 8) {
+            g_srv_t.t_dec_k[batch.view.size()] += ggml_time_us() - tdc; g_srv_t.n_dec_k[batch.view.size()]++;
+            g_srv_t.t_inner_k[batch.view.size()] += tw_end - tw_beg; g_srv_t.t_lat_k[batch.view.size()] += tw_beg - tdc;
+        }
 
         if (ret != 0) {
             {
@@ -4539,6 +4590,9 @@ private:
             GGML_ASSERT(n_draft > 0);
 
             // verify and try to accept the draft
+            g_srv_t.mark(g_srv_t.t_post);
+            const int64_t tac = ggml_time_us();
+            struct srv_t_acc { int64_t t; ~srv_t_acc() { g_srv_t.t_acc += ggml_time_us() - t; } } srv_t_acc_guard{tac};
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 

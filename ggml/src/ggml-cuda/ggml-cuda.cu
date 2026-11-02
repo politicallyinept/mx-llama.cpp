@@ -6283,6 +6283,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+
+        static const bool op_t_on = [] { const char * e = getenv("GGML_CUDA_OP_TIMING"); return e && atoi(e) != 0; }();
+        const int64_t op_t0 = op_t_on ? ggml_time_us() : 0;
+        struct op_t_guard {
+            const ggml_tensor * node; int64_t t0; const bool on;
+            ~op_t_guard() {
+                if (on) {
+                    static std::map<int, std::pair<int64_t,int64_t>> acc;
+                    static int calls = 0;
+                    acc[node->op].first += ggml_time_us() - t0;
+                    acc[node->op].second++;
+                    if (++calls % 4200 == 0) {
+                        fprintf(stderr, "cuda op timing (us per op-type window):\n");
+                        for (auto & kv : acc) if (kv.second.second) {
+                            fprintf(stderr, "  %-24s %10lld us / %7lld = %.3f us\n",
+                                ggml_op_name((enum ggml_op)kv.first), (long long)kv.second.first,
+                                (long long)kv.second.second, (double)kv.second.first/kv.second.second);
+                        }
+                        for (auto & kv : acc) { kv.second = {}; }
+                    }
+                }
+            }
+        };
+        op_t_guard op_t_guard{ node, op_t0, op_t_on };
+
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
