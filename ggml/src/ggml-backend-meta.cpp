@@ -2742,6 +2742,10 @@ struct ggml_backend_meta_context {
     // sub-backend entry point that switches off its per-subgraph graph cache
     void (*graph_cache_disable)(ggml_backend_t) = nullptr;
     bool inner_graphs_disabled = false;
+    // sub-backend entry point that switches the per-subgraph graph cache back on
+    // (used when the token graph cannot own a shape - see inner_graphs_reenable)
+    void (*graph_cache_enable)(ggml_backend_t) = nullptr;
+    bool inner_graphs_reenabled = false;
     bool (*tg_capture_begin)(ggml_backend_t)        = nullptr;
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
@@ -3128,6 +3132,8 @@ struct ggml_backend_meta_context {
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_token_graph_free");
                 graph_cache_disable = (void (*)(ggml_backend_t))
                     ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_graph_cache_disable");
+                graph_cache_enable = (void (*)(ggml_backend_t))
+                    ggml_backend_reg_get_proc_address(simple_reg, "ggml_backend_graph_cache_enable");
                 break;
             }
         }
@@ -5385,6 +5391,27 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // already issued the leading subgraphs.
     size_t i_dispatch_first = 0;
 
+    // Give the lanes' per-subgraph graph caches back after the token graph proved it
+    // cannot own this shape (capture refused/not eligible). Without this the owner's
+    // early graph_cache_disable leaves NOTHING replaying: every node direct-dispatched
+    // (~0.5 us/node, ~2 ms/step on the ~3.9k-node MTP verify graph). Default ON;
+    // GGML_META_TG_INNER_ON_FAIL=0 restores the old behavior.
+    const bool inner_on_fail = [] {
+        const char * e = getenv("GGML_META_TG_INNER_ON_FAIL");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const auto inner_graphs_reenable = [&]() {
+        if (!inner_on_fail || !backend_ctx->inner_graphs_disabled || backend_ctx->inner_graphs_reenabled ||
+                backend_ctx->graph_cache_enable == nullptr) {
+            return;
+        }
+        for (size_t j = 0; j < n_backends; j++) {
+            backend_ctx->graph_cache_enable(backend_ctx->backend_configs[j].backend);
+        }
+        backend_ctx->inner_graphs_reenabled = true;
+        GGML_LOG_DEBUG("%s: token graph cannot own this shape, per-subgraph graph caches re-enabled\n", __func__);
+    };
+
     // GGML_TP_AR_CHUNKED=1: the chunked peer-write AR kernels carry a
     // host-baked arrival token that would go stale on graph replay (the
     // volatile flag compare passes immediately, racing the peer's writes).
@@ -5535,6 +5562,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
             if (!eligible) {
                 tge->failed = true;
+                inner_graphs_reenable();
                 if (backend_ctx->dbg_tg) {
                     fprintf(stderr, "[tg-debug] uid %zu NOT ELIGIBLE (runs=%zu) - token graph permanently disabled for this shape\n",
                             (size_t) cgraph->uid, runs.size());
@@ -5584,6 +5612,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                             }
                             const int nr = backend_ctx->comm_ar_prepare(comm, nodes.data());
                             if (nr < 0) {
+                                // one-time WARN: without this the refusal is silent and the loss of
+                                // token-graph capture is invisible in production logs
+                                static bool s_ar_refuse_warned = false;
+                                if (!s_ar_refuse_warned) {
+                                    s_ar_refuse_warned = true;
+                                    GGML_LOG_WARN("%s: comm_ar_prepare refused token-graph capture (%d) - per-subgraph graph replay used instead\n", __func__, nr);
+                                }
                                 if (backend_ctx->dbg_tg) fprintf(stderr, "[tg-debug] uid %zu: comm_ar_prepare REFUSED (%d) inside capture\n", (size_t) cgraph->uid, nr);
                                 ok = false; break;
                             }
@@ -5633,6 +5668,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
 
                 tge->failed = true;
+                inner_graphs_reenable();
                 backend_ctx->tg_free_entry(*tge);
                 if (backend_ctx->dbg_tg) {
                     fprintf(stderr, "[tg-debug] uid %zu CAPTURE FAILED (ok=false) - token graph permanently disabled for this shape\n",

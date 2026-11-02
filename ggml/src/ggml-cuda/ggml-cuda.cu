@@ -8087,6 +8087,17 @@ static void ggml_backend_cuda_graph_cache_disable(ggml_backend_t backend) {
 #endif
 }
 
+// Undo graph_cache_disable: called by the meta backend when the token graph turned out
+// unable to own this shape, so the per-subgraph caches replay instead of direct dispatch.
+static void ggml_backend_cuda_graph_cache_enable(ggml_backend_t backend) {
+#ifdef USE_CUDA_GRAPH
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->graphs_owner_disabled = false;
+#else
+    GGML_UNUSED(backend);
+#endif
+}
+
 // Begin recording every kernel this thread issues on `backend`'s stream.
 // ThreadLocal mode so the N lanes can capture their own streams concurrently.
 static bool ggml_backend_cuda_token_capture_begin(ggml_backend_t backend) {
@@ -8151,6 +8162,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_graph_cache_disable") == 0) {
         return (void *) ggml_backend_cuda_graph_cache_disable;
+    }
+    if (strcmp(name, "ggml_backend_graph_cache_enable") == 0) {
+        return (void *) ggml_backend_cuda_graph_cache_enable;
     }
     if (strcmp(name, "ggml_backend_token_capture_begin") == 0) {
         return (void *)ggml_backend_cuda_token_capture_begin;
