@@ -2369,6 +2369,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::vector<llama_token_data> q_dist; // rejection candidates, sampler path only
 
                 if (use_fast) {
+                    static const bool fast_banner = [] {
+                        fprintf(stderr, "mtp-fast-sample: fast draft sampling ACTIVE\n");
+                        return true;
+                    }();
+                    (void) fast_banner;
                     const float * lg = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
                     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
                     constexpr int TK = 10;
