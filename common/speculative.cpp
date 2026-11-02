@@ -1745,6 +1745,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
+
+// LLAMA_SPEC_TIMING=1: wall-clock breakdown of the MTP drafter (catch-up decode, draft decodes, sampling), printed
+// every 200 draft calls  [mtp-pipe: ported verbatim from castagna-veloce]
+struct spec_mtp_timing {
+    bool on = [] { const char * e = getenv("LLAMA_SPEC_TIMING"); return e && atoi(e) != 0; }();
+    int64_t t_catch = 0, t_dec = 0, t_samp = 0, t_sync = 0, t_draft = 0, t_between = 0, last_end = 0;
+    int64_t n_catch = 0, n_dec = 0, n_samp = 0, n_draft = 0;
+    void report() {
+        if (!on || n_draft == 0 || n_draft % 200 != 0) {
+            return;
+        }
+        fprintf(stderr, "spec timing: per draft call %.2f ms (catch-up %.2f ms x %.2f, decode submit %.3f ms x %.2f, sample %.3f ms x %.2f + sync), "
+                "of which GPU wait %.3f ms, between draft calls %.2f ms\n", t_draft/1e3/n_draft, n_catch ? t_catch/1e3/n_catch : 0.0, (double) n_catch/n_draft,
+                n_dec ? t_dec/1e3/n_dec : 0.0, (double) n_dec/n_draft, n_samp ? t_samp/1e3/n_samp : 0.0, (double) n_samp/n_draft,
+                n_samp ? t_sync/1e3/n_samp : 0.0, t_between/1e3/n_draft);
+        *this = spec_mtp_timing();
+    }
+};
+static spec_mtp_timing g_spec_t;
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -2059,7 +2079,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t tc0 = g_spec_t.on ? ggml_time_us() : 0;
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (g_spec_t.on) { g_spec_t.t_catch += ggml_time_us() - tc0; g_spec_t.n_catch++; }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -2225,6 +2247,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const int64_t td0 = g_spec_t.on ? ggml_time_us() : 0;
+        if (g_spec_t.on && g_spec_t.last_end) { g_spec_t.t_between += td0 - g_spec_t.last_end; }
+        draft_impl(dparams);
+        if (g_spec_t.on) {
+            g_spec_t.last_end = ggml_time_us();
+            g_spec_t.t_draft += g_spec_t.last_end - td0;
+            g_spec_t.n_draft++;
+            g_spec_t.report();
+        }
+    }
+
+    void draft_impl(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
         if (deferred_prefill_failed) {
@@ -2294,7 +2328,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t tk0 = g_spec_t.on ? ggml_time_us() : 0;
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (g_spec_t.on) { g_spec_t.t_dec += ggml_time_us() - tk0; g_spec_t.n_dec++; }
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2312,32 +2348,87 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
-                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
-
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-
-                if (cur_p->size <= 0 || !std::isfinite(cur_p->data[0].p)) {
-                    disable_seq(seq_id, "non-finite draft probability");
-                    drafting[seq_id] = false;
-                    n_drafting--;
-                    continue;
+                if (g_spec_t.on) {
+                    const int64_t tw0 = ggml_time_us();
+                    llama_synchronize(ctx_dft);
+                    g_spec_t.t_sync += ggml_time_us() - tw0;
                 }
+                const int64_t ts0 = g_spec_t.on ? ggml_time_us() : 0;
+                // LLAMA_MTP_FAST_SAMPLE=1 (default off): the draft only uses the top candidate and its probability
+                // under the top-10 softmax, so scan for the top 10 directly instead of running the sampler chain
+                // over the whole vocab row. Same id and p as common_sampler_sample + get_candidates(top_k 10).
+                // [ported from castagna-veloce; skipped when the backend sampler is attached or rejection
+                //  sampling needs the full candidate distribution]
+                static const bool fast_sample = [] { const char * e = getenv("LLAMA_MTP_FAST_SAMPLE"); return e && atoi(e) != 0; }();
+                const bool use_fast = fast_sample && backend_chains[seq_id] == nullptr
+                        && dparams.at(seq_id).result_q == nullptr;
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                llama_token id = LLAMA_TOKEN_NULL;
+                float       p_0 = 0.0f;
+                const float * h_row = nullptr;
+                std::vector<llama_token_data> q_dist; // rejection candidates, sampler path only
+
+                if (use_fast) {
+                    const float * lg = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    constexpr int TK = 10;
+                    float tv[TK]; int32_t ti[TK]; int nt = 0;
+                    for (int32_t v = 0; v < n_vocab; ++v) {
+                        const float x = lg[v];
+                        if (nt == TK && x <= tv[TK - 1]) {
+                            continue;
+                        }
+                        int q = nt < TK ? nt++ : TK - 1;
+                        while (q > 0 && tv[q - 1] < x) { tv[q] = tv[q - 1]; ti[q] = ti[q - 1]; --q; }
+                        tv[q] = x; ti[q] = v;
+                    }
+                    float sum = 0.0f;
+                    for (int k = 0; k < nt; ++k) { sum += expf(tv[k] - tv[0]); }
+                    id  = ti[0];
+                    p_0 = 1.0f/sum;
+
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                    if (g_spec_t.on) { g_spec_t.t_samp += ggml_time_us() - ts0; g_spec_t.n_samp++; }
+
+                    if (!std::isfinite(p_0)) {
+                        disable_seq(seq_id, "non-finite draft probability");
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                } else {
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                    h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    if (g_spec_t.on) { g_spec_t.t_samp += ggml_time_us() - ts0; g_spec_t.n_samp++; }
+
+                    if (cur_p->size <= 0 || !std::isfinite(cur_p->data[0].p)) {
+                        disable_seq(seq_id, "non-finite draft probability");
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id  = id_sampled;
+                    p_0 = cur_p->data[0].p;
+
+                    if (dparams.at(seq_id).result_q) {
+                        q_dist.assign(cur_p->data, cur_p->data + cur_p->size);
+                    }
                 }
-
-                // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_0 < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
-
                     continue;
                 }
 
@@ -2349,7 +2440,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 result.push_back(id);
 
                 if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    dp.result_q->emplace_back(q_dist.begin(), q_dist.end());
                 }
 
                 if (params.n_max <= (int) result.size()) {
