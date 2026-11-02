@@ -4360,7 +4360,11 @@ static int ggml_cuda_try_gdn_conv_scatter(
             break; // no (more) chains: span ends at the last matched SET_ROWS
         }
         const int64_t wk = t->ne[0];
-        if (wk < 1 || t->ne[1] != C || t->ne[2] != n_seqs || !ggml_is_contiguous(t)) {
+        // the window is a strided slice of the time-major concat: nb = [4, T*4, C*T*4]
+        if (wk < 1 || t->ne[1] != C || t->ne[2] != n_seqs ||
+            t->nb[0] != (size_t) sizeof(float) ||
+            t->nb[1] != (size_t) cat->ne[0] * sizeof(float) ||
+            t->nb[2] != (size_t) cat->ne[1] * cat->ne[0] * sizeof(float)) {
             return 0;
         }
         if (k1 < 0) {
