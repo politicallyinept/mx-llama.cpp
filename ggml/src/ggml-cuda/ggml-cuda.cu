@@ -3943,6 +3943,26 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // GGML_CUDA_GRAPH_DIFF=N (debug): the first changed node of the first N changed graphs
+            static int diff_left = [] { const char * e = getenv("GGML_CUDA_GRAPH_DIFF"); return e ? atoi(e) : 0; }();
+            if (!res && diff_left > 0) {
+                --diff_left;
+                const ggml_tensor & a = graph->node_props[i].node;
+                const ggml_tensor & b = prop.node;
+                const char * what = a.data != b.data ? "data" : memcmp(a.ne, b.ne, sizeof(a.ne)) ? "ne" :
+                    memcmp(a.nb, b.nb, sizeof(a.nb)) ? "nb" : memcmp(a.op_params, b.op_params, sizeof(a.op_params)) ? "op_params" :
+                    a.view_offs != b.view_offs ? "view_offs" : a.view_src != b.view_src ? "view_src" : a.op != b.op ? "op" : "";
+                int js = -1;
+                for (int j = 0; j < GGML_MAX_SRC && !*what; ++j) {
+                    if (graph->node_props[i].node_src_data_ptrs[j] != prop.node_src_data_ptrs[j]) { what = "src data"; js = j; }
+                    else if (memcmp(graph->node_props[i].node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j]))) { what = "src ne"; js = j; }
+                    else if (memcmp(graph->node_props[i].node_src_nb[j], prop.node_src_nb[j], sizeof(prop.node_src_nb[j]))) { what = "src nb"; js = j; }
+                }
+                fprintf(stderr, "graph diff dev %d: %d nodes, node %d %s '%s' [%lld,%lld,%lld,%lld] changed: %s %d (src '%s')\n",
+                        cuda_ctx->device, cgraph->n_nodes, i, ggml_op_desc(cgraph->nodes[i]), cgraph->nodes[i]->name,
+                        (long long) b.ne[0], (long long) b.ne[1], (long long) b.ne[2], (long long) b.ne[3],
+                        *what ? what : "other", js, js >= 0 && cgraph->nodes[i]->src[js] ? cgraph->nodes[i]->src[js]->name : "");
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -6644,6 +6664,28 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static thread_local bool g_cuda_outer_capture = false;
 
+// GGML_CUDA_GRAPH_STATS=1 (debug): per device, how often a cgraph ran as a captured graph replay,
+// was (re)captured, ran directly (warm-up, incompatible or disabled), plus warmup resets and unstable-disables.
+struct ggml_cuda_graph_stats {
+    bool on = getenv("GGML_CUDA_GRAPH_STATS") != nullptr && atoi(getenv("GGML_CUDA_GRAPH_STATS")) != 0;
+    std::atomic<int64_t> replay[GGML_CUDA_MAX_DEVICES] = {}, capture[GGML_CUDA_MAX_DEVICES] = {},
+        direct[GGML_CUDA_MAX_DEVICES] = {}, reset[GGML_CUDA_MAX_DEVICES] = {}, incompat[GGML_CUDA_MAX_DEVICES] = {},
+        unstable[GGML_CUDA_MAX_DEVICES] = {}, owner_off[GGML_CUDA_MAX_DEVICES] = {}, outer[GGML_CUDA_MAX_DEVICES] = {};
+    ~ggml_cuda_graph_stats() {
+        if (!on) {
+            return;
+        }
+        for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+            if (replay[d] + capture[d] + direct[d] > 0) {
+                fprintf(stderr, "graph_stats dev %d: replay %lld capture %lld direct %lld (incompat %lld) resets %lld unstable_off %lld owner_off %lld outer %lld\n", d,
+                    (long long) replay[d], (long long) capture[d], (long long) direct[d], (long long) incompat[d],
+                    (long long) reset[d], (long long) unstable[d], (long long) owner_off[d], (long long) outer[d]);
+            }
+        }
+    }
+};
+static ggml_cuda_graph_stats g_graph_stats;
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     {
         // The repack upload scratch lives only between model load and the first
@@ -6671,16 +6713,25 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    if (g_graph_stats.on) {
+        if (g_cuda_outer_capture) { g_graph_stats.outer[cuda_ctx->device]++; }
+        else if (cuda_ctx->graphs_owner_disabled) { g_graph_stats.owner_off[cuda_ctx->device]++; }
+    }
     if (graph->is_enabled() && !g_cuda_outer_capture && !cuda_ctx->graphs_owner_disabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (!graph_compatible && g_graph_stats.on) {
+            g_graph_stats.incompat[cuda_ctx->device]++;
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             graph->n_prop_checks++;
             if (properties_changed) {
                 graph->n_prop_resets++;
+                if (g_graph_stats.on) { g_graph_stats.reset[cuda_ctx->device]++; }
                 if (graph->n_prop_resets >= 4 && graph->n_prop_resets * 10 > graph->n_prop_checks) {
                     graph->unstable_disabled = true;
+                    if (g_graph_stats.on) { g_graph_stats.unstable[cuda_ctx->device]++; }
                     GGML_LOG_DEBUG("%s: disabling CUDA graph for unstable entry (%d resets / %d checks)\n",
                         __func__, graph->n_prop_resets, graph->n_prop_checks);
                 }
@@ -6709,6 +6760,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (g_graph_stats.on) {
+        (use_cuda_graph ? (cuda_graph_update_required ? g_graph_stats.capture : g_graph_stats.replay)
+                        : g_graph_stats.direct)[cuda_ctx->device]++;
+        // periodic print: legs SIGTERM the server, static destructors never run
+        static std::atomic<int64_t> calls{0};
+        if ((++calls % 1000) == 0) {
+            for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+                if (g_graph_stats.replay[d] + g_graph_stats.capture[d] + g_graph_stats.direct[d] > 0) {
+                    fprintf(stderr, "graph_stats dev %d: replay %lld capture %lld direct %lld (incompat %lld) resets %lld unstable_off %lld owner_off %lld outer %lld\n", d,
+                        (long long) g_graph_stats.replay[d], (long long) g_graph_stats.capture[d], (long long) g_graph_stats.direct[d],
+                        (long long) g_graph_stats.incompat[d], (long long) g_graph_stats.reset[d], (long long) g_graph_stats.unstable[d],
+                        (long long) g_graph_stats.owner_off[d], (long long) g_graph_stats.outer[d]);
+                }
+            }
+        }
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
