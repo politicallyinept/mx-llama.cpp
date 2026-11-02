@@ -5074,6 +5074,17 @@ static bool ggml_cuda_moe_weighted_reduction_enabled() {
 // snapshots, are written in between by design; a whole-tensor check rejected every MI50 deferral, -4% decode.)
 static bool ggml_cuda_deferred_rows_intact(const ggml_cgraph * cgraph, int i, int j) {
     const ggml_tensor * g = cgraph->nodes[i];
+    // F3: graph-shape assumptions this intact-check silently relies on:
+    //  1. the row-ids buffer g->src[1] is materialized (non-null data) and I32 - the matcher
+    //     captures the pointer at match time and the GDN kernel indexes it at run time
+    //  2. every writer to the ids memory is a materialized node of THIS cgraph in (i, j]: nodes
+    //     with t->data == nullptr are skipped (unmaterialized views write nothing), and nothing
+    //     outside the graph (other streams, async copies) touches the ids between match and GDN
+    //     execution
+    //  3. ggml_nbytes(ids) covers the whole live region of the ids buffer
+    //  4. writes to the ids before i are the producer (fine); writes after j happen after the GDN
+    //     has consumed the ids (fine)
+    GGML_ASSERT(g->src[1] != nullptr && g->src[1]->data != nullptr && g->src[1]->type == GGML_TYPE_I32);
     const auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
         const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
         return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
@@ -5084,6 +5095,17 @@ static bool ggml_cuda_deferred_rows_intact(const ggml_cgraph * cgraph, int i, in
             continue;
         }
         if (overlap(t, g->src[1])) {
+            // one-time diagnostic: a silent deferral rejection here is otherwise indistinguishable
+            // from "no deferral possible" and hides allocator/graph-shape regressions (F3)
+            static bool s_intact_warned = false;
+            if (!s_intact_warned) {
+                s_intact_warned = true;
+                fprintf(stderr, "[gdn-state-rows] intact-check REJECT (first of possibly many): node %d ids %s [%p, +%lld) overlaps writer node %d %s [%p, +%lld)\n",
+                    i, g->src[1]->name, (const void *) g->src[1]->data, (long long) ggml_nbytes(g->src[1]),
+                    k, t->name, (const void *) t->data, (long long) ggml_nbytes(t));
+            }
+            static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
+            if (dbg) fprintf(stderr, "[gdn-state-rows] intact-check reject: gather node %d, writer node %d %s\n", i, k, t->name);
             return false;
         }
     }
@@ -5156,10 +5178,35 @@ static bool ggml_cuda_defer_gdn_state_rows(ggml_backend_cuda_context * cuda_ctx,
             return false;
         }
     }
-    if (!ggml_cuda_gdn_state_rows_ok(g, gdn) || !ggml_cuda_deferred_rows_intact(cgraph, i, j_gdn)) {
+    if (!ggml_cuda_gdn_state_rows_ok(g, gdn)) {
+        if (dbg) fprintf(stderr, "[gdn-state-rows] node %d %s: rejected by gdn_state_rows_ok shape check\n", i, g->name);
         return false;
     }
-    static const bool s_gdn_rows_witness = [] { fprintf(stderr, "[gdn-state-rows] recurrent-state gather direct-read ACTIVE\n"); return true; }();
+    if (!ggml_cuda_deferred_rows_intact(cgraph, i, j_gdn)) {
+        if (dbg) fprintf(stderr, "[gdn-state-rows] node %d %s: rejected by deferred-rows intact check\n", i, g->name);
+        return false;
+    }
+    // F3: the deferral additionally assumes the captured cache/ids pointers stay valid and
+    // unmodified until the GDN kernel runs: the intact check above keeps the ids buffer out of
+    // allocator reuse until j_gdn (checked), and the state cache buffer is owned by llama-memory
+    // for the whole graph (structural). The registration below is consumed by the GDN node's op
+    // (matched by dst pointer in gated_delta_net.cu); if another fusion ever skips that op the
+    // gather stays skipped and the direct read is lost - the witness line documents the contract.
+    GGML_ASSERT(g->src[0]->data != nullptr && g->src[1]->data != nullptr);
+    if (i + 400 < cgraph->n_nodes) {
+        // the consumer scan above is windowed at 400 nodes; consumers beyond the window would
+        // silently defeat the deferral. log once so a graph that outgrows the window is visible
+        static bool s_window_warned = false;
+        if (!s_window_warned) {
+            s_window_warned = true;
+            fprintf(stderr, "[gdn-state-rows] NOTE: consumer scan window (400 nodes) truncated at node %d of %d: consumers beyond the window are not checked\n",
+                i + 400, cgraph->n_nodes);
+        }
+    }
+    static const bool s_gdn_rows_witness = [] { fprintf(stderr,
+        "[gdn-state-rows] recurrent-state gather direct-read ACTIVE (assumes: gather-not-output; GDN consumer within 400-node window; "
+        "src[5] reachable via <=2 VIEW(offs=0)/RESHAPE hops; all other consumers empty or absent; ids I32, materialized and untouched "
+        "between gather and GDN; cache/ids pointers stable until the GDN op runs; registered GDN node executes)\n"); return true; }();
     (void) s_gdn_rows_witness;
     if (dbg) {
         fprintf(stderr, "[gdn-state-rows] node %d %s: fused direct-read K=%d ids=%s\n",

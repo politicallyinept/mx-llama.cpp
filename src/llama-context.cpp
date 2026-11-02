@@ -3928,6 +3928,19 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+// Pinned staging allocation for the async state-save path. Split out of ~llama_io_write_async so
+// the failure path is unit-testable, with a test hook: LLAMA_TEST_ASYNC_STAGING_FAIL=1 forces a
+// null return (default unset: no effect, byte-identical behavior). On null the caller degrades to
+// the synchronous capture path - a failed staging alloc must never abort the server from inside a
+// destructor (the GGML_ASSERT this replaces did exactly that).
+ggml_backend_buffer_t llama_state_async_alloc_staging(ggml_backend_buffer_type_t buft, size_t size) {
+    const char * env = getenv("LLAMA_TEST_ASYNC_STAGING_FAIL");
+    if (env != nullptr && atoi(env) != 0) {
+        return nullptr;
+    }
+    return ggml_backend_buft_alloc_buffer(buft, size);
+}
+
 // LLAMA_STATE_SEQ_FLAGS_ASYNC: metadata goes to dst at once, tensor data is copied host-async
 // (D2H into pinned staging) on the backend that owns the state, stream-ordered after the queued
 // prefill/decode work, and read into dst by a worker thread once the recorded events fire. The
@@ -3940,6 +3953,13 @@ public:
     llama_io_write_async(uint8_t * p, size_t len, llama_context & lctx) : ptr(p), buf_size(len), lctx(lctx) {}
 
     ~llama_io_write_async() {
+        // blocking fallback: identical values to the async path, just without the overlap
+        const auto sync_fallback = [this]() {
+            lctx.synchronize();
+            for (const auto & w : winfos) {
+                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
+            }
+        };
         size_t total = 0;
         bool async_ok = true;
         ggml_backend_buffer_type_t host_buft = nullptr;
@@ -3954,10 +3974,7 @@ public:
         async_ok = async_ok && host_buft != nullptr && total > 0;
         if (!async_ok) {
             // e.g. state in host memory: plain blocking read
-            lctx.synchronize();
-            for (const auto & w : winfos) {
-                ggml_backend_tensor_get(w.tensor, w.ptr, w.offset, w.size);
-            }
+            sync_fallback();
             return;
         }
 
@@ -3970,11 +3987,20 @@ public:
             }
         }
         if (slot == nullptr) {
-            lctx.state_async_slots.push_back(std::make_unique<llama_context::state_async_slot>());
-            slot = lctx.state_async_slots.back().get();
-            slot->pinned.reset(ggml_backend_buft_alloc_buffer(host_buft, total));
-            GGML_ASSERT(slot->pinned && "failed to allocate async state staging");
+            auto new_slot = std::make_unique<llama_context::state_async_slot>();
+            new_slot->pinned.reset(llama_state_async_alloc_staging(host_buft, total));
+            if (!new_slot->pinned) {
+                // staging alloc failed: skip the async capture for this checkpoint cycle and write
+                // the checkpoint synchronously - the server keeps serving (F2: this used to hit a
+                // GGML_ASSERT inside a destructor -> abort)
+                LLAMA_LOG_WARN("%s: failed to allocate %.3f MiB of async state staging ('%s') - skipping async capture for this checkpoint, using the synchronous path\n",
+                    __func__, total/1024.0/1024.0, ggml_backend_buft_name(host_buft));
+                sync_fallback();
+                return;
+            }
             LLAMA_LOG_INFO("%s: allocated async state staging '%s' %.3f MiB\n", __func__, ggml_backend_buft_name(host_buft), total/1024.0/1024.0);
+            lctx.state_async_slots.push_back(std::move(new_slot));
+            slot = lctx.state_async_slots.back().get();
         }
         slot->reads.clear();
         slot->busy = true;
