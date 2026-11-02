@@ -151,6 +151,11 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
 
+# F2: async-checkpoint staging allocation failure path (CPU-only, no models needed)
+llama_build(test-async-ckpt-staging.cpp)
+target_include_directories(test-async-ckpt-staging PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+llama_test(test-async-ckpt-staging)
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
