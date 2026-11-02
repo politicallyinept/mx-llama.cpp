@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "../ggml/src/ggml-impl.h"  // probe: graph node dump
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -1784,7 +1785,37 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_DEC_TIMING=1: host-side sub-phase breakdown of llama_context::decode, bucketed by batch size
+// [mtp-pipe diagnostic; default-off, timing-only]
+struct dec_timing {
+    bool on = [] { const char * e = getenv("LLAMA_DEC_TIMING"); return e && atoi(e) != 0; }();
+    int64_t n_rep = 0;
+    int64_t t_balloc[5] = {}, t_mem[5] = {}, t_pu[5] = {}, t_build[5] = {}, t_comp[5] = {}, n_k[5] = {};
+    int64_t t_tap[5] = {};
+    int64_t t_comp_kb[6] = {}; int64_t n_kb[6] = {}; int64_t nodes_kb[6] = {};
+    int64_t n_nodes[5] = {};
+    bool dump = [] { const char * e = getenv("LLAMA_GRAPH_DUMP"); return e && atoi(e) != 0; }();
+    void report() {
+        if (!on || ++n_rep % 200 != 0) { return; }
+        for (int k = 1; k <= 4; ++k) {
+            if (!n_k[k]) { continue; }
+            fprintf(stderr, "decode timing (n_tokens=%d, x%lld): balloc %.3f + mem %.3f + ubatch %.3f (graph build %.3f + compute-submit %.3f + rest %.3f) ms, graph nodes %.0f\n",
+                k, (long long) n_k[k], t_balloc[k]/1e3/n_k[k], t_mem[k]/1e3/n_k[k], t_pu[k]/1e3/n_k[k],
+                t_build[k]/1e3/n_k[k], t_comp[k]/1e3/n_k[k], (t_pu[k]-t_build[k]-t_comp[k])/1e3/n_k[k], (double) n_nodes[k]/n_k[k]);
+        if (t_tap[k]) { fprintf(stderr, "decode timing (nodes-kb%d, x%lld): tap-wait %.3f ms\n", 1000*k, (long long)n_k[k], t_tap[k]/1e3/n_k[k]); }
+    }
+    for (int kb = 0; kb < 6; ++kb) {
+        if (n_kb[kb]) {
+            fprintf(stderr, "t_comp bucket nodes~%.0f x%lld: %.3f ms\n", nodes_kb[kb]/(double)n_kb[kb], (long long)n_kb[kb], t_comp_kb[kb]/1e3/n_kb[kb]);
+            t_comp_kb[kb] = n_kb[kb] = nodes_kb[kb] = 0;
+        }
+        }
+        for (int k = 0; k < 5; ++k) { t_balloc[k]=t_mem[k]=t_pu[k]=t_build[k]=t_comp[k]=n_k[k]=n_nodes[k]=t_tap[k]=0; }
+    }
+};
+static dec_timing g_dec_t;
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t dbb = g_dec_t.on ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1892,7 +1923,26 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t dbc = g_dec_t.on ? ggml_time_us() : 0;
+    if (g_dec_t.on) { g_dec_t.t_build[std::min((int)ubatch.n_tokens,4)] += dbc - dbb; g_dec_t.n_nodes[std::min((int)ubatch.n_tokens,4)] += ggml_graph_n_nodes(res->get_gf()); }
+    if (g_dec_t.dump && ubatch.n_tokens == 3 && ggml_graph_n_nodes(res->get_gf()) > 500) {
+        std::map<std::string, int> hist;
+        auto * gf_ = res->get_gf();
+        for (int ni = 0; ni < ggml_graph_n_nodes(gf_); ++ni) {
+            hist[ggml_op_name(gf_->nodes[ni]->op)]++;
+        }
+        fprintf(stderr, "GRAPH DUMP (n_tokens=%d, total nodes=%d):\n", (int) ubatch.n_tokens, ggml_graph_n_nodes(gf_));
+        for (const auto & kv : hist) { fprintf(stderr, "  %-28s %d\n", kv.first.c_str(), kv.second); }
+        fflush(stderr);
+        g_dec_t.dump = false;
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (g_dec_t.on) {
+        g_dec_t.t_comp[std::min((int)ubatch.n_tokens,4)] += ggml_time_us() - dbc;
+        const int nn = ggml_graph_n_nodes(res->get_gf());
+        const int kb = nn < 200 ? 0 : nn < 1000 ? 1 : nn < 2500 ? 2 : nn < 3500 ? 3 : nn < 5000 ? 4 : 5;
+        g_dec_t.t_comp_kb[kb] += ggml_time_us() - dbc; g_dec_t.n_kb[kb]++; g_dec_t.nodes_kb[kb] += nn;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         if (mctx) {
             mctx->finish_compute(false);
@@ -2210,6 +2260,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    const int64_t dt0 = g_dec_t.on ? ggml_time_us() : 0;
     if (!balloc->init(batch_inp, vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
@@ -2217,6 +2268,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+    if (g_dec_t.on) { g_dec_t.t_balloc[std::min((int)n_outputs_all,4)] += ggml_time_us() - dt0; }
 
     if (output_all) {
         // require that all tokens are output
@@ -2246,6 +2298,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     output_swaps.clear();
     embd_batch_idxs.clear();
 
+    const int64_t dt2 = g_dec_t.on ? ggml_time_us() : 0;
     sched_reserve();
 
     bool did_optimize = false;
@@ -2299,6 +2352,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     // reserve output buffer
+    if (g_dec_t.on) { g_dec_t.t_mem[std::min((int)n_tokens_all,4)] += ggml_time_us() - dt2; }
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
@@ -2312,6 +2366,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    const int64_t dt4 = g_dec_t.on ? ggml_time_us() : 0;
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -2545,6 +2600,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+    if (g_dec_t.on) { g_dec_t.t_pu[std::min((int)n_tokens_all,4)] += ggml_time_us() - dt4; g_dec_t.n_k[std::min((int)n_tokens_all,4)]++; }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2599,6 +2655,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    if (g_dec_t.on) { g_dec_t.report(); }
     return 0;
 }
 
@@ -3271,10 +3328,12 @@ ggml_status llama_context::graph_compute(
     // it would overwrite rows the previous ubatch's D2H may still be reading.
     // Each tapped pipeline stage owns a separate writer stream and needs its own
     // dependency; waiting only on the last stage leaves the other taps exposed.
+    const int64_t tw0 = g_dec_t.on ? ggml_time_us() : 0;
     for (const auto & wait : tap_readback_waits) {
         ggml_backend_event_wait(wait.first, wait.second);
     }
     tap_readback_waits.clear();
+    if (g_dec_t.on) { g_dec_t.t_tap[std::min((int)ggml_graph_n_nodes(gf)/1000,4)] += ggml_time_us() - tw0; }
 
     copy_experts.reset();
 
