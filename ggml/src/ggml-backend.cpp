@@ -2320,6 +2320,10 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
     mixw((uint64_t) g->n_nodes);
     mixw((uint64_t) g->n_leafs);
     mixw((uint64_t) ggml_cgraph_get_flags(g));
+    // Scratch generation: a pool cudaFree (OOM flush / pool-full) kills
+    // scratch pointers baked into captures without moving any tensor->data,
+    // so the uid must change when it bumps.
+    mixw(ggml_scratch_gen());
     for (int i = 0; i < g->n_leafs; i++) {
         mixw((uint64_t) (uintptr_t) g->leafs[i]);
         mixw((uint64_t) g->leafs[i]->op);

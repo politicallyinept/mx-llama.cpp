@@ -488,6 +488,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     void clear_pool() {
         ggml_cuda_set_device(device);
+        bool freed = false;
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
@@ -495,7 +496,15 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 pool_size -= b.size;
                 b.ptr  = nullptr;
                 b.size = 0;
+                freed = true;
             }
+        }
+        if (freed) {
+            // Every cached scratch pointer just died. Captured graphs may bake
+            // these pointers with no tensor->data change, so bump the global
+            // scratch generation: post-alloc uid hashes and meta token-graph
+            // replays invalidate on it.
+            ggml_scratch_gen_bump("cuda pool OOM flush");
         }
     }
 
@@ -589,6 +598,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         ggml_cuda_set_device(device);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
+        ggml_scratch_gen_bump("cuda pool full");  // see clear_pool
     }
 };
 
@@ -3623,6 +3633,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
         if (cuda_ctx->hip_set2d_scratch_cap < total) {
             if (cuda_ctx->hip_set2d_scratch_ptr) {
                 CUDA_CHECK(cudaFreeHost(cuda_ctx->hip_set2d_scratch_ptr));
+                ggml_scratch_gen_bump("set2d pinned scratch grow");
             }
             CUDA_CHECK(cudaMallocHost(&cuda_ctx->hip_set2d_scratch_ptr, total));
             cuda_ctx->hip_set2d_scratch_cap = total;
