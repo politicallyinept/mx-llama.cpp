@@ -334,6 +334,27 @@ throughput dominates and PPL tolerance is >=2%. **Who should not**: MTP/speculat
 workloads (use stock + MTP; measured best), MoE-heavy decode workloads (gains are ~?),
 or deployments where the narrow-width cliff matters.
 
+## Attribution / Provenance
+
+- **Base project:** this tree is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+  (ggml-org).
+- **Lineage:** this branch descends from the mx performance fork
+  ([mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp), itself a fork of
+  ggml-org/llama.cpp); the fork's own records reference that lineage (`docs/BENCH.md`
+  cites "mxxm-t master" as the upstream base).
+- **CV fork (external source):** part of the kernel work on this branch derives from
+  Castagna Veloce, an external llama.cpp fork by benpeterson40
+  ([benpeterson40/castagna-veloce](https://github.com/benpeterson40/castagna-veloce)).
+  Ported kernels are marked in the source comments (`CV (castagna-veloce) port`, pinned
+  to CV commit `3483d46`) — see e.g. `ggml/src/ggml-cuda/gated_delta_net.cu`,
+  `rope.cu`, `concat.cu`, `she-fuse.cu`.
+- **In-house additions on this branch (mtp-pipe / coaltp2 lineage):** MTP pipeline gates
+  (conv-scatter + fast-sample, env-gated), the token-graph inner-replay restore fix
+  (`GGML_META_TG_INNER_ON_FAIL`, per-subgraph graph replay restored on token-graph
+  failure), the coal-under-TP2 cgraph batch-type propagation (SPEC_VERIFY hint to
+  per-lane subgraphs), GDN concat/ring work, and the coal fusion bundle (env-gated OFF
+  in production defaults per the 2026-11-03 adoption benchmark).
+
 ## Provenance
 
 All benchmarks used **base models** (upstream or bartowski-style uncalibrated
