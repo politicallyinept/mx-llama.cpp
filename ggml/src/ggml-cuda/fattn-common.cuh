@@ -18,6 +18,24 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// CV port (castagna-veloce ggml_cuda_fattn_tile_swap_yz): with the gate on, the tile kernel grid is launched with
+// parallel_blocks on grid z and the head groups on grid y and the kernel reads the swapped mapping. The ncols2
+// head groups sharing a K/V head become the fastest-varying block index, so they run together and share the KV
+// chunk through L2 (CV measured +15% on head-256 single-token decode tiles). Env gate GGML_FA_TILE_SWAPYZ=1,
+// default OFF. Pure block-mapping change: per-block computation and the parallel_blocks reduce order are
+// untouched, so the output is byte-identical by construction.
+static inline bool ggml_cuda_fattn_tile_swap_yz_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_FA_TILE_SWAPYZ");
+        const bool on = e && atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("[FA-TILE-SWAPYZ] flash-attn tile grid y/z swap engaged (CV geometry)\n");
+        }
+        return on;
+    }();
+    return enabled;
+}
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -39,7 +57,8 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const bool swap_yz);
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -984,7 +1003,7 @@ template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE, const bool async_kv_preload = false
+    const int warp_size = WARP_SIZE, const bool async_kv_preload = false, const bool tile_swap = false
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1144,6 +1163,7 @@ void launch_fattn(
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
+    const bool swap_yz = tile_swap && !stream_k && ggml_cuda_fattn_tile_swap_yz_enabled();
     dim3 blocks_num;
     if (stream_k) {
         // Stream-K splits the work before the mask scan is applied, so skipped KV tiles make the blocks uneven.
@@ -1258,6 +1278,9 @@ void launch_fattn(
                     __func__, id, failed_blocks, parallel_blocks);
         }
         blocks_num.y = parallel_blocks;
+        if (swap_yz) {
+            std::swap(blocks_num.y, blocks_num.z);
+        }
     }
 
     float scale         = 1.0f;
@@ -1297,7 +1320,8 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        swap_yz
     );
     CUDA_CHECK(cudaGetLastError());
 
