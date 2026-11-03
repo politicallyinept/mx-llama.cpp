@@ -3,6 +3,7 @@
 #include "repack.cuh"
 #include "repack-common.cuh"
 #include "ggml-cuda.h"   // GGML_LOG_WARN for the gate-engagement markers
+#include "ggml-impl.h"   // ggml_scratch_gen_bump
 #include "w4a4-profile.h"   // GGML_CUDA_W4A4_PROFILE: resolved int4-knob presets (after ggml-cuda.h so the real GGML_LOG_WARN macro wins over the header fallback)
 
 // Resolve the profile at library load (see w4a4-profile.h): the summary/unknown
@@ -643,6 +644,7 @@ void repack_view_cache_purge(int device, const void * base, size_t size) {
         const uint8_t * v = (const uint8_t *) it->first.view_data;
         if (v >= lo && v < hi) {
             CUDA_CHECK(cudaFree(it->second.d_ptr));
+            ggml_scratch_gen_bump("repack view cache free");
             it = s_view_cache.erase(it);
         } else {
             ++it;

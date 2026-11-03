@@ -69,6 +69,26 @@ uint64_t ggml_graph_next_uid(void) {
 #endif
 }
 
+// Scratch-generation counter: see ggml-impl.h. Bumped by backends whenever
+// device scratch that captured graphs may have baked is cudaFree'd.
+static uint64_t ggml_scratch_gen_value = 0;
+
+void ggml_scratch_gen_bump(const char *why) {
+    const uint64_t gen = __atomic_add_fetch(&ggml_scratch_gen_value, 1, __ATOMIC_RELEASE);
+    static int dbg = -1;
+    if (dbg < 0) {
+        dbg = getenv("GGML_SCRATCH_GEN_DEBUG") != NULL ? 1 : 0;
+    }
+    if (dbg) {
+        fprintf(stderr, "[scratchgen] bump (%s): gen=%llu\n", why ? why : "?",
+                (unsigned long long) gen);
+    }
+}
+
+uint64_t ggml_scratch_gen(void) {
+    return __atomic_load_n(&ggml_scratch_gen_value, __ATOMIC_ACQUIRE);
+}
+
 // Needed for ggml_fp32_to_bf16_row()
 #if defined(__AVX512BF16__)
 #if defined(_MSC_VER)

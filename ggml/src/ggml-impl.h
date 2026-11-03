@@ -32,6 +32,16 @@ void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);
 
+// Scratch-generation counter. The CUDA/HIP buffer pool cudaFree's cached
+// scratch buffers (OOM flush on a failed alloc, pool-full free). Captured
+// CUDA graphs bake those scratch pointers while no tensor->data changes, so
+// a data-pointer uid hash cannot see the free. Backends bump the counter on
+// every scratch cudaFree; the scheduler mixes it into the post-allocation
+// split-uid hashes and the meta token-graph cache compares it at replay
+// time, so a replay can never target freed scratch.
+void     ggml_scratch_gen_bump(const char *why);
+uint64_t ggml_scratch_gen(void);
+
 // internal: allocate a graph with the scheduler's current buffer-id
 // assignment so multi-buffer layout-cache restores can be validated, and an
 // ids-changed graph can re-bind from the cache without the reserve drain.

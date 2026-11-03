@@ -2769,6 +2769,11 @@ struct ggml_backend_meta_context {
         // `covered` is dispatched per-subgraph after the replay. Only the
         // GGML_META_TG_LIMIT debug knob makes this less than n_subgraphs.
         size_t              covered = SIZE_MAX;
+        // Scratch generation at capture time. The CUDA/HIP pool cudaFree's
+        // cached scratch (OOM flush, pool-full free) without moving any
+        // tensor->data; a capture bakes those pointers, so replay is only
+        // safe while the generation is unchanged (see ggml_scratch_gen).
+        uint64_t            gen     = 0;
         std::vector<tg_run> runs;
     };
     std::vector<tg_entry> tg_cache;
@@ -5457,6 +5462,24 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     tge->covered, backend_ctx->n_subgraphs);
         }
 
+        // Scratch-generation invalidation: if any pool scratch was cudaFree'd
+        // since this capture (OOM flush / pool-full free), the scratch
+        // pointers baked into these graphs are dangling even though every
+        // tensor->data still matches - drop the capture and re-warm instead
+        // of replaying freed memory.
+        if (!tge->runs.empty() && ggml_scratch_gen() != tge->gen) {
+            if (backend_ctx->dbg_tg) {
+                fprintf(stderr, "[tg-debug] uid %zu SCRATCH-GEN %llu -> %llu: capture invalidated, re-warming\n",
+                        (size_t) cgraph->uid, (unsigned long long) tge->gen,
+                        (unsigned long long) ggml_scratch_gen());
+            }
+            backend_ctx->tg_free_entry(*tge);
+            tge->warm    = 0;
+            tge->failed  = false;
+            tge->covered = SIZE_MAX;
+            tge->gen     = ggml_scratch_gen();
+        }
+
         // Replay. Each run is one launch per lane of its stage, then the stage transfer
         // on the host, which is what the next stage's inputs depend on.
         if (!tge->runs.empty()) {
@@ -5589,6 +5612,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 tge->runs    = runs;
                 tge->covered = n_cap;
 
+                // Generation at capture start: scratch allocated during the
+                // capture run belongs to this generation; a bump *during*
+                // capture means the capture baked a freed pointer.
+                const uint64_t tg_cap_gen = ggml_scratch_gen();
+
                 bool ok = true;
                 std::vector<ggml_tensor *> nodes;
                 for (auto & r : tge->runs) {
@@ -5651,7 +5679,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                 }
 
+                if (ok && ggml_scratch_gen() != tg_cap_gen) {
+                    // pool scratch was cudaFree'd mid-capture: baked pointers dangle
+                    ok = false;
+                }
                 if (ok) {
+                    tge->gen = tg_cap_gen;
                     // Capture records without executing, so this token still runs.
                     for (const auto & r : tge->runs) {
                         const size_t lane_lo = r.stage * backend_ctx->tps;
