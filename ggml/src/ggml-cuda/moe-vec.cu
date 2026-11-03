@@ -2411,7 +2411,7 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
             const int si1  = ids->nb[1] / sizeof(int32_t);
             const int sis1 = src1->nb[2] / src1->nb[1];
             ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-                ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
+                ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream, &ctx.pool());
         }
         const int64_t ne10_padded = GGML_PAD(ne00, 256);
         const int64_t s_col_y = ne10_padded / QK8_1;
@@ -2654,7 +2654,7 @@ void ggml_cuda_moe_vec(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         const int si1  = ids->nb[1] / sizeof(int32_t);
         const int sis1 = src1->nb[2] / src1->nb[1];
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-            ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream);
+            ne02, ne12, n_used, ne11, si1, sis1, /*write_inverse =*/ false, stream, &ctx.pool());
     }
 
     const int64_t ne10_padded = GGML_PAD(ne00, 256);
