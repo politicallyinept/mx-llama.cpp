@@ -6,6 +6,7 @@
 #include "repack-common.cuh"
 #include "ggml-cuda.h"
 #include "ggml-backend-impl.h"
+#include "ggml-impl.h"   // ggml_scratch_gen_bump
 
 #include <algorithm>
 #include <cstring>
@@ -450,6 +451,7 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
         // cudaFree synchronizes, but growth is monotonic across a load
         if (st.scratch != nullptr) {
             CUDA_CHECK(cudaFree(st.scratch));
+            ggml_scratch_gen_bump("repack upload scratch grow");
         }
         CUDA_CHECK(cudaMalloc(&st.scratch, total));
         st.cap = total;
@@ -568,6 +570,7 @@ bool ggml_cuda_repack_try_release_scratch(int device) {
     CUDA_CHECK(cudaFree(st.scratch));
     st.scratch = nullptr;
     st.cap     = 0;
+    ggml_scratch_gen_bump("repack upload scratch release");
     return true;
 }
 
@@ -595,6 +598,7 @@ void ggml_cuda_repack_async_release(int device) {
         CUDA_CHECK(cudaFree(st.scratch));
         st.scratch = nullptr;
         st.cap     = 0;
+        ggml_scratch_gen_bump("repack async release");
     }
 }
 
