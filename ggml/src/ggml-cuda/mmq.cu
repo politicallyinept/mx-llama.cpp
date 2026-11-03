@@ -473,7 +473,7 @@ void ggml_cuda_mul_mat_q(
 
         ggml_cuda_launch_mm_ids_helper(ids_chunk, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, iter_ne12, n_expert_used, ne11, ids_s1, src1_ids_s1,
-            /*write_inverse =*/ dedup_bcast, stream);
+            /*write_inverse =*/ dedup_bcast, stream, &ctx.pool());
         CUDA_CHECK(cudaGetLastError());
 
         if (use_native_fp4) {
