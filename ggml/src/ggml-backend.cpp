@@ -2280,53 +2280,100 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // graph that actually reaches the backend, i.e. the split graph. The MTP draft
     // context re-splits every step (alternating shapes), so even with a stable
     // whole-graph uid a fresh split uid here kept every draft token-graph cold.
-    // Hash the split graph the same self-verifying way: a hash match implies
-    // identical node/leaf tensor addresses, so captured graphs stay valid; any
-    // layout change hashes differently and yields a fresh uid -> meta rebuild.
+    // Stamp the split uid post-allocation (ggml_backend_sched_stamp_split_uids):
+    // a hash match implies identical node/leaf tensor addresses in the layout the
+    // captured kernels read, so captured graphs stay valid after allocator moves.
     for (int i = 0; i < sched->n_splits; ++i) {
         if (s_stable_uid) {
-            struct ggml_cgraph * sg = &sched->splits[i].graph;
-            uint64_t h = 1469598103934665603ULL; // FNV-1a 64
-            auto mixs = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
-            mixs(0x5A117E5ULL + (uint64_t) i); // split discriminator
-            mixs(whole_h); // whole-graph struct+data hash: split uid stable => whole graph stable
-            mixs((uint64_t) sg->n_nodes);
-            mixs((uint64_t) sg->n_leafs);
-            mixs((uint64_t) ggml_cgraph_get_flags(sg));
-            for (int k = 0; k < sg->n_leafs; k++) {
-                mixs((uint64_t) (uintptr_t) sg->leafs[k]);
-                mixs((uint64_t) sg->leafs[k]->op);
-                mixs((uint64_t) (uintptr_t) sg->leafs[k]->data);
-            }
-            for (int k = 0; k < sg->n_nodes; k++) {
-                mixs((uint64_t) (uintptr_t) sg->nodes[k]);
-                mixs((uint64_t) sg->nodes[k]->op);
-                mixs((uint64_t) (uintptr_t) sg->nodes[k]->data);
-            }
-            sg->uid = 0;
-            for (int c = 0; c < ggml_backend_sched::UID_CACHE_SIZE; c++) {
-                if (sched->uid_cache[c].hash == h && h != 0) {
-                    sg->uid = sched->uid_cache[c].uid;
-                    break;
-                }
-            }
-            if (sg->uid == 0) {
-                sg->uid = ggml_graph_next_uid();
-                sched->uid_cache[sched->uid_cache_next].hash = h;
-                sched->uid_cache[sched->uid_cache_next].uid = sg->uid;
-                sched->uid_cache_next = (sched->uid_cache_next + 1) % ggml_backend_sched::UID_CACHE_SIZE;
-            }
-            static const bool s_uid_split_dbg = getenv("GGML_SCHED_STABLE_UID_DEBUG") != NULL;
-            if (s_uid_split_dbg) {
-                static long s_uid_split_dbg_n = 0;
-                if (s_uid_split_dbg_n++ < 4000) {
-                    fprintf(stderr, "[uidsplitdbg] i=%d nn=%d nl=%d h=%llx uid=%llu sched=%p\n",
-                            i, sg->n_nodes, sg->n_leafs, (unsigned long long) h,
-                            (unsigned long long) sg->uid, (void *) sched);
-                }
-            }
+            // Defer stamping until AFTER ggml_gallocr_alloc_graph has assigned the
+            // final data addresses (see ggml_backend_sched_stamp_split_uids). At
+            // split time tensor->data still holds the previous allocation (null on
+            // a fresh rebuild), so hashing here cannot see the allocator moving a
+            // tensor: a pre-allocation hash matched even after a reserve/realloc
+            // moved the buffers, and meta replayed the captured graph against the
+            // freed addresses (HSA aperture violation in attn_qk_fused after a new
+            // prefill shape perturbed the allocator). uid=0 marks "pending".
+            sched->splits[i].graph.uid = 0;
         } else {
             sched->splits[i].graph.uid = ggml_graph_next_uid();
+        }
+    }
+}
+
+// GGML_SCHED_STABLE_UID: stamp split-graph uids from the POST-allocation layout,
+// called from ggml_backend_sched_alloc_graph after alloc_splits succeeded. A hash
+// match now pins the live struct AND data addresses of the layout the captured
+// kernels actually read, so a token-graph replay can never target moved memory.
+static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
+    static const bool s_stable_uid = [] {
+        const char * e = getenv("GGML_SCHED_STABLE_UID");
+        return e != NULL && atoi(e) != 0;
+    }();
+    if (!s_stable_uid) {
+        return;
+    }
+    static const bool s_uid_split_dbg = getenv("GGML_SCHED_STABLE_UID_DEBUG") != NULL;
+
+    struct ggml_cgraph * g = &sched->graph;
+    uint64_t wh = 1469598103934665603ULL; // FNV-1a 64, whole-graph hash (post-alloc)
+    auto mixw = [&wh](uint64_t v) { wh ^= v; wh *= 1099511628211ULL; };
+    mixw((uint64_t) g->n_nodes);
+    mixw((uint64_t) g->n_leafs);
+    mixw((uint64_t) ggml_cgraph_get_flags(g));
+    for (int i = 0; i < g->n_leafs; i++) {
+        mixw((uint64_t) (uintptr_t) g->leafs[i]);
+        mixw((uint64_t) g->leafs[i]->op);
+        mixw((uint64_t) (uintptr_t) g->leafs[i]->data);
+        mixw((uint64_t) (uintptr_t) g->leafs[i]->buffer);
+    }
+    for (int i = 0; i < g->n_nodes; i++) {
+        mixw((uint64_t) (uintptr_t) g->nodes[i]);
+        mixw((uint64_t) g->nodes[i]->op);
+        mixw((uint64_t) (uintptr_t) g->nodes[i]->data);
+        mixw((uint64_t) (uintptr_t) g->nodes[i]->buffer);
+    }
+
+    for (int i = 0; i < sched->n_splits; ++i) {
+        struct ggml_cgraph * sg = &sched->splits[i].graph;
+        if (sg->uid != 0) {
+            continue; // not deferred by split_graph
+        }
+        uint64_t h = 1469598103934665603ULL;
+        auto mixs = [&h](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+        mixs(0x5A117E5ULL + (uint64_t) i); // split discriminator
+        mixs(wh); // split uid stable => whole-graph layout stable (leaf data included)
+        mixs((uint64_t) sg->n_nodes);
+        mixs((uint64_t) sg->n_leafs);
+        mixs((uint64_t) ggml_cgraph_get_flags(sg));
+        for (int k = 0; k < sg->n_leafs; k++) {
+            mixs((uint64_t) (uintptr_t) sg->leafs[k]);
+            mixs((uint64_t) sg->leafs[k]->op);
+            mixs((uint64_t) (uintptr_t) sg->leafs[k]->data);
+        }
+        for (int k = 0; k < sg->n_nodes; k++) {
+            mixs((uint64_t) (uintptr_t) sg->nodes[k]);
+            mixs((uint64_t) sg->nodes[k]->op);
+            mixs((uint64_t) (uintptr_t) sg->nodes[k]->data);
+        }
+        for (int c = 0; c < ggml_backend_sched::UID_CACHE_SIZE; c++) {
+            if (sched->uid_cache[c].hash == h && h != 0) {
+                sg->uid = sched->uid_cache[c].uid;
+                break;
+            }
+        }
+        if (sg->uid == 0) {
+            sg->uid = ggml_graph_next_uid();
+            sched->uid_cache[sched->uid_cache_next].hash = h;
+            sched->uid_cache[sched->uid_cache_next].uid = sg->uid;
+            sched->uid_cache_next = (sched->uid_cache_next + 1) % ggml_backend_sched::UID_CACHE_SIZE;
+        }
+        if (s_uid_split_dbg) {
+            static long s_uid_split_dbg_n = 0;
+            if (s_uid_split_dbg_n++ < 4000) {
+                fprintf(stderr, "[uidsplitdbg] i=%d nn=%d nl=%d h=%llx uid=%llu sched=%p\n",
+                        i, sg->n_nodes, sg->n_leafs, (unsigned long long) h,
+                        (unsigned long long) sg->uid, (void *) sched);
+            }
         }
     }
 }
@@ -3015,6 +3062,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
+
+    ggml_backend_sched_stamp_split_uids(sched);
 
     sched->is_alloc = true;
 
