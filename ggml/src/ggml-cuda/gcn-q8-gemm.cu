@@ -2347,7 +2347,7 @@ void ggml_cuda_gcn_kq_moe(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_exp + 1);
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
         (int) n_exp, (int) n_tokens, (int) n_used, (int) ne11, (int) (ids->nb[1]/sizeof(int32_t)),
-        (int) (src1->nb[2]/src1->nb[1]), /*write_inverse =*/ false, stream);
+        (int) (src1->nb[2]/src1->nb[1]), /*write_inverse =*/ false, stream, &ctx.pool());
 
     // every src1 row once (gate/up: one per token; down: one per token slot), in natural order
     ggml_cuda_pool_alloc<int8_t> yq(ctx.pool(), n_rows*K);
