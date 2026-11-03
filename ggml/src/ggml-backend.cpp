@@ -1699,6 +1699,34 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             mix((uint64_t) (uintptr_t) graph->nodes[i]->data);
             mix((uint64_t) (uintptr_t) graph->nodes[i]->buffer);
         }
+        // Shape + op_params: a shared res arena (LLAMA_GRAPH_RES_PER_SHAPE
+        // bucket 7 covers every n_tokens > 32) hosts graphs of different
+        // token widths at identical node structs, data and buffer addresses.
+        // Without ne/nb/op_params a 4096-token capture and a 512-token rebuild
+        // hash to the same uid, and the meta token-graph cache replays the
+        // wrong-width capture out of its buffers (aperture violation).
+        // A captured kernel bakes shape and op_params just like pointers, so
+        // the uid must pin them too.
+        for (int i = 0; i < graph->n_leafs; i++) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) graph->leafs[i]->ne[d]);
+                mix((uint64_t) graph->leafs[i]->nb[d]);
+            }
+            uint64_t op0, op1;
+            memcpy(&op0, graph->leafs[i]->op_params, sizeof(op0));
+            memcpy(&op1, graph->leafs[i]->op_params + 8, sizeof(op1));
+            mix(op0); mix(op1);
+        }
+        for (int i = 0; i < graph->n_nodes; i++) {
+            for (int d = 0; d < GGML_MAX_DIMS; d++) {
+                mix((uint64_t) graph->nodes[i]->ne[d]);
+                mix((uint64_t) graph->nodes[i]->nb[d]);
+            }
+            uint64_t op0, op1;
+            memcpy(&op0, graph->nodes[i]->op_params, sizeof(op0));
+            memcpy(&op1, graph->nodes[i]->op_params + 8, sizeof(op1));
+            mix(op0); mix(op1);
+        }
         whole_h = h;
         graph->uid = 0;
         for (int i = 0; i < ggml_backend_sched::UID_CACHE_SIZE; i++) {
@@ -2329,12 +2357,31 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
         mixw((uint64_t) g->leafs[i]->op);
         mixw((uint64_t) (uintptr_t) g->leafs[i]->data);
         mixw((uint64_t) (uintptr_t) g->leafs[i]->buffer);
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mixw((uint64_t) g->leafs[i]->ne[d]);
+            mixw((uint64_t) g->leafs[i]->nb[d]);
+        }
+        uint64_t op0, op1;
+        memcpy(&op0, g->leafs[i]->op_params, sizeof(op0));
+        memcpy(&op1, g->leafs[i]->op_params + 8, sizeof(op1));
+        mixw(op0); mixw(op1);
     }
     for (int i = 0; i < g->n_nodes; i++) {
         mixw((uint64_t) (uintptr_t) g->nodes[i]);
         mixw((uint64_t) g->nodes[i]->op);
         mixw((uint64_t) (uintptr_t) g->nodes[i]->data);
         mixw((uint64_t) (uintptr_t) g->nodes[i]->buffer);
+        // shape + op_params are baked into captured kernels just like the
+        // pointers; a shared res arena makes them the ONLY discriminator
+        // between different token widths (see split_graph).
+        for (int d = 0; d < GGML_MAX_DIMS; d++) {
+            mixw((uint64_t) g->nodes[i]->ne[d]);
+            mixw((uint64_t) g->nodes[i]->nb[d]);
+        }
+        uint64_t op0, op1;
+        memcpy(&op0, g->nodes[i]->op_params, sizeof(op0));
+        memcpy(&op1, g->nodes[i]->op_params + 8, sizeof(op1));
+        mixw(op0); mixw(op1);
     }
 
     for (int i = 0; i < sched->n_splits; ++i) {
