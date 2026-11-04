@@ -1467,6 +1467,35 @@ bool tp_custom_ar_prepare(CustomARContext * ctx,
             }
             return false;
         }
+        if (!s_broadcast) {
+            // csAR capture-safety is only provided by the per-width pool path,
+            // which exists only for the peer-write broadcast kernel. With
+            // broadcast_ok=0 (e.g. gfx906 PCIe without HSA_FORCE_FINE_GRAIN_PCIE=1)
+            // the call would fall through to the legacy one-shot path: on-demand
+            // staging allocation and a cross-stream event handshake, both illegal
+            // inside stream capture, and its cross-rank barrier spins forever when
+            // peer writes are not cache-coherent (TP2 load deadlock, 2026-11-04:
+            // staging ALLOCATED on both ranks, both lanes blocked at the first
+            // allreduce, unkillable, leaked VRAM on TERM). Refuse this call; the
+            // caller falls back to the regular AllReduce path.
+            plan->transient_refusal = true;
+            static bool warned_nobcast = false;
+            if (!warned_nobcast) {
+                warned_nobcast = true;
+                GGML_LOG_WARN("TP custom AR [CSAR]: broadcast path unavailable (broadcast_ok=0); "
+                              "refusing the capture-unsafe one-shot fallback (falls back to the "
+                              "regular AllReduce path). On PCIe AMD GPUs set "
+                              "HSA_FORCE_FINE_GRAIN_PCIE=1 to enable the peer-write paths.\n");
+            }
+            return false;
+        }
+        if (csar_any_stream_capturing(streams, nranks)) {
+            // twoshot/chunked paths below realloc the legacy staging on demand,
+            // which is not capture-safe. Refuse for THIS call (transient), same
+            // contract as csar_prepare_pool's capture refusal.
+            plan->transient_refusal = true;
+            return false;
+        }
         if (ctx->width_transition_seen) {
             return false;
         }
