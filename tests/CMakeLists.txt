@@ -181,6 +181,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-requant-u4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
     llama_test(test-requant-u4)
 
+    # nibble-layout round-trip property test for the gfx906 repacked planes
+    llama_build(test-repack-nibble-roundtrip.cpp)
+    target_include_directories(test-repack-nibble-roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+    llama_test(test-repack-nibble-roundtrip)
+
     llama_build(test-gbnf-validator.cpp)
 
     # build test-tokenizer-1-bpe target once and add many tests
