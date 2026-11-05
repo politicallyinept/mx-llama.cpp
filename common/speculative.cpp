@@ -1811,10 +1811,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // per-chunk synchronize, then build the draft KV in one pass after prefill. Removes
     // the MTP prefill PP regression caused by the per-prefill-chunk target sync.
     bool deferred_prefill = false;
-    // LLAMA_MTP_DEFERRED_REARM (default off): keep the deferred-prefill accum alive across
-    // requests and re-arm it at the start of each new prompt prefill. Without it, deferred
-    // prefill covers only the first request and every later prefill falls back to the
-    // per-chunk path (draft replay + target sync inside the measured prompt window).
+    // LLAMA_MTP_DEFERRED_REARM (default ON, =0 escape hatch): keep the deferred-prefill
+    // accum alive across requests and re-arm it at the start of each new prompt prefill.
+    // Without it, deferred prefill covers only the first request and every later prefill
+    // falls back to the per-chunk path (draft replay + target sync inside the measured
+    // prompt window). Default ON because the KV-only replay fix (LLAMA_MTP_MOE_KV_ONLY,
+    // also default ON) only covers every request when the rearm is armed -- a two-flag
+    // recipe is a deployment footgun.
     bool deferred_rearm   = false;
     // LLAMA_MTP_SPEC_TIMING (default off): log per-path prefill draft-replay timings for diagnosis
     bool spec_timing      = false;
@@ -1942,8 +1945,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_PREFILL")) {
             deferred_prefill = deferred_prefill && (std::strcmp(env, "0") != 0);
         }
-        if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_REARM")) {
-            deferred_rearm = deferred_prefill && (std::strcmp(env, "0") != 0);
+        {
+            // Default ON (unset or non-zero = enabled, =0 escape hatch). Evidence
+            // 2026-11-05: with KV-only replay default ON, rearm is required for the fix
+            // to cover every request; /root/p2-prefill/report.md, report-q40.md.
+            const char * env = std::getenv("LLAMA_MTP_DEFERRED_REARM");
+            deferred_rearm = deferred_prefill && (!env || std::atoi(env) != 0);
         }
         if (const char * env = std::getenv("LLAMA_MTP_SPEC_TIMING")) {
             spec_timing = std::strcmp(env, "0") != 0;
