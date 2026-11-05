@@ -2526,16 +2526,47 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     }
     // c2c3 C3: MoE expert tensors can stay canonical (skip the repack buffer) so the
     // CV-ported mul_mat_vec_q_moe row-lane kernels serve verify-width expert matvecs;
-    // the repacked_id1 path loses to them at decode widths. Env gate
-    // GGML_CUDA_MOE_CANONICAL, default OFF (=1 enables).
-    static const bool s_moe_canonical = [] {
+    // the repacked_id1 path loses to them at decode widths.
+    // Q11 (2026-11-05): default flipped ON for non-Q4_0 experts. Evidence (Q10,
+    // median-of-3, 21 legs): UD-Q4_K_XL canon is BIT-IDENTICAL to base (greedy sha
+    // 9144cfce0656684d every run, ladder KL 0.000000) and tg +1.01% sits inside the
+    // 8.20% base-to-base spread => flat. Q4_0 experts stay on the repacked u4 path
+    // by default: the Q4_0 canon ladder passes (mean KL 0.004478) but the per-case
+    // account of the 0.0339 gdnab KL is still open, so Q4_0 is not swept up here.
+    // Env GGML_CUDA_MOE_CANONICAL: unset = new default (ON for every expert type
+    // except Q4_0); =0 forces OFF for all types; =1 forces ON for all types (A/B).
+    static const int s_moe_canonical_env = [] {
         const char * e = getenv("GGML_CUDA_MOE_CANONICAL");
-        return e != nullptr && atoi(e) != 0;
+        return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
     }();
-    if (s_moe_canonical && layer_dev != nullptr &&
+    if (layer_dev != nullptr &&
             (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
              tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS)) {
-        buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+        ggml_type exps_type = GGML_TYPE_COUNT;
+        const auto wit = ml.weights_map.find(tn.str());
+        if (wit != ml.weights_map.end() && wit->second.tensor != nullptr) {
+            exps_type = wit->second.tensor->type;
+        }
+        const bool moe_canonical = s_moe_canonical_env == 1 ||
+            (s_moe_canonical_env < 0 && exps_type != GGML_TYPE_Q4_0);
+        if (moe_canonical) {
+            buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+            static bool s_moe_canonical_logged_on = false;
+            if (!s_moe_canonical_logged_on) {
+                s_moe_canonical_logged_on = true;
+                LLAMA_LOG_WARN("%s: GGML_CUDA_MOE_CANONICAL ACTIVE (first expert tensor %s type %s): MoE expert weights stay canonical, mul_mat_vec_q_moe serves verify-width expert matvecs\n",
+                    __func__, tn.str().c_str(),
+                    exps_type < GGML_TYPE_COUNT ? ggml_type_name(exps_type) : "unknown");
+            }
+        } else if (s_moe_canonical_env < 0) {
+            static bool s_moe_canonical_logged_off = false;
+            if (!s_moe_canonical_logged_off) {
+                s_moe_canonical_logged_off = true;
+                LLAMA_LOG_WARN("%s: GGML_CUDA_MOE_CANONICAL default keeps expert tensors (first: %s type %s) on the repacked path (Q4_0 exclusion)\n",
+                    __func__, tn.str().c_str(),
+                    exps_type < GGML_TYPE_COUNT ? ggml_type_name(exps_type) : "unknown");
+            }
+        }
     }
     // The gather table is an input-class tensor, so it normally lands on the CPU and
     // is read lazily. Sharding it means putting it back in VRAM across the TP group,
