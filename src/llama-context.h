@@ -129,6 +129,10 @@ struct llama_context {
     // buffer for MTP deferred prefill. Returns the buffer base (or nullptr).
     float * set_embeddings_pre_norm_accum(int32_t n_tokens_cap);
     float * get_embeddings_pre_norm_accum(); // synchronizes, then returns the accum base
+    // Cheap re-arm toggle for the MTP deferred-prefill accum: re-enables/disables the
+    // position-indexed extraction into the already-allocated buffer without reallocating
+    // or clearing it. No-op when the buffer was never allocated.
+    void set_embeddings_pre_norm_accum_active(bool active);
 
     // Enable (n_tokens_cap > 0) or disable (0) a pinned position-indexed accum for the
     // layer-input taps (DFlash/DSpark deferred prompt encode). One region per tap layer
@@ -360,6 +364,7 @@ private:
     // synchronize. This lets the MTP hook skip its per-prefill-chunk target sync and
     // build the draft KV in one pass after prefill. nullptr by default (no change).
     float * embd_pre_norm_accum      = nullptr; // base of buf_pre_norm_accum (pinned), or null
+    float * embd_pre_norm_accum_base = nullptr; // saved base, kept across active toggles
     size_t  embd_pre_norm_accum_size = 0;        // capacity in floats
     int64_t embd_pre_norm_accum_ub   = 0;        // ubatch counter for the ring-wrap drain
 
