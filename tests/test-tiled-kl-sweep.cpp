@@ -136,9 +136,10 @@ static int run_dump(const char * path, uint64_t seed) {
         fprintf(stderr, "FATAL: repack buffer type not found — tiled leg cannot engage the repack path\n");
         return 3;
     }
-    ggml_backend_buffer_type_t buft = (want_repack && repack_buft)
-        ? repack_buft : ggml_backend_get_default_buffer_type(backend);
-    printf("buffer type: %s\n", ggml_backend_buft_name(buft));
+    ggml_backend_buffer_type_t def_buft = ggml_backend_get_default_buffer_type(backend);
+    ggml_backend_buffer_type_t buft = (want_repack && repack_buft) ? repack_buft : def_buft;
+    printf("weight buft: %s | io buft: %s\n", ggml_backend_buft_name(buft), ggml_backend_buft_name(def_buft));
+    fflush(stdout);
 
     auto shapes = build_shapes();
     FILE * fp = fopen(path, "wb");
@@ -151,14 +152,20 @@ static int run_dump(const char * path, uint64_t seed) {
     for (const auto & sh : shapes) {
         // fresh ggml ctx per shape (tensors sized per shape)
         ggml_init_params ip = { 64u << 20, nullptr, /*.no_alloc=*/ true };
-        ggml_context_ptr ctx(ggml_init(ip));
+        // v4: weights live on the repack buft; activations/output on the default buft.
+        // The repack buffer is write-once by design (iface.get_tensor == nullptr and
+        // ggml_backend_tensor_get has NO null guard -> tail-call to 0x0, SIGSEGV).
+        // Production only ever allocates model weights there and never reads them
+        // back, so the v3 crash was harness misuse, not a kernel defect.
+        ggml_context_ptr ctx_w(ggml_init(ip));   // src0 only -> repack buft
+        ggml_context_ptr ctx (ggml_init(ip));    // src1/ids/dst + graph -> default buft
         ggml_cgraph * gf = ggml_new_graph(ctx.get());  // freed with ctx
 
         // --- tensors: weights + activations + ids, then one buffer alloc ---
         const int64_t rows = sh.N * sh.E;
         ggml_tensor * src0 = sh.moe
-            ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q4_0, sh.K, sh.N, sh.E)
-            : ggml_new_tensor_2d (ctx.get(), GGML_TYPE_Q4_0, sh.K, sh.N);
+            ? ggml_new_tensor_3d(ctx_w.get(), GGML_TYPE_Q4_0, sh.K, sh.N, sh.E)
+            : ggml_new_tensor_2d (ctx_w.get(), GGML_TYPE_Q4_0, sh.K, sh.N);
         ggml_tensor * src1 = sh.moe
             ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, sh.K, 1, sh.w)   // b is 3d for MUL_MAT_ID
             : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, sh.K, sh.w);
@@ -176,7 +183,9 @@ static int run_dump(const char * path, uint64_t seed) {
         ggml_build_forward_expand(gf, dst);
         const int64_t out_per_step = sh.N * sh.w;
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w.get(), buft);
+        GGML_ASSERT(buf_w);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), def_buft);
         GGML_ASSERT(buf);
 
         // --- weights: Q4_0, deterministic from seed+shape ---
@@ -226,6 +235,7 @@ static int run_dump(const char * path, uint64_t seed) {
         printf("dumped %-28s (%d steps x %lld cols x %lld)\n", sh.name, STEPS, (long long) sh.w, (long long) sh.N);
         fflush(stdout);
         ggml_backend_buffer_free(buf);
+        ggml_backend_buffer_free(buf_w);
         si++;
     }
     fclose(fp);
