@@ -1811,6 +1811,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // per-chunk synchronize, then build the draft KV in one pass after prefill. Removes
     // the MTP prefill PP regression caused by the per-prefill-chunk target sync.
     bool deferred_prefill = false;
+    // LLAMA_MTP_DEFERRED_REARM (default off): keep the deferred-prefill accum alive across
+    // requests and re-arm it at the start of each new prompt prefill. Without it, deferred
+    // prefill covers only the first request and every later prefill falls back to the
+    // per-chunk path (draft replay + target sync inside the measured prompt window).
+    bool deferred_rearm   = false;
     bool prefilling       = false;
     bool deferred_prefill_failed = false;
     float * prefill_accum_base = nullptr;      // pinned position-indexed [n_ctx][n_embd], owned by ctx_tgt
@@ -1934,6 +1939,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         deferred_prefill = n_seq == 1 && !is_mem_shared && !chain_heads;
         if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_PREFILL")) {
             deferred_prefill = deferred_prefill && (std::strcmp(env, "0") != 0);
+        }
+        if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_REARM")) {
+            deferred_rearm = deferred_prefill && (std::strcmp(env, "0") != 0);
         }
 
         if (deferred_prefill) {
@@ -2202,8 +2210,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         prefill_chunks.clear();
-        llama_set_embeddings_pre_norm_accum(ctx_tgt, 0); // disable and free the pinned buffer
-        prefill_accum_base = nullptr;
+        if (deferred_rearm && ok) {
+            // keep the pinned accum allocated for the next request; process() re-arms the
+            // routing at the start of the next prompt prefill without realloc/clear
+            llama_set_embeddings_pre_norm_accum_active(ctx_tgt, false);
+        } else {
+            llama_set_embeddings_pre_norm_accum(ctx_tgt, 0); // disable and free the pinned buffer
+            prefill_accum_base = nullptr;
+        }
         prefilling = false;
         return ok;
     }
@@ -2218,6 +2232,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t n_tokens = batch_in.size();
+
+        // LLAMA_MTP_DEFERRED_REARM: a new prompt prefill is starting (first ubatch of a
+        // fresh sequence at pos 0). The context already re-armed the accum routing during
+        // this ubatch's extraction (see llama-context.cpp); flip the local flag so the
+        // chunk is buffered and replayed deferred, like the first request. Without this,
+        // deferred prefill covers only the first request and every later prefill pays the
+        // per-chunk draft replay + target sync inside the measured prompt window (the
+        // MTP-on prefill tax).
+        if (deferred_prefill && deferred_rearm && !prefilling && !deferred_prefill_failed
+                && n_tokens > 1 && batch_in.tokens[0].pos[0] == 0) {
+            prefilling = true;
+        }
 
         // Deferred prefill: buffer the prompt chunk and let the target pre-norm hidden
         // accumulate in the position-indexed accum buffer (set on ctx_tgt). The draft

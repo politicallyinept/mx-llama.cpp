@@ -1412,6 +1412,7 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
     if (n_tokens_cap <= 0) {
         buf_pre_norm_accum.reset();
         embd_pre_norm_accum      = nullptr;
+        embd_pre_norm_accum_base = nullptr;
         embd_pre_norm_accum_size = 0;
         return nullptr;
     }
@@ -1434,6 +1435,7 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
         LLAMA_LOG_ERROR("%s: failed to allocate pre-norm accum buffer of size %.2f MiB\n",
                 __func__, nbytes / (1024.0 * 1024.0));
         embd_pre_norm_accum      = nullptr;
+        embd_pre_norm_accum_base = nullptr;
         embd_pre_norm_accum_size = 0;
         return nullptr;
     }
@@ -1444,9 +1446,18 @@ float * llama_context::set_embeddings_pre_norm_accum(int32_t n_tokens_cap) {
     ggml_backend_buffer_clear(buf_pre_norm_accum.get(), 0);
 
     embd_pre_norm_accum      = (float *) ggml_backend_buffer_get_base(buf_pre_norm_accum.get());
+    embd_pre_norm_accum_base = embd_pre_norm_accum;
     embd_pre_norm_accum_size = nfloats;
     embd_pre_norm_accum_ub   = 0;
     return embd_pre_norm_accum;
+}
+
+void llama_context::set_embeddings_pre_norm_accum_active(bool active) {
+    if (buf_pre_norm_accum == nullptr) {
+        return; // never allocated, nothing to toggle
+    }
+    embd_pre_norm_accum = active ? embd_pre_norm_accum_base : nullptr;
+    embd_pre_norm_accum_ub = 0;
 }
 
 float * llama_context::get_embeddings_pre_norm_accum() {
@@ -2524,6 +2535,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd = hparams.n_embd_out();
+
+                // MTP deferred prefill re-arm: the spec hook released the accum after the
+                // previous request (kept allocated, routing inactive). A fresh prompt prefill
+                // (multi-token ubatch starting at pos 0, unmasked) re-arms routing here so
+                // even the first ubatch's hidden lands in the accum. Only reachable when the
+                // re-arm path kept the buffer allocated; a freed buffer has no base.
+                if (!embd_pre_norm_accum && embd_pre_norm_accum_base && !masked && ubatch.pos
+                        && ubatch.n_tokens > 1 && ubatch.pos[0] == 0) {
+                    embd_pre_norm_accum    = embd_pre_norm_accum_base;
+                    embd_pre_norm_accum_ub = 0;
+                }
 
                 // MTP deferred prefill: when an accum buffer is set (unmasked target during
                 // prompt prefill), extract straight into the position-indexed accum buffer
@@ -5100,6 +5122,10 @@ float * llama_set_embeddings_pre_norm_accum(llama_context * ctx, int32_t n_token
 
 float * llama_get_embeddings_pre_norm_accum(llama_context * ctx) {
     return ctx->get_embeddings_pre_norm_accum();
+}
+
+void llama_set_embeddings_pre_norm_accum_active(llama_context * ctx, bool active) {
+    ctx->set_embeddings_pre_norm_accum_active(active);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
