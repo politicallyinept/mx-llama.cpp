@@ -637,12 +637,16 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     // of the K/V store - Q norm, gated attention, wo, and the full MoE FFN - is skipped.
     // K/V values and their store order are identical to the full path, so draft KV is
     // bit-identical; only the wasted compute disappears.
-    // Doctrine gate: LLAMA_MTP_MOE_KV_ONLY=1 opts into the MoE store-only replay graph;
-    // default off keeps the full-graph replay (pre-fix behavior) byte-for-byte.
+    // Doctrine gate: LLAMA_MTP_MOE_KV_ONLY default ON (unset or non-zero = enabled;
+    // =0 is the escape hatch back to the full-graph replay, pre-fix behavior).
+    // Sealed 2026-11-05: UD pp 2502.1 -> 2788.7 (+11.5%), greedy sha byte-identical
+    // e3037f48; Q4_0 pp 2397.3 -> 2816.0 (+17.5%), tg 105.1 -> 121.8 (+15.9%), greedy
+    // sha byte-identical 997b0ec8, accept bit-stable 0.5906; replay 235ms (UD) / ~347ms
+    // (Q4_0) -> 42-65ms. Reports: /root/p2-prefill/report.md, /root/p2-prefill/report-q40.md.
     bool mtp_kv_only_ok = cparams.mtp_prefill_kv_only;
     if (mtp_kv_only_ok) {
         const char * kv_env = std::getenv("LLAMA_MTP_MOE_KV_ONLY");
-        mtp_kv_only_ok = kv_env != nullptr && std::strcmp(kv_env, "0") != 0;
+        mtp_kv_only_ok = !kv_env || std::atoi(kv_env) != 0;
     }
     if (mtp_kv_only_ok) {
         auto [Qcur_full_kv, Kcur_kv, Vcur_kv] = build_qkv(layer, cur,
