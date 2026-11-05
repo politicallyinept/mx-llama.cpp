@@ -73,6 +73,8 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_GCN_KQ_MV` | ON (`=0` off) | GCN q4_K/q5_K/q6_K/iq4_xs mat-vec for 1-4 token decode | CV port (default flipped ON after KLD/PPL audit) |
 | `GGML_CUDA_CONCAT_SMALL` | OFF (`=1` on) | flat-grid short-row concat kernel | CV port |
 | `GGML_CUDA_ASYNC_CKPT` | ON (`=0` off) | async recurrent-state checkpoint capture in the server (sync deferred to next synchronize) | fork server work (staging robustness under further investigation) |
+| `GGML_CUDA_GDN_CONV_SCATTER` | ON (`=0` off) | GDN conv-state ring written by direct kernel-side scatter instead of a gather+copy | mtp-pipe (default ON) |
+| `LLAMA_MTP_FAST_SAMPLE` | ON (`=0` off) | MTP draft skips backend top-k chain construction and samples directly | mtp-pipe (default ON) |
 
 ## What this is
 
@@ -333,27 +335,6 @@ tg128 within noise on dense models (stock-path ksplit measured +1-4% at model le
 throughput dominates and PPL tolerance is >=2%. **Who should not**: MTP/speculative-decode
 workloads (use stock + MTP; measured best), MoE-heavy decode workloads (gains are ~?),
 or deployments where the narrow-width cliff matters.
-
-## Attribution / Provenance
-
-- **Base project:** this tree is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-  (ggml-org).
-- **Lineage:** this branch descends from the mx performance fork
-  ([mxxm-t/mx-llama.cpp](https://github.com/mxxm-t/mx-llama.cpp), itself a fork of
-  ggml-org/llama.cpp); the fork's own records reference that lineage (`docs/BENCH.md`
-  cites "mxxm-t master" as the upstream base).
-- **CV fork (external source):** part of the kernel work on this branch derives from
-  Castagna Veloce, an external llama.cpp fork by benpeterson40
-  ([benpeterson40/castagna-veloce](https://github.com/benpeterson40/castagna-veloce)).
-  Ported kernels are marked in the source comments (`CV (castagna-veloce) port`, pinned
-  to CV commit `3483d46`) — see e.g. `ggml/src/ggml-cuda/gated_delta_net.cu`,
-  `rope.cu`, `concat.cu`, `she-fuse.cu`.
-- **In-house additions on this branch (mtp-pipe / coaltp2 lineage):** MTP pipeline gates
-  (conv-scatter + fast-sample, env-gated), the token-graph inner-replay restore fix
-  (`GGML_META_TG_INNER_ON_FAIL`, per-subgraph graph replay restored on token-graph
-  failure), the coal-under-TP2 cgraph batch-type propagation (SPEC_VERIFY hint to
-  per-lane subgraphs), GDN concat/ring work, and the coal fusion bundle (env-gated OFF
-  in production defaults per the 2026-11-03 adoption benchmark).
 
 ## Provenance
 
