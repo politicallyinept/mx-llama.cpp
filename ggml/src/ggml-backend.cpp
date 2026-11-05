@@ -1712,20 +1712,34 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 mix((uint64_t) graph->leafs[i]->ne[d]);
                 mix((uint64_t) graph->leafs[i]->nb[d]);
             }
-            uint64_t op0, op1;
-            memcpy(&op0, graph->leafs[i]->op_params, sizeof(op0));
-            memcpy(&op1, graph->leafs[i]->op_params + 8, sizeof(op1));
-            mix(op0); mix(op1);
+            // Full op_params, not just the first 16 bytes: a captured kernel
+            // bakes every byte it reads, and ops such as MUL_MAT_ID / SET_ROWS
+            // / SOFT_MAX carry operands past offset 16.
+            for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+                uint64_t op;
+                memcpy(&op, graph->leafs[i]->op_params + o * sizeof(uint64_t), sizeof(op));
+                mix(op);
+            }
+            // src[] wiring: two graphs with identical tensors in a different
+            // order feed different inputs to the same kernels. Struct pointers
+            // alone do not distinguish them, so pin the edge set too.
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                mix((uint64_t) (uintptr_t) graph->leafs[i]->src[s]);
+            }
         }
         for (int i = 0; i < graph->n_nodes; i++) {
             for (int d = 0; d < GGML_MAX_DIMS; d++) {
                 mix((uint64_t) graph->nodes[i]->ne[d]);
                 mix((uint64_t) graph->nodes[i]->nb[d]);
             }
-            uint64_t op0, op1;
-            memcpy(&op0, graph->nodes[i]->op_params, sizeof(op0));
-            memcpy(&op1, graph->nodes[i]->op_params + 8, sizeof(op1));
-            mix(op0); mix(op1);
+            for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+                uint64_t op;
+                memcpy(&op, graph->nodes[i]->op_params + o * sizeof(uint64_t), sizeof(op));
+                mix(op);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                mix((uint64_t) (uintptr_t) graph->nodes[i]->src[s]);
+            }
         }
         whole_h = h;
         graph->uid = 0;
