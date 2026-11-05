@@ -501,6 +501,13 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
+    if (buf->iface.get_tensor == NULL) {
+        // Backends that never expose reads (e.g. the gfx906 repack buffer:
+        // weights are write-once and a plain read would misread the two-plane
+        // layout as canonical) must fail cleanly here, not via a NULL call.
+        GGML_ABORT("ggml_backend_tensor_get: buffer interface does not support get_tensor (tensor type %s on buffer %s)",
+                   ggml_op_name(tensor->op), ggml_backend_buffer_name(buf));
+    }
     buf->iface.get_tensor(buf, tensor, data, offset, size);
 }
 
