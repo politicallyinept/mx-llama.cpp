@@ -111,6 +111,35 @@ static int run_dump(const char * path, uint64_t seed) {
     }
     printf("backend: %s\n", ggml_backend_name(backend));
 
+    // The repack path lives on a dedicated extra buffer type (selected by the model loader in
+    // production). The plain default buft never repacks, so the tiled leg MUST allocate there.
+    ggml_backend_buffer_type_t repack_buft = nullptr;
+    {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        for (int i = 0; repack_buft == nullptr && i < (int) ggml_backend_reg_count(); i++) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto f = (ggml_backend_dev_get_extra_bufts_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_dev_get_extra_bufts");
+            if (!f || !dev) {
+                continue;
+            }
+            // the CUDA/HIP device exposes exactly one extra buft: the repack one
+            ggml_backend_buffer_type_t * pb = f(dev);
+            if (*pb != nullptr) {
+                repack_buft = *pb;
+                printf("extra buft: %s\n", ggml_backend_buft_name(*pb));
+            }
+        }
+    }
+    const bool want_repack = getenv("GGML_CUDA_REPACK_Q4_0") != nullptr;
+    if (want_repack && repack_buft == nullptr) {
+        fprintf(stderr, "FATAL: repack buffer type not found — tiled leg cannot engage the repack path\n");
+        return 3;
+    }
+    ggml_backend_buffer_type_t buft = (want_repack && repack_buft)
+        ? repack_buft : ggml_backend_get_default_buffer_type(backend);
+    printf("buffer type: %s\n", ggml_backend_buft_name(buft));
+
     auto shapes = build_shapes();
     FILE * fp = fopen(path, "wb");
     if (!fp) { fprintf(stderr, "cannot open %s\n", path); return 1; }
@@ -121,7 +150,7 @@ static int run_dump(const char * path, uint64_t seed) {
     int si = 0;
     for (const auto & sh : shapes) {
         // fresh ggml ctx per shape (tensors sized per shape)
-        ggml_init_params ip = { 64u << 20, nullptr, false };
+        ggml_init_params ip = { 64u << 20, nullptr, /*.no_alloc=*/ true };
         ggml_context_ptr ctx(ggml_init(ip));
         ggml_cgraph * gf = ggml_new_graph(ctx.get());  // freed with ctx
 
@@ -130,7 +159,9 @@ static int run_dump(const char * path, uint64_t seed) {
         ggml_tensor * src0 = sh.moe
             ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_Q4_0, sh.K, sh.N, sh.E)
             : ggml_new_tensor_2d (ctx.get(), GGML_TYPE_Q4_0, sh.K, sh.N);
-        ggml_tensor * src1 = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, sh.K, sh.w);
+        ggml_tensor * src1 = sh.moe
+            ? ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, sh.K, 1, sh.w)   // b is 3d for MUL_MAT_ID
+            : ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, sh.K, sh.w);
         ggml_tensor * ids  = nullptr;
         std::vector<int32_t> ids_host(sh.w);
         if (sh.moe) {
@@ -145,7 +176,7 @@ static int run_dump(const char * path, uint64_t seed) {
         ggml_build_forward_expand(gf, dst);
         const int64_t out_per_step = sh.N * sh.w;
 
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx.get(), backend);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
         GGML_ASSERT(buf);
 
         // --- weights: Q4_0, deterministic from seed+shape ---
