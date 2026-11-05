@@ -2524,6 +2524,19 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     if (narrow_shexp) {
         buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
     }
+    // c2c3 C3: MoE expert tensors can stay canonical (skip the repack buffer) so the
+    // CV-ported mul_mat_vec_q_moe row-lane kernels serve verify-width expert matvecs;
+    // the repacked_id1 path loses to them at decode widths. Env gate
+    // GGML_CUDA_MOE_CANONICAL, default OFF (=1 enables).
+    static const bool s_moe_canonical = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CANONICAL");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (s_moe_canonical && layer_dev != nullptr &&
+            (tn.tensor == LLM_TENSOR_FFN_GATE_EXPS || tn.tensor == LLM_TENSOR_FFN_UP_EXPS ||
+             tn.tensor == LLM_TENSOR_FFN_DOWN_EXPS)) {
+        buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+    }
     // The gather table is an input-class tensor, so it normally lands on the CPU and
     // is read lazily. Sharding it means putting it back in VRAM across the TP group,
     // which also means dropping the lazy flag - there is no file mapping to page from
