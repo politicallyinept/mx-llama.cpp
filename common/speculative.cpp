@@ -1816,6 +1816,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // prefill covers only the first request and every later prefill falls back to the
     // per-chunk path (draft replay + target sync inside the measured prompt window).
     bool deferred_rearm   = false;
+    // LLAMA_MTP_SPEC_TIMING (default off): log per-path prefill draft-replay timings for diagnosis
+    bool spec_timing      = false;
     bool prefilling       = false;
     bool deferred_prefill_failed = false;
     float * prefill_accum_base = nullptr;      // pinned position-indexed [n_ctx][n_embd], owned by ctx_tgt
@@ -1942,6 +1944,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         if (const char * env = std::getenv("LLAMA_MTP_DEFERRED_REARM")) {
             deferred_rearm = deferred_prefill && (std::strcmp(env, "0") != 0);
+        }
+        if (const char * env = std::getenv("LLAMA_MTP_SPEC_TIMING")) {
+            spec_timing = std::strcmp(env, "0") != 0;
         }
 
         if (deferred_prefill) {
@@ -2143,9 +2148,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool finish_deferred_prefill() {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+        const int64_t t_f0 = ggml_time_us();
 
         // one synchronize drains the accumulated async pre-norm copies and returns the base
         const float * base = llama_get_embeddings_pre_norm_accum(ctx_tgt);
+        const int64_t t_f1 = ggml_time_us();
 
         // Phase 2b: the replay only needs the head's prompt K/V stored (its attention/FFN/logits
         // output is discarded - verify_h/pending_h come from the trunk hidden). Arm KV-only on the
@@ -2208,6 +2215,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (kv_only) {
             llama_set_mtp_prefill_kv_only(ctx_dft, false);
         }
+        if (spec_timing) {
+            SPC_INF("%s: accum-drain %.1f ms, draft replay %.1f ms (%zu chunks, kv_only=%d)\n",
+                    __func__, (t_f1 - t_f0) / 1000.0, (ggml_time_us() - t_f1) / 1000.0,
+                    prefill_chunks.size(), (int) kv_only);
+        }
 
         prefill_chunks.clear();
         if (deferred_rearm && ok) {
@@ -2243,6 +2255,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (deferred_prefill && deferred_rearm && !prefilling && !deferred_prefill_failed
                 && n_tokens > 1 && batch_in.tokens[0].pos[0] == 0) {
             prefilling = true;
+            if (spec_timing) {
+                SPC_INF("%s: deferred prefill re-armed for new prompt (n_tokens=%d)\n", __func__, n_tokens);
+            }
         }
 
         // Deferred prefill: buffer the prompt chunk and let the target pre-norm hidden
@@ -2273,7 +2288,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        return process_decode(batch_in, nullptr);
+        if (!spec_timing || n_tokens <= 1) {
+            return process_decode(batch_in, nullptr);
+        }
+        const int64_t t_pc0 = ggml_time_us();
+        const bool rc_pc = process_decode(batch_in, nullptr);
+        SPC_INF("%s: per-chunk prefill draft replay %.1f ms (n_tokens=%d)\n",
+                __func__, (ggml_time_us() - t_pc0) / 1000.0, n_tokens);
+        return rc_pc;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {

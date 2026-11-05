@@ -630,6 +630,40 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
     cb(cur, "mtp_attn_norm", il);
 
+    // Phase 2b (MoE): KV-only prefill replay, mirroring qwen35.cpp. The deferred-prefill
+    // replay only needs the head's prompt K/V stored - the attention/FFN outputs of the
+    // replay are discarded (process_decode reads the trunk hidden, batch logits all 0).
+    // The fused wqkv GEMM must still run (it produces K and V), but everything downstream
+    // of the K/V store - Q norm, gated attention, wo, and the full MoE FFN - is skipped.
+    // K/V values and their store order are identical to the full path, so draft KV is
+    // bit-identical; only the wasted compute disappears.
+    if (cparams.mtp_prefill_kv_only) {
+        auto [Qcur_full_kv, Kcur_kv, Vcur_kv] = build_qkv(layer, cur,
+                n_embd_head * 2, n_head,
+                n_embd_head,     n_head_kv,
+                n_embd_head,     n_head_kv,
+                il, false);
+        (void) Qcur_full_kv;
+
+        ggml_tensor * Kc = ggml_reshape_3d(ctx0, Kcur_kv, n_embd_head, n_head_kv, n_tokens);
+        Kc = build_norm(Kc, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kc, "mtp_kv_only_K", il);
+
+        ggml_tensor * Vc = ggml_reshape_3d(ctx0, Vcur_kv, n_embd_head, n_head_kv, n_tokens);
+        cb(Vc, "mtp_kv_only_V", il);
+
+        Kc = ggml_rope_multi(ctx0, Kc, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+
+        build_attn_store_kv(inp_attn, Kc, Vc, il);
+
+        // Minimal valid result: cheap non-null nextn slot (never consumed during the replay).
+        res->t_h_nextn = inpSA;
+        ggml_build_forward_expand(gf, inpSA);
+        return;
+    }
+
     auto [Qcur_full, Kcur, Vcur] = build_qkv(layer, cur,
             n_embd_head * 2, n_head,
             n_embd_head,     n_head_kv,
