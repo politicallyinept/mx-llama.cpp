@@ -637,7 +637,14 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     // of the K/V store - Q norm, gated attention, wo, and the full MoE FFN - is skipped.
     // K/V values and their store order are identical to the full path, so draft KV is
     // bit-identical; only the wasted compute disappears.
-    if (cparams.mtp_prefill_kv_only) {
+    // Doctrine gate: LLAMA_MTP_MOE_KV_ONLY=1 opts into the MoE store-only replay graph;
+    // default off keeps the full-graph replay (pre-fix behavior) byte-for-byte.
+    bool mtp_kv_only_ok = cparams.mtp_prefill_kv_only;
+    if (mtp_kv_only_ok) {
+        const char * kv_env = std::getenv("LLAMA_MTP_MOE_KV_ONLY");
+        mtp_kv_only_ok = kv_env != nullptr && std::strcmp(kv_env, "0") != 0;
+    }
+    if (mtp_kv_only_ok) {
         auto [Qcur_full_kv, Kcur_kv, Vcur_kv] = build_qkv(layer, cur,
                 n_embd_head * 2, n_head,
                 n_embd_head,     n_head_kv,
