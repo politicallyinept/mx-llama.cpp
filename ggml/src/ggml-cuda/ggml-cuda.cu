@@ -4166,11 +4166,12 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
 }
 
 // dflash width-8 staging fusion (fix #5): admits the width-8 GDN ring staging chains into the
-// direct-scatter paths (conv-state gate relaxation + standalone state scatter). Default OFF;
-// when ON it still only engages graphs stamped GGML_CGRAPH_FLAG_SPEC_VERIFY (true verify batches),
-// so prefill and plain-decode graphs keep their existing paths untouched.
+// direct-scatter paths (conv-state gate relaxation + standalone state scatter). Default ON
+// (perf flag: byte-identical output, measured verify-width win); GGML_CUDA_DFLASH_STAGE_FUSE=0
+// is the kill switch. Even when ON it only engages graphs stamped GGML_CGRAPH_FLAG_SPEC_VERIFY
+// (true verify batches), so prefill and plain-decode graphs keep their existing paths untouched.
 static bool ggml_cuda_dflash_stage_fuse_enabled() {
-    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_DFLASH_STAGE_FUSE"); return e && atoi(e) != 0; }();
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_DFLASH_STAGE_FUSE"); return e == nullptr || atoi(e) != 0; }();
     return enabled;
 }
 
