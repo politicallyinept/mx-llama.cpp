@@ -590,6 +590,32 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const uint32_t xs, const uint32_t ys, cudaStream_t stream) {
+    // E4 stage 3 (2026-11-07, RESTYLE8-NC): under the RESTYLE gate the Q8_0
+    // narrow-batch window (MTP speculative verify, widths 2..8) runs
+    // mul_mat_vec_q8_0_repacked8_nc: stock 4-terms-per-32-block accumulation
+    // (2 dp4a per 8-value chunk) with the stock (block,quarter) partition and
+    // shared/shfl reduce, one row per block and the whole batch width as the
+    // column tile (NCOLS = ne11). Bit-identical to the single-token
+    // repacked8 MMV. Gate off = the shipped <2,1,N,2,64> shape below.
+    if constexpr (WT == GGML_TYPE_Q8_0 && !U4ACT && !U4P8 && !U4Q41) {
+        if (rp_q8_0_restyle_on()) {
+            const dim3 grid((unsigned) ne01, 1, 1);
+#define RP_R8NC_LAUNCH(NC) mul_mat_vec_q8_0_repacked8_nc<2, NC> \
+    <<<grid, dim3(64, 2), 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys)
+            switch (ne11) {
+                case 2: RP_R8NC_LAUNCH(2); break;
+                case 3: RP_R8NC_LAUNCH(3); break;
+                case 4: RP_R8NC_LAUNCH(4); break;
+                case 5: RP_R8NC_LAUNCH(5); break;
+                case 6: RP_R8NC_LAUNCH(6); break;
+                case 7: RP_R8NC_LAUNCH(7); break;
+                case 8: RP_R8NC_LAUNCH(8); break;
+                default: GGML_ABORT("nc mat-vec: unsupported batch width");
+            }
+#undef RP_R8NC_LAUNCH
+            return;
+        }
+    }
     // Geometry per width, measured on Qwen3.8-27B (pp512 at that ubatch, 4x
     // MI50 -sm tensor). The row count per lane is small once the tensor is
     // split, so scheduling granularity beats per-group reuse and 64-thread

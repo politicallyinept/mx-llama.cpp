@@ -645,6 +645,95 @@ static __global__ void __launch_bounds__(NWARPS*64, 1) mul_mat_vec_q8_0_repacked
 #endif
 }
 
+// E4/RESTYLE8-NC (stage 3, 2026-11-07, GGML_CUDA_REPACK_Q8_0_RESTYLE): stock
+// accumulation granularity for the narrow-batch (2..8 token, MTP speculative
+// verify) window. The shipped nc mat-vec accumulates one fp32 term per
+// 32-value block (two 4-dp4a int chains added in integer space,
+// dw*dx*(ilo+ihi)); stock mmvq uses four scaled fp32 terms per block, one
+// per 8-value chunk (two dp4a each, VDR_Q8_0_Q8_1_MMVQ=2). This kernel is
+// mul_mat_vec_q8_0_repacked8 generalized to NCOLS token columns per block:
+// identical (block, quarter) partition (kbx = tid/(qi/vdr), kqs = vdr*(qi%)),
+// identical 64-lane x NWARPS=2 launch and shared-partial + 64-lane shfl
+// reduce. The weight chunk (2 ints) and the fp16 scale are loaded once per
+// kbx iteration and shared across the column tile, so the weight traffic
+// stays one row pass per launch. Each column's accumulation is bit-identical
+// to repacked8 and to the canonical mul_mat_vec_q<Q8_0>: the decode leg
+// (MTP verify widths 2..8) now matches the single-token MMV bit-for-bit,
+// closing the residual RESTYLE8 divergence.
+template <int NWARPS, int NCOLS>
+static __global__ void __launch_bounds__(NWARPS*64, 1) mul_mat_vec_q8_0_repacked8_nc(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint32_t xs, const uint32_t ys) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    constexpr int warp_size = 64;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int qi  = QI8_0;
+    constexpr int blocks_per_iter = vdr * NWARPS * warp_size / qi;
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t row      = blockIdx.x;
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t qs_str   = repack_qs_stride(ne0);
+
+    const int * const w_row = reinterpret_cast<const int *>(wbase + (size_t) row * qs_str);
+    const uint16_t * const d_row = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * qs_str) + (size_t) row * n_blocks;
+
+    float acc[NCOLS] = {};
+
+    for (int kbx = tid / (qi/vdr); kbx < (int) n_blocks; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi/vdr));
+        const int * const wv = w_row + 8*kbx;
+        const uint16_t db = d_row[kbx];
+        const float dw = __half2float(*reinterpret_cast<const __half *>(&db));
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            const block_q8_1 * const xb = xq + (size_t) c * xs + kbx;
+            const int * const xv = reinterpret_cast<const int *>(xb->qs);
+            const float dx = __low2float(xb->ds);
+            int sumi = ggml_cuda_dp4a(wv[kqs], xv[kqs], 0);
+            sumi = ggml_cuda_dp4a(wv[kqs+1], xv[kqs+1], sumi);
+            acc[c] += dw * dx * (float) sumi;
+        }
+    }
+
+    // Stock reduce: warps y>0 stage their partial in shared memory, warp 0
+    // adds them in warp order, then the 64-lane shfl tree (mmvq.cu:793-807).
+    __shared__ float tmp_shared[NWARPS-1 > 0 ? NWARPS-1 : 1][NCOLS][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            tmp_shared[threadIdx.y-1][c][threadIdx.x] = acc[c];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int l = 0; l < NWARPS-1; ++l) {
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            acc[c] += tmp_shared[l][c][threadIdx.x];
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NCOLS; ++c) {
+        acc[c] = warp_reduce_sum<warp_size>(acc[c]);
+    }
+    if (threadIdx.x == 0 && row < ne1) {
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            y[(size_t) c * ys + row] = acc[c];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Generic repacked mat-vec: any type with 32-value sub-blocks, fetched through
 // rp_traits<WT>::load_w. Simple LANES-strided sub-block loop: both production
 // instantiations of the Q8_0 mat-vec run WPR == 1 (dense <16,16,false,64>, MoE
