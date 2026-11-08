@@ -585,8 +585,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                        __func__, tp_width_eff);
     }
 
+    // MQA under tensor-parallel: when the TP group has more lanes than KV heads, the KV
+    // cache cannot be head-split. The split degenerates to one lane owning the whole cache
+    // and the others owning none, and the K/V value chain then desyncs from the cache leaf:
+    // the SET_ROWS split-state match aborts on the first decode (gemma4 12B, n_head_kv=1,
+    // ggml_backend_meta_get_split_state handle_set_rows). Mirror the attention (design A)
+    // like the MLA archs above; the FFN and the output head still split.
+    uint32_t n_head_kv_min = hparams.n_head_kv();
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        n_head_kv_min = std::min(n_head_kv_min, hparams.n_head_kv(il));
+    }
+    const bool mqa_cannot_head_split = tp_width_eff > 1 &&
+                                       n_head_kv_min > 0 &&
+                                       n_head_kv_min < (uint32_t) tp_width_eff;
+    if (mqa_cannot_head_split) {
+        LLAMA_LOG_WARN("%s: %u KV heads cannot be split across %zu TP lanes, replicating attention\n",
+                       __func__, n_head_kv_min, tp_width_eff);
+    }
+
     const bool replicate_attention = llm_arch_sm_tensor_replicates_attention(ud->model->arch) ||
-                                     dflash_dsv4_split;
+                                     dflash_dsv4_split || mqa_cannot_head_split;
 
     // Head-split the MLA attention instead of replicating it, so each device computes
     // n_head/n_devices heads rather than all of them. The KV latent is a single head (head_count_kv == 1) and stays MIRRORED
