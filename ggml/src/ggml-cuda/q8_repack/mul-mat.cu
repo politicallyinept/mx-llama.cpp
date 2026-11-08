@@ -22,6 +22,31 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint32_t xs, const uint32_t ys, cudaStream_t stream);
 
 
+// E4/Q8_0 restyle gate (2026-11-06, RESTYLE8 rev): GGML_CUDA_REPACK_Q8_0_RESTYLE=1
+// selects the stock-granularity accumulation on the repacked two-plane layout:
+//  * decode MMV: mul_mat_vec_q8_0_repacked8 (NEW) - 4 scaled fp32 terms per
+//    32-value block (2 dp4a per 8-value chunk, VDR_Q8_0_Q8_1_MMVQ=2) with the
+//    stock mmvq (block,quarter) partition (kbx=tid/4, kqs=2*(tid%4)), 64-lane
+//    x 2-wave launch and the shared-partial + 64-lane shfl reduce tree. This
+//    replaces the 409412b97d single-term-per-block form (which was the third
+//    quantization between stock's 4 terms and the old repack's 2, and its
+//    8-dp4a serial chain cost 12.4% decode).
+//  * prefill GEMM: mmq_gemm_repacked<..., RESTYLE=true> - the Q8_0 dot chains
+//    its 8 dp4a in stock int order 0..7 (mmq-vec-dot.cuh:137-148) instead of
+//    the shipped lo/hi interleave.
+// Default OFF: today's per-half-block MMV terms + interleaved GEMM dot.
+static bool rp_q8_0_restyle_on(void) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q8_0_RESTYLE");
+        const bool r = e != nullptr && atoi(e) != 0;
+        if (r) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_RESTYLE gate ACTIVE: repacked Q8_0 MMV uses one fp32 term per 32-value block\n");
+        }
+        return r;
+    }();
+    return on;
+}
+
 // GGML_CUDA_NO_GEMM_CHUNK=1: do not seed or persist the workspace-pressure
 // column cap; a prefill GEMM stays a single launch whenever the full-width
 // workspace fits. The halving loop remains as OOM safety and logs every
@@ -749,10 +774,16 @@ static void ggml_cuda_mul_mat_repacked_slice(ggml_backend_cuda_context & ctx,
                         nullptr, 1, 0, 0, 0);
                     break;
                 }
-                mul_mat_vec_q8_0_repacked<16, 16, false><<<grid, 1024, 0, stream>>>(
-                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                    nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
-                    nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                if (rp_q8_0_restyle_on()) {
+                    mul_mat_vec_q8_0_repacked8<2, false><<<dim3((unsigned) ne01), dim3(64, 2), 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                } else {
+                    mul_mat_vec_q8_0_repacked<16, 16, false><<<grid, 1024, 0, stream>>>(
+                        w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                        nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                        nullptr, nullptr, nullptr, GGML_GLU_OP_REGLU);
+                }
             } break;
             case GGML_TYPE_MXFP4: {
                 const dim3 grid((ne01 + 15) / 16, 1, 1);
@@ -1161,10 +1192,16 @@ void ggml_cuda_mul_mat_vec_repacked_fused(ggml_backend_cuda_context & ctx,
                 nullptr, 1, 0, 0, 0,
                 w_gate, x_bias_s, gate_bias_s, glu_op);
         } else {
-            mul_mat_vec_q8_0_repacked<16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
-                w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
-                nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
-                w_gate, x_bias_s, gate_bias_s, glu_op);
+            if (rp_q8_0_restyle_on()) {
+                mul_mat_vec_q8_0_repacked8<2, true><<<dim3((unsigned) ne01), dim3(64, 2), 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    w_gate, x_bias_s, gate_bias_s, glu_op);
+            } else {
+                mul_mat_vec_q8_0_repacked<16, 16, false, 64, true><<<grid, 1024, 0, stream>>>(
+                    w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    nullptr, nullptr, nullptr, 0, 1, 0, 0, 0,
+                    w_gate, x_bias_s, gate_bias_s, glu_op);
+            }
         }
     }
     }

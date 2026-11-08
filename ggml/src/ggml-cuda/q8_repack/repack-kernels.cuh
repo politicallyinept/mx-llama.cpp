@@ -178,7 +178,8 @@ static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
 #endif
 }
 
-template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false>
+template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false,
+          bool RESTYLE = false>
 static __global__ void mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -256,7 +257,52 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     float acc = 0.0f;
     [[maybe_unused]] float acc_gate = 0.0f;
 
-    if constexpr (LANES < 64) {
+    if constexpr (RESTYLE) {
+        // E4/Q8_0 restyle (2026-11-06, GGML_CUDA_REPACK_Q8_0_RESTYLE): one
+        // fp32 term per 32-value block, matching stock vec_dot_q8_0_q8_1's
+        // single d8_0*d8_1 scaling per block. The repacked qs plane stores
+        // each block as two contiguous 16-byte halves (repack_q8_0_kernel,
+        // buffer.cu:127-148), so a full block is w_row[2*sb] + w_row[2*sb+1]
+        // with scale d_row[sb]; the x side is the same q8_1 block (8 ints).
+        // The default path splits the block into two 16-value half-block
+        // terms; this branch runs 8 chained dp4a over the whole block.
+        const uint32_t sb_lo = (n_blocks * k_slice) / WPR;
+        const uint32_t sb_hi = (n_blocks * (k_slice + 1)) / WPR;
+        for (uint32_t sb = sb_lo + (uint32_t) lane; sb < sb_hi; sb += LANES) {
+            const uint4 * const wv = w_row + 2 * sb;
+            const int * const xv = reinterpret_cast<const int *>(xq[sb].qs);
+            const float dx = __low2float(xq[sb].ds);
+            const uint16_t db = d_row[sb] & rmask;
+            const float dw = __half2float(*reinterpret_cast<const __half *>(&db));
+            int idot = 0;
+            idot = ggml_cuda_dp4a((int) wv[0].x, xv[0], idot);
+            idot = ggml_cuda_dp4a((int) wv[0].y, xv[1], idot);
+            idot = ggml_cuda_dp4a((int) wv[0].z, xv[2], idot);
+            idot = ggml_cuda_dp4a((int) wv[0].w, xv[3], idot);
+            idot = ggml_cuda_dp4a((int) wv[1].x, xv[4], idot);
+            idot = ggml_cuda_dp4a((int) wv[1].y, xv[5], idot);
+            idot = ggml_cuda_dp4a((int) wv[1].z, xv[6], idot);
+            idot = ggml_cuda_dp4a((int) wv[1].w, xv[7], idot);
+            acc += dw * dx * (float) idot;
+            if constexpr (HAS_FUSION) {
+                if (use_gate) {
+                    const uint4 * const wgv = w_row_gate + 2 * sb;
+                    const uint16_t dgb = d_row_gate[sb] & rmask;
+                    const float dwg = __half2float(*reinterpret_cast<const __half *>(&dgb));
+                    int gdot = 0;
+                    gdot = ggml_cuda_dp4a((int) wgv[0].x, xv[0], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[0].y, xv[1], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[0].z, xv[2], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[0].w, xv[3], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[1].x, xv[4], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[1].y, xv[5], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[1].z, xv[6], gdot);
+                    gdot = ggml_cuda_dp4a((int) wgv[1].w, xv[7], gdot);
+                    acc_gate += dwg * dx * (float) gdot;
+                }
+            }
+        }
+    } else if constexpr (LANES < 64) {
         const uint32_t n_half = n_blocks * 2;
         const uint32_t hb_lo  = (n_half * k_slice) / WPR;
         const uint32_t hb_hi  = (n_half * (k_slice + 1)) / WPR;
@@ -481,6 +527,120 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     }
 #else
     GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, ids_src1, ids_dst, expert_bounds, n_expert, nchannels_y, expert_stride, xs_id, dst_s1, wbase_gate, x_bias, gate_bias, glu_op);
+    NO_DEVICE_CODE;
+#endif
+}
+
+
+// E4/RESTYLE8 (2026-11-06, GGML_CUDA_REPACK_Q8_0_RESTYLE): stock-geometry
+// mat-vec on the repacked two-plane layout. Reproduces mul_mat_vec_q<Q8_0>
+// bit-for-bit:
+//  * 4 scaled fp32 terms per 32-value block, one per 8-value chunk
+//    (vec_dot_q8_0_q8_1, VDR_Q8_0_Q8_1_MMVQ = 2 ints -> two dp4a per term;
+//    the two-dp4a chain is short, unlike the 8-dp4a chain of 409412b97d that
+//    cost 12.4% decode),
+//  * the stock (block, quarter) thread partition kbx = tid/(qi/vdr),
+//    kqs = vdr*(tid%(qi/vdr)) with qi = QI8_0 = 8 ints per block: 4 threads
+//    per block, 32 blocks per 128-thread wave (mmvq.cu:727-731),
+//  * the stock launch geometry: 64-lane waves, NWARPS waves per block, one
+//    row per block (the GCN ncols_dst=1 table, calc_nwarps/calc_rows_per_block),
+//  * the stock cross-warp shared-memory partial (warps y>0 -> tmp_shared[y-1],
+//    warp 0 adds in warp order) + 64-lane shfl tree (mmvq.cu:793-807).
+// The repacked qs plane stores each block's 8 ints contiguously (two uint4,
+// repack_q8_0_kernel buffer.cu:127-148), so the chunk at kqs is a plain int
+// load at w_row[8*kbx] + kqs and the scale is d_row[kbx] (lossless plane).
+template <int NWARPS, bool HAS_FUSION = false>
+static __global__ void __launch_bounds__(NWARPS*64, 1) mul_mat_vec_q8_0_repacked8(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
+        float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
+        const uint8_t * __restrict__ wbase_gate, const float * __restrict__ x_bias,
+        const float * __restrict__ gate_bias, const ggml_glu_op glu_op) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    constexpr int warp_size = 64;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int qi  = QI8_0;
+    constexpr int blocks_per_iter = vdr * NWARPS * warp_size / qi;
+
+    const int tid = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t row      = blockIdx.x;
+    const uint32_t n_blocks = ne0 >> 5;
+    const uint32_t qs_str   = repack_qs_stride(ne0);
+
+    const int * w_row = reinterpret_cast<const int *>(wbase + (size_t) row * qs_str);
+    const uint16_t * d_row = reinterpret_cast<const uint16_t *>(
+        wbase + (size_t) ne1 * qs_str) + (size_t) row * n_blocks;
+    [[maybe_unused]] const int * w_row_gate = nullptr;
+    [[maybe_unused]] const uint16_t * d_row_gate = nullptr;
+    [[maybe_unused]] const bool use_gate = wbase_gate != nullptr;
+    if constexpr (HAS_FUSION) {
+        if (use_gate) {
+            w_row_gate = reinterpret_cast<const int *>(wbase_gate + (size_t) row * qs_str);
+            d_row_gate = reinterpret_cast<const uint16_t *>(
+                wbase_gate + (size_t) ne1 * qs_str) + (size_t) row * n_blocks;
+        }
+    }
+
+    float acc = 0.0f;
+    [[maybe_unused]] float acc_gate = 0.0f;
+
+    for (int kbx = tid / (qi/vdr); kbx < (int) n_blocks; kbx += blocks_per_iter) {
+        const int kqs = vdr * (tid % (qi/vdr));
+        const int * const wv = w_row + 8*kbx;
+        const block_q8_1 * const xb = xq + kbx;
+        const int * const xv = reinterpret_cast<const int *>(xb->qs);
+        const float dx = __low2float(xb->ds);
+        const uint16_t db = d_row[kbx];
+        const float dw = __half2float(*reinterpret_cast<const __half *>(&db));
+        int sumi = ggml_cuda_dp4a(wv[kqs], xv[kqs], 0);
+        sumi = ggml_cuda_dp4a(wv[kqs+1], xv[kqs+1], sumi);
+        acc += dw * dx * (float) sumi;
+        if constexpr (HAS_FUSION) {
+            if (use_gate) {
+                const int * const wgv = w_row_gate + 8*kbx;
+                const uint16_t dgb = d_row_gate[kbx];
+                const float dwg = __half2float(*reinterpret_cast<const __half *>(&dgb));
+                int gdot = ggml_cuda_dp4a(wgv[kqs], xv[kqs], 0);
+                gdot = ggml_cuda_dp4a(wgv[kqs+1], xv[kqs+1], gdot);
+                acc_gate += dwg * dx * (float) gdot;
+            }
+        }
+    }
+
+    // Stock reduce: warps y>0 stage their partial in shared memory, warp 0
+    // adds them in warp order, then the 64-lane shfl tree (mmvq.cu:793-807).
+    __shared__ float tmp_shared[NWARPS-1 > 0 ? NWARPS-1 : 1][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[NWARPS-1 > 0 ? NWARPS-1 : 1][warp_size];
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y-1][threadIdx.x] = acc;
+        if constexpr (HAS_FUSION) {
+            tmp_shared_gate[threadIdx.y-1][threadIdx.x] = acc_gate;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int l = 0; l < NWARPS-1; ++l) {
+        acc += tmp_shared[l][threadIdx.x];
+        if constexpr (HAS_FUSION) {
+            acc_gate += tmp_shared_gate[l][threadIdx.x];
+        }
+    }
+    float result = warp_reduce_sum<warp_size>(acc);
+    [[maybe_unused]] float gate_result = 0.0f;
+    if constexpr (HAS_FUSION) {
+        gate_result = warp_reduce_sum<warp_size>(acc_gate);
+    }
+    if (threadIdx.x == 0 && row < ne1) {
+        if constexpr (HAS_FUSION) {
+            y[row] = rp_mmv_fusion_epilogue(result, gate_result, x_bias, gate_bias, row, glu_op, use_gate);
+        } else {
+            y[row] = result;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, wbase_gate, x_bias, gate_bias, glu_op);
     NO_DEVICE_CODE;
 #endif
 }
@@ -720,7 +880,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_vec_rp(
 // read is token-major (xcol*n_sub + sb) so a K-slice reads its own contiguous
 // slab of the pool. Both can be active at once (gate 3 + GGML_RP_KSPLIT).
 template <ggml_type WT, bool HAS_IDS, int CW, int TN_, int NRL, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
-          bool U4Q41 = false, int KSPLIT = 1, bool SUMW = false>
+          bool U4Q41 = false, int KSPLIT = 1, bool SUMW = false, bool RESTYLE = false>
 static __device__ void mmq_gemm_repacked_impl(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1769,14 +1929,31 @@ static __device__ void mmq_gemm_repacked_impl(
                             }
                         } else {
                         int idot = 0;
-                        idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
-                        idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
-                        idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                        if constexpr (RESTYLE) {
+                            // E4/RESTYLE8 stage 2 (2026-11-06): stock mul_mat_q
+                            // chains the 8 dp4a of a 32-value block in int order
+                            // 0..7 (vec_dot_q8_0_q8_1_impl<float, VDR_Q8_0_Q8_1_MMQ>,
+                            // mmq-vec-dot.cuh:137-148); the repacked staging tiles
+                            // keep that order as wlo.xyzw = ints 0..3, whi.xyzw =
+                            // ints 4..7. The shipped order interleaves the halves.
+                            idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                        } else {
+                            idot = ggml_cuda_dp4a((int) wlo_c.x, xq32[n][0], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.x, xq32[n][4], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.y, xq32[n][1], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.y, xq32[n][5], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.z, xq32[n][2], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.z, xq32[n][6], idot);
+                            idot = ggml_cuda_dp4a((int) wlo_c.w, xq32[n][3], idot);
+                            idot = ggml_cuda_dp4a((int) whi_c.w, xq32[n][7], idot);
+                        }
                         if constexpr (rp_traits<WT>::affine) {
                             // Affine (Q4_K): d*sc times the dot, minus dmin*m times the sum.
                             acc[r][n] += dlo * dx[n] * (float) idot - dhi * sx[n];
@@ -1883,7 +2060,7 @@ static __device__ void mmq_gemm_repacked_impl(
 // stock instantiation byte-identical.
 // M4: U4P8 threaded the same way (default false = byte-identical stock).
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
-          bool U4Q41 = false, bool SUMW = false>
+          bool U4Q41 = false, bool SUMW = false, bool RESTYLE = false>
 static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -1893,7 +2070,7 @@ static __global__ void __launch_bounds__(64 * NRL, 2) mmq_gemm_repacked(
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41, 1, SUMW>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 64, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41, 1, SUMW, RESTYLE>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
@@ -2485,7 +2662,7 @@ static __global__ void mul_mat_vec_repacked_coal(
 }
 
 template <bool HAS_IDS, int TN_, int NRL, ggml_type WT = GGML_TYPE_Q8_0, bool U4ACT = false, bool U4P8 = false, bool U4X16 = false,
-          bool U4Q41 = false, int KSPLIT = 1, bool SUMW = false>
+          bool U4Q41 = false, int KSPLIT = 1, bool SUMW = false, bool RESTYLE = false>
 static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q4_K || WT == GGML_TYPE_Q5_K) ? 2 : 3) mmq_gemm_repacked_w32(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -2495,7 +2672,7 @@ static __global__ void __launch_bounds__(32 * NRL, HAS_IDS && (WT == GGML_TYPE_Q
         const repack_tile_meta * __restrict__ tile_meta,
         const uint32_t n_expert, const size_t expert_stride, const uint32_t dst_s1) {
 #if defined(GGML_USE_HIP) && defined(__gfx906__)
-    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41, KSPLIT, SUMW>(
+    mmq_gemm_repacked_impl<WT, HAS_IDS, 32, TN_, NRL, U4ACT, U4P8, U4X16, U4Q41, KSPLIT, SUMW, RESTYLE>(
         wbase, xq, y, ne0, ne1, n_tok, ids_src1, ids_dst,
         expert_bounds, tile_off, tile_meta, n_expert, expert_stride, dst_s1);
 #else
