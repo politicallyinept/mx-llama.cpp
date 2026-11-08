@@ -48,6 +48,44 @@ static __global__ void k_gdn_conv_scatter(const float * __restrict__ src,
     }
 }
 
+// One grid.y row per (slot, seq): copy the D-float state row from the contiguous gdn output
+// tail straight into ring row ids[r]. Pure float copy, each element written exactly once
+// => byte-identical to the cont + set_rows staging it replaces.
+static __global__ void k_gdn_state_scatter(const float4 * __restrict__ src,
+                                           float4 * __restrict__ dst,
+                                           const int32_t * __restrict__ ids,
+                                           const int D4) {
+    ggml_cuda_pdl_sync();
+
+    const int r = blockIdx.y;
+
+    const int64_t row  = ids[r];
+    const float4 * srow = src + (int64_t) r * D4;
+    float4 *       drow = dst + row * D4;
+
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < D4; i += gridDim.x * blockDim.x) {
+        drow[i] = srow[i];
+    }
+}
+
+void ggml_cuda_gdn_state_scatter(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_state_scatter_args & a) {
+    GGML_ASSERT(a.src != nullptr && a.dst != nullptr && a.ids != nullptr);
+    GGML_ASSERT(a.n_rows >= 1 && a.n_rows <= GDN_CONV_SCATTER_MAX_SNAPS * a.n_seqs);
+    GGML_ASSERT(a.D >= 4 && a.D % 4 == 0);
+    GGML_ASSERT(((uintptr_t) a.src) % 16 == 0 && ((uintptr_t) a.dst) % 16 == 0);
+
+    const int D4 = (int) (a.D / 4);
+
+    const int block_dims_x = 256;
+    dim3 block_dims(block_dims_x);
+    dim3 grid_dims((D4 + block_dims_x - 1) / block_dims_x, a.n_rows, 1);
+
+    cudaStream_t stream = ctx.stream();
+
+    k_gdn_state_scatter<<<grid_dims, block_dims, 0, stream>>>(
+        (const float4 *) a.src, (float4 *) a.dst, a.ids, D4);
+}
+
 void ggml_cuda_gdn_conv_scatter(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_scatter_args & a) {
     GGML_ASSERT(a.src != nullptr && a.dst != nullptr);
     GGML_ASSERT(a.n_written >= 1 && a.n_written <= GDN_CONV_SCATTER_MAX_SNAPS);

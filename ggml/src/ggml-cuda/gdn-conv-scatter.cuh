@@ -30,3 +30,23 @@ struct ggml_cuda_gdn_conv_scatter_args {
 };
 
 void ggml_cuda_gdn_conv_scatter(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_conv_scatter_args & args);
+
+// ring-mode recurrent-state direct scatter (dflash width-8 staging fusion). The colthread GDN
+// kernel (n_tokens >= 8) does not take snap_ids, so the snapshot tail of its output is staged
+// into the ring state cache by VIEW -> CONT -> SET_ROWS. This kernel replaces that chain with
+// ONE strided copy: row r of the contiguous tail lands in cache row ids[r] (slot s of seq j ->
+// ids[j + n_seqs*s], the same mapping the in-kernel snap scatter uses). Same floats, same rows
+// as the chain it replaces => byte-identical by construction.
+// See ggml_cuda_try_gdn_state_scatter in ggml-cuda.cu for the matcher and admission gates.
+struct ggml_cuda_gdn_state_scatter_args {
+    // src: gdn output snapshot tail, contiguous [D, n_seqs*n_written] f32
+    // dst: state cache, [D, n_cells] f32, row stride = D floats
+    const float *   src;
+    float *         dst;
+    const int32_t * ids;   // [n_seqs*n_written] ring row ids
+    int             n_rows; // n_seqs * n_written
+    int             n_seqs;
+    int64_t         D;      // floats per scattered row (S_v*S_v*H), multiple of 4
+};
+
+void ggml_cuda_gdn_state_scatter(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_state_scatter_args & args);
