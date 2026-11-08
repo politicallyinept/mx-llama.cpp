@@ -1692,6 +1692,20 @@ void ggml_free(struct ggml_context * ctx) {
     GGML_FREE(ctx);
 }
 
+// Model-shape hint storage (see ggml.h): latched on the first call. Model load is
+// single-threaded at the call site, so a plain static is sufficient.
+static int ggml_model_has_experts_hint = -1;  // -1 unset, 0 dense, 1 has 3D expert tensors
+
+void ggml_set_model_has_expert_tensors(bool has_experts) {
+    if (ggml_model_has_experts_hint == -1) {
+        ggml_model_has_experts_hint = has_experts ? 1 : 0;
+    }
+}
+
+bool ggml_model_has_expert_tensors(void) {
+    return ggml_model_has_experts_hint > 0;
+}
+
 size_t ggml_used_mem(const struct ggml_context * ctx) {
     return ctx->objects_end == NULL ? 0 : ctx->objects_end->offs + ctx->objects_end->size;
 }

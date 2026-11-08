@@ -824,6 +824,15 @@ extern "C" {
     GGML_API void                  ggml_reset(struct ggml_context * ctx);
     GGML_API void                  ggml_free (struct ggml_context * ctx);
 
+    // Model-shape hint for backend weight-layout admission (fork extension). The
+    // model loader calls ggml_set_model_has_expert_tensors() once per model load,
+    // before any weight buffer is allocated, with has_experts = the model contains
+    // 3D expert tensors (ne[2] > 1). The first call per process latches the value;
+    // backends consult ggml_model_has_expert_tensors() for shape-conditional layout
+    // defaults (currently: the CUDA Q8_0 repack admission).
+    GGML_API void ggml_set_model_has_expert_tensors(bool has_experts);
+    GGML_API bool ggml_model_has_expert_tensors(void);
+
     GGML_API size_t  ggml_used_mem(const struct ggml_context * ctx);
 
     GGML_API bool    ggml_get_no_alloc(struct ggml_context * ctx);

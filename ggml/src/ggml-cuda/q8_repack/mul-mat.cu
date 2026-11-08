@@ -35,11 +35,14 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 //  * prefill GEMM: mmq_gemm_repacked<..., RESTYLE=true> - the Q8_0 dot chains
 //    its 8 dp4a in stock int order 0..7 (mmq-vec-dot.cuh:137-148) instead of
 //    the shipped lo/hi interleave.
-// Default OFF: today's per-half-block MMV terms + interleaved GEMM dot.
+// Default ON (perf flag): the restyled kernels reproduce the stock accumulation
+// order and granularity on the repacked layout - bit-identical greedy output on the
+// validated MoE and dense legs at a decode win. GGML_CUDA_REPACK_Q8_0_RESTYLE=0 is
+// the kill switch: today's per-half-block MMV terms + interleaved GEMM dot.
 static bool rp_q8_0_restyle_on(void) {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0_RESTYLE");
-        const bool r = e != nullptr && atoi(e) != 0;
+        const bool r = e == nullptr || atoi(e) != 0;
         if (r) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_RESTYLE gate ACTIVE: repacked Q8_0 MMV uses one fp32 term per 32-value block\n");
         }

@@ -2018,6 +2018,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    // Q8_0 repack admission shape hint: scan the loaded weights for 3D expert
+    // tensors (ne[2] > 1) before any weight buffer is allocated, so the CUDA repack
+    // admission can default Q8_0 repacking ON for MoE models (measured decode win,
+    // bit-identical) and OFF for dense models (measured regression). The hint
+    // latches on the first model load in the process; see ggml.h.
+    {
+        bool has_experts = false;
+        for (const auto & it : ml.weights_map) {
+            const ggml_tensor * t = it.second.tensor;
+            if (t != nullptr && ggml_n_dims(t) > 2 && t->ne[2] > 1 &&
+                it.first.find("_exps") != std::string::npos) {
+                has_experts = true;
+                break;
+            }
+        }
+        ggml_set_model_has_expert_tensors(has_experts);
+        LLAMA_LOG_WARN("%s: model shape hint for the Q8_0 repack admission: %s 3D expert tensors\n",
+                       __func__, has_experts ? "found" : "no");
+    }
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;

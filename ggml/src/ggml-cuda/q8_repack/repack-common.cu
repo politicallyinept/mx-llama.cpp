@@ -37,6 +37,21 @@ bool repack_sumw_plane_on() {
     return s_on;
 }
 
+// Resolve the Q8_0 repack admission: an explicit GGML_CUDA_REPACK_Q8_0 override wins
+// (=1 forces on even for dense, =0 forces off even for MoE); otherwise the default is
+// MoE-conditional - admit only when the loaded model has 3D expert tensors (see the
+// admission comment below and ggml_model_has_expert_tensors).
+static bool q8_0_repack_admitted(void) {
+    static const int env = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
+        return e == nullptr ? 0 : (atoi(e) != 0 ? 1 : -1);
+    }();
+    if (env != 0) {
+        return env > 0;
+    }
+    return ggml_model_has_expert_tensors();
+}
+
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Views are never in repacked layout (the scale-plane offset needs the FULL ne1).
     if (t->view_src != nullptr) return false;
@@ -88,35 +103,29 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return off;
     }();
-    // Q8_0 admission is OPT-IN: GGML_CUDA_REPACK_Q8_0=1. Unset/0 keeps Q8_0
-    // tensors in canonical layout (never repacked), so the stock path handles
-    // them. Flipped from default-ON by the q8rp-mmv lane (2026-10-26) on the
-    // decode-diag rank-3 finding: on UD-Q4_K_XL tp1 the repacked q8_0 mmv is
-    // net-NEGATIVE for decode - llama-bench tg256 with the fork gate bundle:
-    // repack-on 91.91 t/s vs Q8_0-canonical 95.37 t/s (+3.8%), and the same
-    // gate recovered prefill on Qwen3.8-27B TP2 (repacked Q8_0 GEMM ~2.4x
-    // slower than stock mul_mat_q on the GDN projection shards: 324 us/call
-    // vs 135 us/call, same 1152 calls). On bartowski Q4_0 tp1 the Q8_0 repack
-    // is decode-neutral (93.36 vs 93.22), so nothing regresses: the Q4_0 u4
-    // win there comes from GGML_CUDA_REPACK_Q4_0 admission, untouched here.
+    // Q8_0 admission: MoE-conditional by default. The repacked Q8_0 path (with the
+    // RESTYLE stock-granularity kernels and the gcn_kq yield) is bit-identical to the
+    // stock path and measured +1.3..+1.5% decode on MoE models, but a net regression
+    // on a dense all-Q8_0 model (-1.6% decode, -8.4% prefill, +24 GB VRAM for the
+    // dual-layout canon copy) - the win is MoE-shaped. With no explicit env, Q8_0 is
+    // therefore admitted only when the loaded model has 3D expert tensors (the
+    // structural feature separating the winning MoE legs from the losing dense leg);
+    // the hint is latched by the model loader before any weight buffer is allocated
+    // (ggml_model_has_expert_tensors). GGML_CUDA_REPACK_Q8_0=1 forces admission ON
+    // (dense included); =0 forces it OFF (MoE included). History: the path was
+    // default-ON pre-RESTYLE, flipped to opt-in after a decode-regression finding on
+    // the pre-RESTYLE kernels, and is now the MoE-conditional default on top of the
+    // RESTYLE bit-identical kernels.
+    //
     // The repack is a layout repack of the 8-bit weights (dp4a-friendly row +
-    // scale-plane layout): greedy temp-0 byte-compare vs the default-on build
-    // passed on both UD-Q4_K_XL and bartowski Q4_0, and GGML_CUDA_REPACK_Q8_0=1
-    // on this build reproduces the default-on output byte-for-byte. The
-    // q40-longpp bisect (2026-10-28) later REFUTED full neutrality: the repack
-    // path is deterministic but not bit-identical to stock - see the
-    // STOCK_ACC gate below for the divergence map and the neutral fallback.
-    static const bool s_q8_0 = [] {
-        const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
-        const bool on = e != nullptr && atoi(e) != 0;
-        if (on) {
-            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate ACTIVE: Q8_0 admitted to the gfx906 repack path (opt-in)\n");
-        }
-        return on;
-    }();
-    // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC pins
-    // Q8_0 matmuls to STOCK accumulation order. Default ON (anchor3 consolidation,
-    // 6/6 baseline match proven 2026-10-30); set =0 to restore the repacked Q8_0 path.
+    // scale-plane layout); without RESTYLE the accumulation order differs from stock
+    // - see the STOCK_ACC gate below for the divergence map and the neutral fallback.
+    // Tier-3.3 stock-accumulation kill switch: GGML_CUDA_REPACK_Q8_0_STOCK_ACC=1
+    // pins Q8_0 matmuls to STOCK accumulation order (Q8_0 stays canonical, repack
+    // suppressed). Default OFF now that the RESTYLE kernels reproduce the stock
+    // accumulation order and granularity on the repacked layout (bit-identical
+    // greedy output on the validated MoE and dense legs); =1 restores the
+    // numerics-neutral fallback for A/B.
     //
     // Divergence map (adopt-gdn-rows): the weight repack itself is lossless -
     // block_q8_0 carries a ggml_half d (ggml-common.h:253) and both planes are
@@ -154,7 +163,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // matmul as stock - no extra passes.
     static const bool s_q8_0_stock_acc = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0_STOCK_ACC");
-        const bool on = e == nullptr || atoi(e) != 0;
+        const bool on = e != nullptr && atoi(e) != 0;
         if (on) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_STOCK_ACC gate ACTIVE: Q8_0 stays canonical, stock accumulation (repack suppressed for Q8_0)\n");
         }
@@ -162,7 +171,14 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }();
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
-            return s_q8_0 && !s_q8_0_stock_acc && t->ne[0] % 32 == 0;
+            const bool adm = q8_0_repack_admitted() && !s_q8_0_stock_acc;
+            static const bool s_banner = [&] {
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s: Q8_0 %s the gfx906 repack path (MoE-conditional default)\n",
+                              adm ? "ACTIVE" : "inactive", adm ? "admitted to" : "stays canonical for");
+                return true;
+            }();
+            (void) s_banner;
+            return adm && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_IQ4_NL: {
