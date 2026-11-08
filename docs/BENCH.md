@@ -2685,3 +2685,59 @@ prior seal witness):
 
 Full gate-default table (per-gate source defaults vs bundle values) and both seal
 matrices: `benchmarks/defaults-vs-env.md`.
+
+## 92. E4 Q8_0 repack yield + dflash staging fusion ship: MoE-conditional defaults (2026-11-07)
+
+Shipped on CV-port: the E4 repack chain (RESTYLE8 stock-granularity repacked
+Q8_0 mat-vec/GEMM, the verify-width nc variant, and the gcn_kq yield for
+admitted dense prefill GEMMs) plus the dflash width-8 GDN ring staging fusion,
+with flag defaults set per the performance-flag policy (perf flags default ON;
+shape-conditional only when self-limiting).
+
+Production matrix (3 reps/arm, interleaved, tensor TP2, spec decode OFF):
+
+| Leg | Model | tg256 decode | pp4096 | Greedy bit-id vs stock |
+|---|---|---|---|---|
+| 1 | 35B-A3B MoE UD-Q4_K_XL | +1.53% (clean per-rep separation) | -0.24% (noise) | 6/6 identical |
+| 2 | 35B-A3B MoE Q8_0 | +1.29% (clean per-rep separation) | -0.84% (spread) | 6/6 identical |
+| 3 | 27B dense Q8_0 | -1.62% (regression) | -8.44% | 6/6 identical |
+| dflash w8 | 35B-A3B MoE + dflash draft, verify width 8 | +5.1% (58.65 vs 55.81 t/s medians) | - | byte-identical |
+
+Leg 3 is why the Q8_0 repack admission default is MoE-conditional: with no
+explicit env, Q8_0 is admitted to the repack path only when the loaded model
+has 3D expert tensors (ne[2] > 1); the model loader scans the weights and
+latches the hint before any weight buffer is allocated, so allocation-time and
+dispatch-time admission can never disagree. Dense models keep the canonical
+stock path with zero configuration. `GGML_CUDA_REPACK_Q8_0=1` forces admission
+on for dense, `=0` forces it off even for MoE. `GGML_CUDA_REPACK_Q8_0_RESTYLE`
+and `GGML_CUDA_REPACK_Q8_0_YIELD` default ON; `GGML_CUDA_REPACK_Q8_0_STOCK_ACC`
+is now a default-OFF kill switch; `GGML_CUDA_DFLASH_STAGE_FUSE` defaults ON and
+only engages spec-verify graphs. Debug traces (`GGML_Q8_YIELD_TRACE`,
+`GGML_TP1_DEBUG`) stay default OFF.
+
+Defaults-only verification on the release build (zero env set, natural greedy
+prompts, one server at a time):
+
+* 35B-A3B MoE UD-Q4_K_XL TP2: greedy completion bit-identical to the
+  ship-lineage stock build (sha256 f2526cf4...); banners witness the shape hint
+  finding 3D expert tensors and the repack/RESTYLE/YIELD gates engaging with no
+  env set.
+* 27B dense Q8_0 TP2: bit-identical to the stock build (sha256 69b596e0...);
+  shape hint reports no expert tensors and the repack gate stays inactive.
+* dflash width-8 leg: staging-fusion banner present; the byte gate reproduces
+  the verified fusion arm exactly (md5 e6af2a3d...); with the fusion kill switch
+  set the natural-prompt output is unchanged (fusion byte-identical beyond the
+  byte gate too).
+* tg256 A/B on the MoE leg, defaults vs the stock build: +1.76% decode
+  (121.54 -> 123.68 t/s medians, 24 reps/arm) with zero env - the E4 win is a
+  default behavior now.
+
+Observation (spec-decode fidelity): under dflash width-8 verify the release
+build's greedy output equals its own non-speculative greedy output (the
+stock-granularity nc verify kernels reproduce decode-path accumulation order),
+while the stock build's width-8 verify output diverges from its non-speculative
+greedy output on the same prompt. The release build is strictly closer to
+lossless spec decode; no action needed, noted for the record.
+
+Serving guidance for draft depth: np <= 2 -> `--spec-draft-n-max 2`; np >= 3 ->
+speculative decode off or `n_max 1`; mixed concurrency -> `n_max 1`.

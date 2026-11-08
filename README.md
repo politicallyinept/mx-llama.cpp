@@ -60,8 +60,12 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_DISABLE_FUSION` | OFF | kill switch: disables the whole CUDA fusion-matcher pass | upstream llama.cpp |
 | `GGML_CUDA_REPACK_KQUANT` | ON (`=0` off) | repacks Q4_K/Q5_K/Q6_K into the GEMM-friendly layout; `=0` keeps canonical layout (stock path) for A/B | gcn-repro A/B lane |
 | `GGML_CUDA_REPACK_KQUANT_MOE_FUSION` | ON (`=0` off) | admits K-quant/IQ4_NL expert tensors to the repacked MoE up/gate mat-vec fusion | repack MoE-fusion lane |
-| `GGML_CUDA_REPACK_Q8_0` | OFF (`=1` on) | opt-in Q8_0 repack (flipped from default-ON after a decode-regression finding) | q8_0-repack decode-diag lane |
-| `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | ON (`=0` off) | pins Q8_0 matmuls to stock accumulation order: Q8_0 stays canonical (repack suppressed for Q8_0 even with `GGML_CUDA_REPACK_Q8_0=1`); `=0` restores the repacked Q8_0 path | anchor3 consolidation |
+| `GGML_CUDA_REPACK_Q8_0` | MoE-conditional (`=1` force on, `=0` force off) | admits Q8_0 weights to the gfx906 repack path. Default follows the model shape: ON only when the loaded model has 3D expert tensors (MoE: +1.3..1.5% decode, bit-identical to stock), OFF for dense models (dense repack measured -1.6% decode / -8.4% prefill at +24 GB VRAM). `=1` forces admission on for dense models too; `=0` forces it off even for MoE | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0_RESTYLE` | ON (`=0` off) | repacked Q8_0 mat-vec/GEMM reproduce the stock accumulation order and granularity on the repacked layout (bit-identical greedy output at a decode win); `=0` restores the pre-RESTYLE kernels | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0_YIELD` | ON (`=0` off) | dense Q8_0 prefill GEMMs admitted by the gcn_kq gate yield to the gcn_kq v4 kernel via the canonical copy kept next to the repacked record; inert unless Q8_0 is admitted | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | OFF (`=1` on) | numerics-neutral kill switch: pins Q8_0 matmuls to stock accumulation order (Q8_0 stays canonical, repack suppressed) even when admitted; the A/B fallback from before the RESTYLE kernels | anchor3 consolidation |
+| `GGML_Q8_YIELD_TRACE` | OFF (`=1` on) | debug trace of the yield branch decisions on stderr (capped); never affects output | q8_0-repack E4 lane |
+| `GGML_CUDA_DFLASH_STAGE_FUSE` | ON (`=0` off) | dflash width-8 GDN ring staging fusion: conv-state ring scatter and recurrent-state snapshot copies fold into the direct-scatter kernels on spec-verify graphs only; byte-identical output, +5.1% verify-width decode | dflash fix lane |
 | `GGML_CUDA_MOE_VEC` | OFF (`=1` on) | row-lane MoE decode kernel family (decode-shape admission) | CV port |
 | `GGML_CUDA_MOE_FUSE` | OFF (`=1` on) | MoE gate/up + SwiGLU prefill fusion on the expert-grouped GCN v4 GEMM | CV-port prefill fusion |
 | `GGML_TP_AR_MTP_SAFE` | OFF (`=1`/`=2`) | disables the custom TP all-reduce once a tensor-width change is seen (MTP/spec-decode safety) | fork TP work |
@@ -75,6 +79,14 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_ASYNC_CKPT` | ON (`=0` off) | async recurrent-state checkpoint capture in the server (sync deferred to next synchronize) | fork server work (staging robustness under further investigation) |
 | `GGML_CUDA_GDN_CONV_SCATTER` | ON (`=0` off) | GDN conv-state ring written by direct kernel-side scatter instead of a gather+copy | mtp-pipe (default ON) |
 | `LLAMA_MTP_FAST_SAMPLE` | ON (`=0` off) | MTP draft skips backend top-k chain construction and samples directly | mtp-pipe (default ON) |
+
+### Speculative-decode serving guidance (draft depth)
+
+`--spec-draft-n-max` should follow concurrency: at `np <= 2` serve `n_max 2`; at
+`np >= 3` disable speculative decode or drop to `n_max 1`; for mixed-concurrency
+endpoints serve `n_max 1`. Wider drafts only pay while per-request GPU slack
+exists - at higher batch counts the extra verify width costs more than the
+accepted tokens return.
 
 ## What this is
 
