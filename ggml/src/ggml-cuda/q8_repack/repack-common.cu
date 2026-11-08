@@ -217,6 +217,34 @@ bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0) {
     return src0->view_src != nullptr && ggml_cuda_repack_tensor_supported(src0->view_src);
 }
 
+// E4 gcn_kq yield: static half of the ggml_cuda_gcn_kq_gemm admission for dense
+// Q8_0 (gcn-q8-gemm.cu:1976 area). Mirrors the env/mask logic there: default
+// GGML_CUDA_GCN_KQ=1 -> mask 8191 admits bit 128 (Q8_0); GGML_GCN_GEMM_MIN_M
+// default 128; K%256==0 (QK_K super-blocks); dense single-batch; not a view
+// (views splice from the repacked base and have no canonical copy). The runtime
+// half (N>=32, src1/dst layout, alignment, v4 checks) is decided by calling
+// ggml_cuda_gcn_kq_gemm itself, so the regime split can never drift from stock.
+// Consulted at load time (get_alloc_size / upload: tensor->buffer not yet set)
+// AND at dispatch; identical env statics both times, so alloc and yield agree.
+bool ggml_cuda_q8_yield_eligible(const ggml_tensor * t) {
+    if (t->type != GGML_TYPE_Q8_0 || t->view_src != nullptr) {
+        return false;
+    }
+    if (t->ne[2] != 1 || t->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_cuda_repack_tensor_supported(t)) {
+        return false;   // Q8_0 repack gate off (or STOCK_ACC) -> nothing to yield
+    }
+    static const int kq_env = [] { const char * e = getenv("GGML_CUDA_GCN_KQ"); return e ? atoi(e) : 1; }();
+    const int mask = kq_env == 1 ? 8191 : kq_env;
+    if (!(mask & 128)) {
+        return false;   // Q8_0 bit declined by GGML_CUDA_GCN_KQ -> stock regime is mmq
+    }
+    static const int min_rows = [] { const char * e = getenv("GGML_CUDA_GCN_GEMM_MIN_M"); return e ? atoi(e) : 128; }();
+    return t->ne[0] % 256 == 0 && t->ne[1] >= (int64_t) min_rows;
+}
+
 // The FUSED mat-vec path dispatches to mul_mat_vec_q8_0_repacked, which is Q8_0-only:
 // an MXFP4 sub-block is a single uint4 of nibbles, so that kernel's half-block
 // indexing (2 uint4 per sub-block) has no MXFP4 equivalent. MXFP4 reaches the GEMM

@@ -21,6 +21,10 @@ inline bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor *) {
     return false;
 }
 
+inline bool ggml_cuda_q8_yield_eligible(const ggml_tensor *) {
+    return false;
+}
+
 inline void ggml_cuda_repack_set_tensor_async(
         int, cudaStream_t, ggml_tensor *, const void *, size_t, size_t) {
     GGML_ABORT("repacked weights are unavailable on MUSA");
@@ -76,6 +80,15 @@ ggml_backend_buffer_type_t ggml_backend_cuda_repack_buffer_type(int device);
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t);
 
 bool ggml_cuda_repack_mul_mat_should_fire(const ggml_tensor * src0);
+
+// E4 gcn_kq yield (branch e4-gcnkq-yield): static half of the ggml_cuda_gcn_kq_gemm
+// admission for dense Q8_0 — env mask bit 128 of GGML_CUDA_GCN_KQ, K%256==0,
+// M>=GGML_CUDA_GCN_GEMM_MIN_M (default 128), ne2==ne3==1, not a view, and the Q8_0
+// repack gate on. When true, the repack buffer ALSO stores a canonical block_q8_0
+// copy after the repacked record (get_alloc_size grows), and the dense dispatch
+// yields GEMMs that gcn_kq itself admits (runtime half: N>=32, alignment, ...) to
+// ggml_cuda_gcn_kq_gemm on that copy — exactly the stock arm's kernel regime.
+bool ggml_cuda_q8_yield_eligible(const ggml_tensor * t);
 
 // Async-upload path: canonical chunks stage into per-device scratch and the
 // device-side repack kernel runs when the tensor completes. The scratch is

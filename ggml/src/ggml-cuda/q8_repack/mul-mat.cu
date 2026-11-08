@@ -7,6 +7,7 @@
 #include "w4a4-profile.h"   // GGML_CUDA_W4A4_PROFILE: resolved int4-knob presets
 #include "../quantize.cuh"
 #include "../mmq.cuh"
+#include "../gcn-q8-gemm.cuh"   // E4 gcn_kq yield: ggml_cuda_gcn_kq_gemm
 #include "../w4a4_skip.cuh"   // Lever 2: GGML_CUDA_W4A4_SKIP prefix exclusion
 #include <atomic>   // rp_dispatch_trace witness counter
 
@@ -73,6 +74,62 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     const int64_t ne12 = src1->ne[2];
     const int64_t ne13 = src1->ne[3];
     GGML_ASSERT(ne10 == ne00);
+
+    // E4 gcn_kq yield (branch e4-gcnkq-yield): dense Q8_0 prefill GEMMs that
+    // ggml_cuda_gcn_kq_gemm admits (N>=32, M>=128, K%256==0, mask bit 128 — the
+    // runtime half is re-decided by the kernel itself) must NOT be repack-
+    // intercepted: the pinned baseline regime for those shapes is the gcn_kq v4
+    // kernel, not mmq-geometry. The repack buffer carries a canonical
+    // block_q8_0 copy after the repacked record (see buffer.cu get_alloc_size);
+    // point a tensor view at it and hand the GEMM to gcn_kq exactly as the stock
+    // arm does. Repack keeps what gcn_kq declines: decode MMV (N=1), nc verify
+    // batches 2..8 and N<32 prefill — all already bit-identical to stock.
+    // Applies to the Q8_0 repack admission generally (not RESTYLE-specific):
+    // the gcn_kq regime is the production default-ON baseline for every arm.
+    // GGML_CUDA_REPACK_Q8_0_YIELD=0 kills the yield (A/B switch, default ON).
+    static const bool s_q8_yield = [] {
+        const char * e = getenv("GGML_CUDA_REPACK_Q8_0_YIELD");
+        const bool on = e == nullptr || atoi(e) != 0;
+        if (on) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_YIELD gate ACTIVE: gcn_kq-admissible dense Q8_0 prefill GEMMs yield to ggml_cuda_gcn_kq_gemm (canonical copy)\n");
+        }
+        return on;
+    }();
+    if (s_q8_yield && ne11 >= 32 && src0->type == GGML_TYPE_Q8_0 &&
+            src0->view_src == nullptr && ggml_cuda_q8_yield_eligible(src0)) {
+        ggml_tensor canon = *src0;
+        const size_t rec = repack_gcn_nbytes(GGML_TYPE_Q8_0, ne00, ne01) * src0->ne[2];
+        canon.data = (char *) src0->data + rec;
+        // canonical block_q8_0 strides, matching ggml_new_tensor for a quantized
+        // type: nb[0] = type size (34 B / 32-value block), nb[1] = 34*(K/32).
+        canon.nb[0] = ggml_type_size(GGML_TYPE_Q8_0);
+        canon.nb[1] = canon.nb[0] * (size_t) (ne00 / 32);
+        canon.nb[2] = canon.nb[1] * (size_t) ne01;
+        canon.nb[3] = canon.nb[2];
+        const bool ok = ggml_cuda_gcn_kq_gemm(ctx, &canon, src1, dst);
+        static const int ytrace = [] { const char * e = getenv("GGML_Q8_YIELD_TRACE"); return e ? atoi(e) : 0; }();
+        static int y_n = 0;
+        if (ytrace && y_n++ < 40) {
+            fprintf(stderr, "[Q8-YIELD] K=%lld M=%lld N=%lld rec=%zu data=%p canon=%p gcn_kq=%d\n",
+                (long long) ne00, (long long) ne01, (long long) ne11, rec, src0->data, canon.data, (int) ok);
+            if (y_n <= 6) {
+                fprintf(stderr, "[Q8-YIELD-DBG] contig=%d s0ne3=%lld s1ne2=%lld s1ne3=%lld ne2=%lld "
+                    "dnb0=%zu s1nb0=%zu s0nb1=%zu canon%%4=%llu s1nb1%%8=%zu s1data%%8=%llu "
+                    "dstne2=%lld s1type=%d dsttype=%d\n",
+                    (int) ggml_is_contiguous(&canon), (long long) canon.ne[3],
+                    (long long) src1->ne[2], (long long) src1->ne[3], (long long) canon.ne[2],
+                    dst->nb[0], src1->nb[0], canon.nb[1],
+                    (unsigned long long) ((uintptr_t) canon.data % 4), src1->nb[1] % 8,
+                    (unsigned long long) ((uintptr_t) src1->data % 8),
+                    (long long) dst->ne[2], (int) src1->type, (int) dst->type);
+            }
+        }
+        if (ok) {
+            return;
+        }
+        // gcn_kq declined at runtime (alignment, v4 layout, ...) -> repack GEMM,
+        // same fallback shape as the stock arm's mmq fallback.
+    }
 
     cudaStream_t stream = ctx.stream();
 

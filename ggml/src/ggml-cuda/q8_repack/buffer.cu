@@ -72,6 +72,12 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
     const size_t src_stride = ggml_nbytes(tensor) / ne2;
     const size_t dst_stride = repack_gcn_nbytes(tensor->type, ne0, ne1);
     const size_t need       = dst_stride * ne2;
+    // E4 gcn_kq yield: stage the canonical bytes right after the repacked record
+    // and upload both in the one async H2D — the tail region is contiguous with
+    // the record in the tensor's allocation (see get_alloc_size).
+    const bool   dual       = ggml_cuda_q8_yield_eligible(tensor);
+    const size_t canon      = dual ? ggml_nbytes(tensor) : 0;
+    const size_t upload     = need + canon;
 
     repack_witness(tensor, ctx->device);
     // Pinned double-buffered upload scratch per device: repack into one slot,
@@ -91,12 +97,12 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
         CUDA_CHECK(cudaEventSynchronize(u.ev));
         u.ev_live = false;
     }
-    if (u.cap < need) {
+    if (u.cap < upload) {
         if (u.p != nullptr) {
             CUDA_CHECK(cudaFreeHost(u.p));
         }
-        CUDA_CHECK(cudaMallocHost((void **) &u.p, need));
-        u.cap = need;
+        CUDA_CHECK(cudaMallocHost((void **) &u.p, upload));
+        u.cap = upload;
     }
     if (u.ev == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&u.ev, cudaEventDisableTiming));
@@ -107,8 +113,11 @@ static void repack_and_upload(ggml_backend_buffer_t buffer, ggml_tensor * tensor
         repack_host(tensor->type, src + e * src_stride,
             repacked + e * dst_stride, ne0, ne1);
     }
+    if (dual) {
+        memcpy(repacked + need, src, canon);
+    }
 
-    CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked, need,
+    CUDA_CHECK(cudaMemcpyAsync(tensor->data, repacked, upload,
         cudaMemcpyHostToDevice, s_upl_stream[dev]));
     CUDA_CHECK(cudaEventRecord(u.ev, s_upl_stream[dev]));
     u.ev_live = true;
@@ -553,6 +562,11 @@ void ggml_cuda_repack_set_tensor_async(int device, cudaStream_t stream,
                 GGML_ABORT("unsupported repack type for async upload");
         }
         CUDA_CHECK(cudaGetLastError());
+        if (tensor->type == GGML_TYPE_Q8_0 && ggml_cuda_q8_yield_eligible(tensor)) {
+            // E4 gcn_kq yield: canonical copy after the repacked record (see get_alloc_size).
+            CUDA_CHECK(cudaMemcpyAsync((uint8_t *) tensor->data + dst_str * ne2, st.scratch, total,
+                cudaMemcpyDeviceToDevice, stream));
+        }
         st.cur      = nullptr;
         st.received = 0;
     }
@@ -742,7 +756,14 @@ static size_t ggml_backend_cuda_repack_buffer_type_get_alloc_size(
         ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     GGML_UNUSED(buft);
     if (ggml_cuda_repack_tensor_supported(tensor)) {
-        return repack_gcn_nbytes(tensor->type, tensor->ne[0], tensor->ne[1]) * tensor->ne[2];
+        size_t bytes = repack_gcn_nbytes(tensor->type, tensor->ne[0], tensor->ne[1]) * tensor->ne[2];
+        // E4 gcn_kq yield: gcn_kq-admissible dense Q8_0 tensors carry a canonical
+        // block_q8_0 copy after the repacked record so the dispatch can yield
+        // admitted prefill GEMMs to ggml_cuda_gcn_kq_gemm (bit-identical regime).
+        if (ggml_cuda_q8_yield_eligible(tensor)) {
+            bytes += ggml_nbytes(tensor);
+        }
+        return bytes;
     }
     return ggml_nbytes(tensor);
 }
