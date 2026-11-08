@@ -2025,17 +2025,50 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // latches on the first model load in the process; see ggml.h.
     {
         bool has_experts = false;
+        int64_t dense_q8_bytes = 0;
         for (const auto & it : ml.weights_map) {
             const ggml_tensor * t = it.second.tensor;
-            if (t != nullptr && ggml_n_dims(t) > 2 && t->ne[2] > 1 &&
-                it.first.find("_exps") != std::string::npos) {
+            if (t == nullptr) {
+                continue;
+            }
+            const bool is_exps = it.first.find("_exps") != std::string::npos;
+            if (is_exps && ggml_n_dims(t) > 2 && t->ne[2] > 1) {
                 has_experts = true;
-                break;
+            }
+            if (!is_exps && t->type == GGML_TYPE_Q8_0) {
+                dense_q8_bytes += (int64_t) ggml_nbytes(t);
             }
         }
-        ggml_set_model_has_expert_tensors(has_experts);
-        LLAMA_LOG_WARN("%s: model shape hint for the Q8_0 repack admission: %s 3D expert tensors\n",
-                       __func__, has_experts ? "found" : "no");
+        // E4 corruption fix, failure mode 2 (VRAM blowup): the conditional default also
+        // turns on the dual-layout canonical copy for yield-eligible dense Q8_0, which
+        // costs ~1x the dense Q8_0 bytes in extra VRAM. On small hybrid/graft/spec-draft
+        // models (a 4.1GB spec-decode draft with 1.45GB dense Q8_0) that overhead is
+        // material and OOMs the load on top of the main model. The repack win was only
+        // ever measured on models with GB-scale dense Q8_0, so require a minimum before
+        // defaulting ON. Env GGML_CUDA_REPACK_Q8_0_MIN_DENSE overrides in bytes (0 = off).
+        static const int64_t min_dense_q8_bytes = [] () {
+            const char * e = getenv("GGML_CUDA_REPACK_Q8_0_MIN_DENSE");
+            return e != nullptr ? (int64_t) strtoll(e, nullptr, 10)
+                                : (int64_t) 2 * 1024 * 1024 * 1024;
+        }();
+        // E4 corruption fix, failure mode 1 (MLA and grafted-MoE shapes): the
+        // repack win was only ever validated on TENSOR-split geometry, where the
+        // repacked kernels run on row-split views spliced from a repacked base
+        // (repack_view_get_cached). On LAYER-split models the kernels run directly on
+        // full tensors and both E4 corruption victims produce garbage - the direct
+        // full-tensor path is not
+        // validated. The conditional default therefore only latches ON for
+        // LLAMA_SPLIT_MODE_TENSOR; GGML_CUDA_REPACK_Q8_0=1 still forces admission
+        // for A/B at the operator's own risk.
+        const bool tensor_split = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
+        const bool hint = has_experts && dense_q8_bytes >= min_dense_q8_bytes && tensor_split;
+        ggml_set_model_has_expert_tensors(hint);
+        LLAMA_LOG_WARN("%s: model shape hint for the Q8_0 repack admission: %s 3D expert tensors, dense Q8_0 %.2f GiB (min %.2f GiB), split_mode %s: gate %s\n",
+                       __func__, has_experts ? "found" : "no",
+                       (double) dense_q8_bytes / (1024.0*1024.0*1024.0),
+                       (double) min_dense_q8_bytes / (1024.0*1024.0*1024.0),
+                       tensor_split ? "tensor" : "non-tensor",
+                       hint ? "ON" : "OFF");
     }
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
@@ -2588,6 +2621,29 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             }
         }
     }
+    // E4 corruption fix, failure mode 1 (MLA models): 3D tensors that are not FFN
+    // experts (MLA attn_k_b/attn_v_b) reach the DENSE repacked dispatch, which has no
+    // per-i2 slice offset -- every head reads slice 0 of the repacked record -> garbage
+    // MLA K/V and corrupted chat output. The repack buft cannot serve them until the
+    // dense dispatch learns per-slice offsets; keep them canonical. _exps-named tensors are excluded: they are served by
+    // mul_mat_id (and stay canonical by default via GGML_CUDA_MOE_CANONICAL above).
+    if (layer_dev != nullptr && tn.str().find("_exps") == std::string::npos) {
+        const auto wit3d = ml.weights_map.find(tn.str());
+        const ggml_tensor * t3d = (wit3d != ml.weights_map.end()) ? wit3d->second.tensor : nullptr;
+        const bool is_3d_dense = t3d != nullptr
+            ? (ggml_n_dims(t3d) > 2 && t3d->ne[2] > 1)
+            : (ne.size() > 2 && ne.begin()[2] > 1);
+        if (is_3d_dense) {
+            buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+            static bool s_3d_dense_plain_logged = false;
+            if (!s_3d_dense_plain_logged) {
+                s_3d_dense_plain_logged = true;
+                LLAMA_LOG_WARN("%s: 3D non-expert tensor %s kept canonical (dense repack has no per-slice offset)\n",
+                               __func__, tn.str().c_str());
+            }
+        }
+    }
+
     // The gather table is an input-class tensor, so it normally lands on the CPU and
     // is read lazily. Sharding it means putting it back in VRAM across the TP group,
     // which also means dropping the lazy flag - there is no file mapping to page from
