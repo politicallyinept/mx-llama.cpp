@@ -37,19 +37,22 @@ bool repack_sumw_plane_on() {
     return s_on;
 }
 
-// Resolve the Q8_0 repack admission: an explicit GGML_CUDA_REPACK_Q8_0 override wins
-// (=1 forces on even for dense, =0 forces off even for MoE); otherwise the default is
-// MoE-conditional - admit only when the loaded model has 3D expert tensors (see the
-// admission comment below and ggml_model_has_expert_tensors).
+// Resolve the Q8_0 repack admission: opt-in. An explicit GGML_CUDA_REPACK_Q8_0=1
+// forces admission ON (dense included), =0 forces it OFF; with no env the gate is
+// OFF. The MoE-conditional default (admit when the loaded model has 3D expert
+// tensors, see ggml_model_has_expert_tensors) is reverted to opt-in: the RESTYLE
+// GEMM was never wired at the repacked GEMM dispatch sites (they hardcode the
+// original repacked instantiation), so the repacked prefill GEMM accumulates
+// differently from stock on the shapes the gcn_kq yield declines (9..31-token
+// prefill etc) and the MoE-conditional default is not bit-safe until the GEMM
+// restyle is real. The loader still latches the shape hint (llama-model.cpp); it
+// does not gate admission while the default is opt-in.
 static bool q8_0_repack_admitted(void) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
         return e == nullptr ? 0 : (atoi(e) != 0 ? 1 : -1);
     }();
-    if (env != 0) {
-        return env > 0;
-    }
-    return ggml_model_has_expert_tensors();
+    return env > 0;
 }
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
@@ -103,29 +106,31 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         }
         return off;
     }();
-    // Q8_0 admission: MoE-conditional by default. The repacked Q8_0 path (with the
-    // RESTYLE stock-granularity kernels and the gcn_kq yield) is bit-identical to the
-    // stock path and measured +1.3..+1.5% decode on MoE models, but a net regression
-    // on a dense all-Q8_0 model (-1.6% decode, -8.4% prefill, +24 GB VRAM for the
-    // dual-layout canon copy) - the win is MoE-shaped. With no explicit env, Q8_0 is
-    // therefore admitted only when the loaded model has 3D expert tensors (the
-    // structural feature separating the winning MoE legs from the losing dense leg);
-    // the hint is latched by the model loader before any weight buffer is allocated
-    // (ggml_model_has_expert_tensors). GGML_CUDA_REPACK_Q8_0=1 forces admission ON
-    // (dense included); =0 forces it OFF (MoE included). History: the path was
-    // default-ON pre-RESTYLE, flipped to opt-in after a decode-regression finding on
-    // the pre-RESTYLE kernels, and is now the MoE-conditional default on top of the
-    // RESTYLE bit-identical kernels.
+    // Q8_0 admission: OPT-IN (GGML_CUDA_REPACK_Q8_0=1). The repacked Q8_0 path
+    // (mat-vec restyled to stock granularity + the gcn_kq yield) is bit-identical
+    // to the stock path on the shapes it covers and measured +1.3..+1.5% decode on
+    // MoE models, but a net regression on a dense all-Q8_0 model (-1.6% decode,
+    // -8.4% prefill, +24 GB VRAM for the dual-layout canon copy). History: the
+    // path was default-ON pre-RESTYLE, flipped to opt-in after a decode-regression
+    // finding on the pre-RESTYLE kernels, briefly shipped as a MoE-conditional
+    // default (admit when the loaded model has 3D expert tensors), and is back to
+    // opt-in: the RESTYLE GEMM is not wired at the repacked GEMM dispatch sites,
+    // so the repacked prefill GEMM is not bit-identical to stock on the shapes the
+    // gcn_kq yield declines (9..31-token prefill etc). The MoE-conditional default
+    // returns once the GEMM restyle is real. GGML_CUDA_REPACK_Q8_0=1 forces
+    // admission ON (dense included, with STOCK_ACC=0); =0 forces it OFF.
     //
     // The repack is a layout repack of the 8-bit weights (dp4a-friendly row +
     // scale-plane layout); without RESTYLE the accumulation order differs from stock
     // - see the STOCK_ACC gate below for the divergence map and the neutral fallback.
-    // Tier-3.3 stock-accumulation kill switch: GGML_CUDA_REPACK_Q8_0_STOCK_ACC=1
-    // pins Q8_0 matmuls to STOCK accumulation order (Q8_0 stays canonical, repack
-    // suppressed). Default OFF now that the RESTYLE kernels reproduce the stock
-    // accumulation order and granularity on the repacked layout (bit-identical
-    // greedy output on the validated MoE and dense legs); =1 restores the
-    // numerics-neutral fallback for A/B.
+    // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC defaults ON
+    // (the pre-ship posture): Q8_0 matmuls stay on STOCK accumulation order (Q8_0
+    // stays canonical, repack suppressed). The RESTYLE mat-vec kernels reproduce the
+    // stock accumulation order and granularity on the repacked layout, but the GEMM
+    // restyle is not wired at the dispatch sites, so the repacked prefill GEMM is
+    // not bit-identical to stock on the shapes the gcn_kq yield declines - the
+    // default stays stock until that lands. =0 opts into the repack path (together
+    // with GGML_CUDA_REPACK_Q8_0=1) for A/B and for the validated MoE decode win.
     //
     // Divergence map (adopt-gdn-rows): the weight repack itself is lossless -
     // block_q8_0 carries a ggml_half d (ggml-common.h:253) and both planes are
@@ -163,7 +168,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // matmul as stock - no extra passes.
     static const bool s_q8_0_stock_acc = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0_STOCK_ACC");
-        const bool on = e != nullptr && atoi(e) != 0;
+        const bool on = e == nullptr || atoi(e) != 0;
         if (on) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_STOCK_ACC gate ACTIVE: Q8_0 stays canonical, stock accumulation (repack suppressed for Q8_0)\n");
         }
@@ -173,7 +178,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
         case GGML_TYPE_Q8_0: {
             const bool adm = q8_0_repack_admitted() && !s_q8_0_stock_acc;
             static const bool s_banner = [&] {
-                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s: Q8_0 %s the gfx906 repack path (MoE-conditional default)\n",
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s: Q8_0 %s the gfx906 repack path (opt-in default)\n",
                               adm ? "ACTIVE" : "inactive", adm ? "admitted to" : "stays canonical for");
                 return true;
             }();

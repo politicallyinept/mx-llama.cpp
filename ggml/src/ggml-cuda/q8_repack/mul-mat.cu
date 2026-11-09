@@ -25,26 +25,33 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
 
 // E4/Q8_0 restyle gate (2026-11-06, RESTYLE8 rev): GGML_CUDA_REPACK_Q8_0_RESTYLE=1
 // selects the stock-granularity accumulation on the repacked two-plane layout:
-//  * decode MMV: mul_mat_vec_q8_0_repacked8 (NEW) - 4 scaled fp32 terms per
+//  * decode MMV: mul_mat_vec_q8_0_repacked8 - 4 scaled fp32 terms per
 //    32-value block (2 dp4a per 8-value chunk, VDR_Q8_0_Q8_1_MMVQ=2) with the
 //    stock mmvq (block,quarter) partition (kbx=tid/4, kqs=2*(tid%4)), 64-lane
 //    x 2-wave launch and the shared-partial + 64-lane shfl reduce tree. This
 //    replaces the 409412b97d single-term-per-block form (which was the third
 //    quantization between stock's 4 terms and the old repack's 2, and its
 //    8-dp4a serial chain cost 12.4% decode).
-//  * prefill GEMM: mmq_gemm_repacked<..., RESTYLE=true> - the Q8_0 dot chains
-//    its 8 dp4a in stock int order 0..7 (mmq-vec-dot.cuh:137-148) instead of
-//    the shipped lo/hi interleave.
-// Default ON (perf flag): the restyled kernels reproduce the stock accumulation
-// order and granularity on the repacked layout - bit-identical greedy output on the
-// validated MoE and dense legs at a decode win. GGML_CUDA_REPACK_Q8_0_RESTYLE=0 is
-// the kill switch: today's per-half-block MMV terms + interleaved GEMM dot.
+//  * nc verify (2..8 tokens): mul_mat_vec_q8_0_repacked8_nc - same stock
+//    granularity, one row per block, the batch width as the column tile.
+//  * prefill GEMM: NOT WIRED. The mmq_gemm_repacked RESTYLE template branch (the
+//    Q8_0 dot chains its 8 dp4a in stock int order 0..7, mmq-vec-dot.cuh:137-148)
+//    exists in the kernel, but the GEMM dispatch sites hardcode the original
+//    repacked instantiation (RESTYLE=false), so prefill on the repack path runs
+//    the original accumulation - not bit-identical to stock on the shapes the
+//    gcn_kq yield declines. Repacked-GEMM bit-safety is NOT established; that is
+//    why GGML_CUDA_REPACK_Q8_0_STOCK_ACC defaults ON (repack suppressed by
+//    default) and the Q8_0 admission is opt-in.
+// Default ON: the restyled mat-vec kernels reproduce the stock accumulation order
+// and granularity on the repacked layout (bit-identical decode/verify at a decode
+// win). GGML_CUDA_REPACK_Q8_0_RESTYLE=0 is the kill switch: the per-half-block
+// MMV terms + interleaved GEMM dot.
 static bool rp_q8_0_restyle_on(void) {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0_RESTYLE");
         const bool r = e == nullptr || atoi(e) != 0;
         if (r) {
-            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_RESTYLE gate ACTIVE: repacked Q8_0 MMV uses one fp32 term per 32-value block\n");
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_RESTYLE gate ACTIVE: repacked Q8_0 mat-vec uses four scaled fp32 terms per 32-value block (stock granularity); GEMM restyle not wired\n");
         }
         return r;
     }();
