@@ -1692,18 +1692,33 @@ void ggml_free(struct ggml_context * ctx) {
     GGML_FREE(ctx);
 }
 
-// Model-shape hint storage (see ggml.h): latched on the first call. Model load is
-// single-threaded at the call site, so a plain static is sufficient.
-static int ggml_model_has_experts_hint = -1;  // -1 unset, 0 dense, 1 has 3D expert tensors
+// Model-shape hint storage (see ggml.h): stored on each weight tensor, so every
+// model in a multi-model process carries its own value. Model load is
+// single-threaded at the call site, so plain fields are sufficient.
+void ggml_tensor_set_model_has_expert_tensors(struct ggml_tensor * t, bool has_experts) {
+    if (t == NULL) {
+        return;
+    }
+    t->model_has_experts_hint = has_experts ? 1 : 0;
+}
 
-void ggml_set_model_has_expert_tensors(bool has_experts) {
-    if (ggml_model_has_experts_hint == -1) {
-        ggml_model_has_experts_hint = has_experts ? 1 : 0;
+void ggml_ctx_set_model_has_expert_tensors(struct ggml_context * ctx, bool has_experts) {
+    if (ctx == NULL) {
+        return;
+    }
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        t->model_has_experts_hint = has_experts ? 1 : 0;
     }
 }
 
-bool ggml_model_has_expert_tensors(void) {
-    return ggml_model_has_experts_hint > 0;
+bool ggml_tensor_model_has_expert_tensors(const struct ggml_tensor * t) {
+    while (t != NULL) {
+        if (t->model_has_experts_hint != -1) {
+            return t->model_has_experts_hint > 0;
+        }
+        t = t->view_src;
+    }
+    return false;
 }
 
 size_t ggml_used_mem(const struct ggml_context * ctx) {
@@ -1863,6 +1878,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
+        /*.model_has_experts_hint =*/ -1,
         /*.padding      =*/ { 0 },
     };
 

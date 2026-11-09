@@ -591,9 +591,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // the SET_ROWS split-state match aborts on the first decode (gemma4 12B, n_head_kv=1,
     // ggml_backend_meta_get_split_state handle_set_rows). Mirror the attention (design A)
     // like the MLA archs above; the FFN and the output head still split.
-    uint32_t n_head_kv_min = hparams.n_head_kv();
+    // Take the min over NONZERO entries: hybrid models whose recurrent layers carry no
+    // KV store 0 there, and a 0 in the min would zero the result and silently skip the
+    // replication the attention layers still need. If no layer has any KV heads there is
+    // nothing to head-split and no replication is needed.
+    uint32_t n_head_kv_min = 0;
     for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
-        n_head_kv_min = std::min(n_head_kv_min, hparams.n_head_kv(il));
+        const uint32_t n_head_kv_il = hparams.n_head_kv(il);
+        if (n_head_kv_il > 0 && (n_head_kv_min == 0 || n_head_kv_il < n_head_kv_min)) {
+            n_head_kv_min = n_head_kv_il;
+        }
     }
     const bool mqa_cannot_head_split = tp_width_eff > 1 &&
                                        n_head_kv_min > 0 &&
@@ -2039,8 +2046,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Q8_0 repack admission shape hint: scan the loaded weights for 3D expert
     // tensors (ne[2] > 1) before any weight buffer is allocated, so the CUDA repack
     // admission can default Q8_0 repacking ON for MoE models (measured decode win,
-    // bit-identical) and OFF for dense models (measured regression). The hint
-    // latches on the first model load in the process; see ggml.h.
+    // bit-identical) and OFF for dense models (measured regression). The value is
+    // PER MODEL: it is stamped on every context that owns this model's weight tensors
+    // below (see ggml.h), so a multi-model process (MoE main + small spec-decode
+    // draft) never admits the draft with the main model's value.
+    bool q8_repack_shape_hint = false;
     {
         bool has_experts = false;
         int64_t dense_q8_bytes = 0;
@@ -2080,7 +2090,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // for A/B at the operator's own risk.
         const bool tensor_split = params.split_mode == LLAMA_SPLIT_MODE_TENSOR;
         const bool hint = has_experts && dense_q8_bytes >= min_dense_q8_bytes && tensor_split;
-        ggml_set_model_has_expert_tensors(hint);
+        q8_repack_shape_hint = hint;
         LLAMA_LOG_WARN("%s: model shape hint for the Q8_0 repack admission: %s 3D expert tensors, dense Q8_0 %.2f GiB (min %.2f GiB), split_mode %s: gate %s\n",
                        __func__, has_experts ? "found" : "no",
                        (double) dense_q8_bytes / (1024.0*1024.0*1024.0),
@@ -2413,6 +2423,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
         ggml_context * ctx = ctx_ptr.get();
+
+        // Stamp this model's Q8_0 repack shape hint on every context that owns its
+        // weight tensors, before any of its buffers are allocated: the CUDA repack
+        // admission reads it per tensor at buffer creation and at dispatch, so each
+        // model in a multi-model process is admitted by its own shape (see ggml.h).
+        ggml_ctx_set_model_has_expert_tensors(ctx, q8_repack_shape_hint);
 
         // skip contexts without tensors
         if (ggml_get_first_tensor(ctx) == nullptr) {

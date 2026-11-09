@@ -1759,6 +1759,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             t_ij->nb[i] = nb[i];
         }
         t_ij->flags = tensor->flags;
+        // Per-model shape hint: the lane tensor must carry the owning model's value
+        // (stamped on the base tensor by the model loader) so the CUDA repack
+        // admission - consulted at lane-buffer get_alloc_size, set_tensor upload and
+        // dispatch - sees the model these tensors belong to, not whatever model
+        // loaded first in the process.
+        t_ij->model_has_experts_hint = tensor->model_has_experts_hint;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
 
         // A row-sharded gather (see handle_get_rows) needs the global row where this

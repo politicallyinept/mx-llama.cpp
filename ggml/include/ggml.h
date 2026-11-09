@@ -713,7 +713,10 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        // per-model shape hint for backend weight-layout admission (fork extension):
+        // -1 unset, 0 dense, 1 has 3D expert tensors. See the hint API below.
+        int  model_has_experts_hint;
+        char padding[4];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
@@ -825,13 +828,21 @@ extern "C" {
     GGML_API void                  ggml_free (struct ggml_context * ctx);
 
     // Model-shape hint for backend weight-layout admission (fork extension). The
-    // model loader calls ggml_set_model_has_expert_tensors() once per model load,
-    // before any weight buffer is allocated, with has_experts = the model contains
-    // 3D expert tensors (ne[2] > 1). The first call per process latches the value;
-    // backends consult ggml_model_has_expert_tensors() for shape-conditional layout
-    // defaults (currently: the CUDA Q8_0 repack admission).
-    GGML_API void ggml_set_model_has_expert_tensors(bool has_experts);
-    GGML_API bool ggml_model_has_expert_tensors(void);
+    // hint is PER-MODEL: the model loader stamps it on every weight tensor of a
+    // model (ggml_ctx_set_model_has_expert_tensors stamps all tensors of a context)
+    // before any of that model's buffers are allocated, so a multi-model process
+    // (MoE main + small spec-decode draft) admits each model's weights by that
+    // model's own shape. A process-global latch let a MoE main admit a later-loaded
+    // small draft's Q8_0 weights to a layout the draft's own shape check declined -
+    // the buffer-doubling OOM on small drafts.
+    //
+    // Backends consult ggml_tensor_model_has_expert_tensors() at buffer creation
+    // and at dispatch; it follows the view chain and reports false for tensors that
+    // carry no hint (unset) or whose model declined admission. The meta backend
+    // copies the value from the base tensor onto each per-lane tensor it creates.
+    GGML_API void ggml_ctx_set_model_has_expert_tensors(struct ggml_context * ctx, bool has_experts);
+    GGML_API void ggml_tensor_set_model_has_expert_tensors(struct ggml_tensor * t, bool has_experts);
+    GGML_API bool ggml_tensor_model_has_expert_tensors(const struct ggml_tensor * t);
 
     GGML_API size_t  ggml_used_mem(const struct ggml_context * ctx);
 

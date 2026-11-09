@@ -12,6 +12,7 @@ static const w4a4_profile_detail::w4a4_profile_init s_w4a4_profile_init;
 
 #include <cstdlib>
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -39,9 +40,12 @@ bool repack_sumw_plane_on() {
 
 // Resolve the Q8_0 repack admission: an explicit GGML_CUDA_REPACK_Q8_0 override wins
 // (=1 forces on even for dense, =0 forces off even for MoE); otherwise the default is
-// MoE-conditional - admit only when the loaded model has 3D expert tensors (see the
-// admission comment below and ggml_model_has_expert_tensors).
-static bool q8_0_repack_admitted(void) {
+// MoE-conditional - admit only when the tensor's own model has 3D expert tensors
+// (see the admission comment below and ggml_tensor_model_has_expert_tensors). The
+// hint is per-model on purpose: in a multi-model process (MoE main + small
+// spec-decode draft) each model's weights are admitted by their own model's shape,
+// never by whatever model loaded first.
+static bool q8_0_repack_admitted(const ggml_tensor * t) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
         return e == nullptr ? 0 : (atoi(e) != 0 ? 1 : -1);
@@ -49,7 +53,7 @@ static bool q8_0_repack_admitted(void) {
     if (env != 0) {
         return env > 0;
     }
-    return ggml_model_has_expert_tensors();
+    return ggml_tensor_model_has_expert_tensors(t);
 }
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
@@ -110,8 +114,9 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // dual-layout canon copy) - the win is MoE-shaped. With no explicit env, Q8_0 is
     // therefore admitted only when the loaded model has 3D expert tensors (the
     // structural feature separating the winning MoE legs from the losing dense leg);
-    // the hint is latched by the model loader before any weight buffer is allocated
-    // (ggml_model_has_expert_tensors). GGML_CUDA_REPACK_Q8_0=1 forces admission ON
+    // the hint is latched per model by the model loader before any of that model's
+    // weight buffers are allocated (ggml_tensor_model_has_expert_tensors).
+    // GGML_CUDA_REPACK_Q8_0=1 forces admission ON
     // (dense included); =0 forces it OFF (MoE included). History: the path was
     // default-ON pre-RESTYLE, flipped to opt-in after a decode-regression finding on
     // the pre-RESTYLE kernels, and is now the MoE-conditional default on top of the
@@ -171,13 +176,17 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }();
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
-            const bool adm = q8_0_repack_admitted() && !s_q8_0_stock_acc;
-            static const bool s_banner = [&] {
-                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s: Q8_0 %s the gfx906 repack path (MoE-conditional default)\n",
-                              adm ? "ACTIVE" : "inactive", adm ? "admitted to" : "stays canonical for");
-                return true;
-            }();
-            (void) s_banner;
+            const bool adm = q8_0_repack_admitted(t) && !s_q8_0_stock_acc;
+            // The admission is per-model, so log whenever the resolved value CHANGES
+            // (e.g. ACTIVE for a MoE main, inactive for a small draft loaded after it
+            // in the same process) instead of a once-per-process banner that would
+            // only ever show the first model's decision.
+            static std::atomic<int> s_banner_adm(-1);
+            const int adm_now = adm ? 1 : 0;
+            if (s_banner_adm.exchange(adm_now) != adm_now) {
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s'): Q8_0 %s the gfx906 repack path (per-model MoE-conditional default)\n",
+                              adm ? "ACTIVE" : "inactive", ggml_get_name(t), adm ? "admitted to" : "stays canonical for");
+            }
             return adm && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_MXFP4:
