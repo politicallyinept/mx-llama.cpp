@@ -60,7 +60,8 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_DISABLE_FUSION` | OFF | kill switch: disables the whole CUDA fusion-matcher pass | upstream llama.cpp |
 | `GGML_CUDA_REPACK_KQUANT` | ON (`=0` off) | repacks Q4_K/Q5_K/Q6_K into the GEMM-friendly layout; `=0` keeps canonical layout (stock path) for A/B | gcn-repro A/B lane |
 | `GGML_CUDA_REPACK_KQUANT_MOE_FUSION` | ON (`=0` off) | admits K-quant/IQ4_NL expert tensors to the repacked MoE up/gate mat-vec fusion | repack MoE-fusion lane |
-| `GGML_CUDA_REPACK_Q8_0` | MoE-conditional (`=1` force on, `=0` force off) | admits Q8_0 weights to the gfx906 repack path. Default follows the model shape: ON only when the loaded model has 3D expert tensors (MoE: +1.3..1.5% decode, bit-identical to stock), OFF for dense models (dense repack measured -1.6% decode / -8.4% prefill at +24 GB VRAM). `=1` forces admission on for dense models too; `=0` forces it off even for MoE | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0` | MoE-conditional (`=1` force on, `=0` force off) | admits Q8_0 weights to the gfx906 repack path. Default follows the model shape: ON only when the loaded model has 3D expert tensors (MoE: +1.3..1.5% decode, bit-identical to stock), its non-expert Q8_0 total reaches the `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` floor, and the run uses tensor split; OFF for dense models (dense repack measured -1.6% decode / -8.4% prefill at +24 GB VRAM) and under layer split (the repacked dispatch is only validated on tensor-split view geometry). 3D non-expert tensors (MLA attn_k_b/attn_v_b) always stay canonical: the dense repacked dispatch has no per-slice offset. `=1` forces admission on regardless of shape; `=0` forces it off | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` | 2 GiB (bytes) | floor for the MoE-conditional default: models whose non-expert Q8_0 total is below this keep the gate OFF (the dual-layout canonical copy costs ~1x those bytes in extra VRAM and OOMs small hybrid/graft/spec-draft models); `=0` removes the floor | q8_0-repack E4 lane |
 | `GGML_CUDA_REPACK_Q8_0_RESTYLE` | ON (`=0` off) | repacked Q8_0 mat-vec/GEMM reproduce the stock accumulation order and granularity on the repacked layout (bit-identical greedy output at a decode win); `=0` restores the pre-RESTYLE kernels | q8_0-repack E4 lane |
 | `GGML_CUDA_REPACK_Q8_0_YIELD` | ON (`=0` off) | dense Q8_0 prefill GEMMs admitted by the gcn_kq gate yield to the gcn_kq v4 kernel via the canonical copy kept next to the repacked record; inert unless Q8_0 is admitted | q8_0-repack E4 lane |
 | `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | OFF (`=1` on) | numerics-neutral kill switch: pins Q8_0 matmuls to stock accumulation order (Q8_0 stays canonical, repack suppressed) even when admitted; the A/B fallback from before the RESTYLE kernels | anchor3 consolidation |
@@ -79,6 +80,19 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_ASYNC_CKPT` | ON (`=0` off) | async recurrent-state checkpoint capture in the server (sync deferred to next synchronize) | fork server work (staging robustness under further investigation) |
 | `GGML_CUDA_GDN_CONV_SCATTER` | ON (`=0` off) | GDN conv-state ring written by direct kernel-side scatter instead of a gather+copy | mtp-pipe (default ON) |
 | `LLAMA_MTP_FAST_SAMPLE` | ON (`=0` off) | MTP draft skips backend top-k chain construction and samples directly | mtp-pipe (default ON) |
+
+### Tensor-parallel attention replication (single-KV-head models)
+
+Under `-sm tensor` the KV cache is head-split across the TP group. Models whose
+attention layers carry fewer KV heads than TP lanes (MQA, `n_head_kv = 1`; this
+includes hybrid archs where only every Nth layer is full attention) cannot be
+head-split: the cache split degenerates (one lane owns all rows, the others
+none) and the KV-cache SET_ROWS split-state check aborts on the first decode.
+Such models are now detected at load and routed through the MLA-class attention
+replication: attention weights and KV caches mirror on every lane while the FFN
+and output head still split. The load log prints "N KV heads cannot be split
+across M TP lanes, replicating attention". Models with head-splitable KV
+(min `n_head_kv` >= TP width) are untouched.
 
 ### Speculative-decode serving guidance (draft depth)
 
