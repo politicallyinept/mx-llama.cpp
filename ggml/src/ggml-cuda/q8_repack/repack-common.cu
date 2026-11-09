@@ -12,6 +12,7 @@ static const w4a4_profile_detail::w4a4_profile_init s_w4a4_profile_init;
 
 #include <cstdlib>
 
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -40,13 +41,14 @@ bool repack_sumw_plane_on() {
 // Resolve the Q8_0 repack admission: opt-in. An explicit GGML_CUDA_REPACK_Q8_0=1
 // forces admission ON (dense included), =0 forces it OFF; with no env the gate is
 // OFF. The MoE-conditional default (admit when the loaded model has 3D expert
-// tensors, see ggml_model_has_expert_tensors) is reverted to opt-in: the RESTYLE
-// GEMM was never wired at the repacked GEMM dispatch sites (they hardcode the
-// original repacked instantiation), so the repacked prefill GEMM accumulates
-// differently from stock on the shapes the gcn_kq yield declines (9..31-token
-// prefill etc) and the MoE-conditional default is not bit-safe until the GEMM
-// restyle is real. The loader still latches the shape hint (llama-model.cpp); it
-// does not gate admission while the default is opt-in.
+// tensors; the shape hint is per model: ggml_tensor_model_has_expert_tensors) is
+// reverted to opt-in: the RESTYLE GEMM was never wired at the repacked GEMM
+// dispatch sites (they hardcode the original repacked instantiation), so the
+// repacked prefill GEMM accumulates differently from stock on the shapes the
+// gcn_kq yield declines (9..31-token prefill etc) and the MoE-conditional default
+// is not bit-safe until the GEMM restyle is real. The loader still stamps the
+// shape hint per model (llama-model.cpp); it does not gate admission while the
+// default is opt-in.
 static bool q8_0_repack_admitted(void) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
@@ -177,12 +179,16 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
             const bool adm = q8_0_repack_admitted() && !s_q8_0_stock_acc;
-            static const bool s_banner = [&] {
-                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s: Q8_0 %s the gfx906 repack path (opt-in default)\n",
-                              adm ? "ACTIVE" : "inactive", adm ? "admitted to" : "stays canonical for");
-                return true;
-            }();
-            (void) s_banner;
+            // The gate decision is logged whenever it CHANGES (per-model shape hints
+            // can differ between models in one process: MoE main + small spec-decode
+            // draft), so the log shows each model's own admission instead of a
+            // once-per-process banner that would only ever show the first decision.
+            static std::atomic<int> s_banner_adm(-1);
+            const int adm_now = adm ? 1 : 0;
+            if (s_banner_adm.exchange(adm_now) != adm_now) {
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s'): Q8_0 %s the gfx906 repack path (opt-in default)\n",
+                              adm ? "ACTIVE" : "inactive", ggml_get_name(t), adm ? "admitted to" : "stays canonical for");
+            }
             return adm && t->ne[0] % 32 == 0;
         }
         case GGML_TYPE_MXFP4:
