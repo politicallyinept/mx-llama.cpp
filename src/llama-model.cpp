@@ -2584,6 +2584,17 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr :
         layer_dev != nullptr ? layer_dev->buft_list : pimpl->dev_output.buft_list;
 
+    // The plain (canonical) per-device buft lists are built only for the GPU
+    // devices. With partial offload (-ngl below the layer count) a layer can be
+    // CPU-resident: its tensors are already canonical on the CPU buft list and
+    // there is no plain GPU entry to switch to. Look the device up instead of
+    // .at() and leave the layer's own buft list untouched when the layer is
+    // not on a GPU device (fixes a std::out_of_range load failure).
+    auto plain_gpu_buft_list = [&](ggml_backend_dev_t dev) -> const buft_list_t * {
+        const auto it = pimpl->gpu_buft_list_plain.find(dev);
+        return it == pimpl->gpu_buft_list_plain.end() ? nullptr : &it->second;
+    };
+
     // DSV4 splits shared-expert up/gate rows across the TP group. Below 512
     // rows per lane the gfx906 repacked MMV loses to the canonical kernel;
     // TPS4 lands exactly at 512 while TPS8 lands at 256 for this model.
@@ -2593,7 +2604,9 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         (tn.tensor == LLM_TENSOR_FFN_GATE_SHEXP || tn.tensor == LLM_TENSOR_FFN_UP_SHEXP) &&
         (size_t) ne.begin()[1] / tp_width < 512;
     if (narrow_shexp) {
-        buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+        if (const buft_list_t * plain = plain_gpu_buft_list(layer_dev->dev)) {
+            buft_list_layer = plain;
+        }
     }
     // c2c3 C3: MoE expert tensors can stay canonical (skip the repack buffer) so the
     // CV-ported mul_mat_vec_q_moe row-lane kernels serve verify-width expert matvecs;
@@ -2621,7 +2634,9 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         const bool moe_canonical = s_moe_canonical_env == 1 ||
             (s_moe_canonical_env < 0 && exps_type != GGML_TYPE_Q4_0);
         if (moe_canonical) {
-            buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+            if (const buft_list_t * plain = plain_gpu_buft_list(layer_dev->dev)) {
+                buft_list_layer = plain;
+            }
             static bool s_moe_canonical_logged_on = false;
             if (!s_moe_canonical_logged_on) {
                 s_moe_canonical_logged_on = true;
@@ -2652,7 +2667,9 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             ? (ggml_n_dims(t3d) > 2 && t3d->ne[2] > 1)
             : (ne.size() > 2 && ne.begin()[2] > 1);
         if (is_3d_dense) {
-            buft_list_layer = &pimpl->gpu_buft_list_plain.at(layer_dev->dev);
+            if (const buft_list_t * plain = plain_gpu_buft_list(layer_dev->dev)) {
+                buft_list_layer = plain;
+            }
             static bool s_3d_dense_plain_logged = false;
             if (!s_3d_dense_plain_logged) {
                 s_3d_dense_plain_logged = true;
