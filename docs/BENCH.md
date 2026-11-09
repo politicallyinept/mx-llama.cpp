@@ -2741,3 +2741,39 @@ lossless spec decode; no action needed, noted for the record.
 
 Serving guidance for draft depth: np <= 2 -> `--spec-draft-n-max 2`; np >= 3 ->
 speculative decode off or `n_max 1`; mixed concurrency -> `n_max 1`.
+
+## 93. HOTFIX: STOCK_ACC default restored ON, Q8_0 repack admission back to opt-in (2026-11-09, hotfix/stockacc-restore)
+
+Source review of the §92 ship found the RESTYLE GEMM was never wired at the
+repacked GEMM dispatch sites: the `ne11 >= 128` and w32 GEMM dispatches in
+`q8_repack/mul-mat.cu` hardcode the original repacked instantiation
+(`mmq_gemm_repacked<false, ...>` / `mmq_gemm_repacked_w32<false, ...>`); the
+RESTYLE template branch exists in `mmq_gemm_repacked_impl` but no call site
+enables it. Only the mat-vec paths (single-token MMV, nc verify 2..8) have
+runtime RESTYLE branches, and they launch the separate `repacked8` kernels.
+Consequence: prefill on the repack path always ran the ORIGINAL repacked GEMM,
+which accumulates differently from stock; the §92 yield-arm bit-identity holds
+only for the shapes gcn_kq admits, so the shipped MoE-conditional default was
+not bit-safe on the shapes the yield declines (9..31-token prefill etc). The
+§92 defaults-only greedy gate passed because the pinned probe did not exercise
+those shapes.
+
+Changes (this hotfix):
+* `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` default restored to ON (the pre-ship
+  posture): Q8_0 stays canonical, repack suppressed, stock accumulation - the
+  defaults are bit-safe again.
+* `GGML_CUDA_REPACK_Q8_0` admission is opt-in again (`=1`); the MoE-conditional
+  auto-admission is disabled by default (the loader shape hint still latches but
+  does not gate admission). The E4 MoE decode win is env-gated
+  (`REPACK_Q8_0=1 STOCK_ACC=0`) until the GEMM restyle is actually wired.
+* Stale RESTYLE banner text fixed: the repacked8 kernels use four scaled fp32
+  terms per 32-value block (stock 8-value-chunk granularity), not one; the
+  banner and gate comments now say so and state that the GEMM restyle is not
+  wired.
+* Dead code removed: the stage-1 `if constexpr (RESTYLE)` branch inside the old
+  `mul_mat_vec_q8_0_repacked` kernel (one fp32 term per block) was unreachable -
+  no call site ever passed the template argument - and contradicted the gate
+  semantics (the gate launches `mul_mat_vec_q8_0_repacked8` instead). The
+  template parameter and the branch are gone.
+* README flag table updated to the honest state (GEMM restyle NOT implemented;
+  repacked-GEMM bit-safety not established; STOCK_ACC default ON).

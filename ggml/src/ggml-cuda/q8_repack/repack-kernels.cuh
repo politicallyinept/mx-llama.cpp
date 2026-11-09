@@ -178,8 +178,7 @@ static __device__ __forceinline__ float rp_mmv_fusion_epilogue(
 #endif
 }
 
-template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false,
-          bool RESTYLE = false>
+template <int ROWS, int NWAVES, bool HAS_IDS, int LANES = 64, bool HAS_FUSION = false>
 static __global__ void mul_mat_vec_q8_0_repacked(
         const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq,
         float * __restrict__ y, const uint32_t ne0, const uint32_t ne1,
@@ -257,52 +256,13 @@ static __global__ void mul_mat_vec_q8_0_repacked(
     float acc = 0.0f;
     [[maybe_unused]] float acc_gate = 0.0f;
 
-    if constexpr (RESTYLE) {
-        // E4/Q8_0 restyle (2026-11-06, GGML_CUDA_REPACK_Q8_0_RESTYLE): one
-        // fp32 term per 32-value block, matching stock vec_dot_q8_0_q8_1's
-        // single d8_0*d8_1 scaling per block. The repacked qs plane stores
-        // each block as two contiguous 16-byte halves (repack_q8_0_kernel,
-        // buffer.cu:127-148), so a full block is w_row[2*sb] + w_row[2*sb+1]
-        // with scale d_row[sb]; the x side is the same q8_1 block (8 ints).
-        // The default path splits the block into two 16-value half-block
-        // terms; this branch runs 8 chained dp4a over the whole block.
-        const uint32_t sb_lo = (n_blocks * k_slice) / WPR;
-        const uint32_t sb_hi = (n_blocks * (k_slice + 1)) / WPR;
-        for (uint32_t sb = sb_lo + (uint32_t) lane; sb < sb_hi; sb += LANES) {
-            const uint4 * const wv = w_row + 2 * sb;
-            const int * const xv = reinterpret_cast<const int *>(xq[sb].qs);
-            const float dx = __low2float(xq[sb].ds);
-            const uint16_t db = d_row[sb] & rmask;
-            const float dw = __half2float(*reinterpret_cast<const __half *>(&db));
-            int idot = 0;
-            idot = ggml_cuda_dp4a((int) wv[0].x, xv[0], idot);
-            idot = ggml_cuda_dp4a((int) wv[0].y, xv[1], idot);
-            idot = ggml_cuda_dp4a((int) wv[0].z, xv[2], idot);
-            idot = ggml_cuda_dp4a((int) wv[0].w, xv[3], idot);
-            idot = ggml_cuda_dp4a((int) wv[1].x, xv[4], idot);
-            idot = ggml_cuda_dp4a((int) wv[1].y, xv[5], idot);
-            idot = ggml_cuda_dp4a((int) wv[1].z, xv[6], idot);
-            idot = ggml_cuda_dp4a((int) wv[1].w, xv[7], idot);
-            acc += dw * dx * (float) idot;
-            if constexpr (HAS_FUSION) {
-                if (use_gate) {
-                    const uint4 * const wgv = w_row_gate + 2 * sb;
-                    const uint16_t dgb = d_row_gate[sb] & rmask;
-                    const float dwg = __half2float(*reinterpret_cast<const __half *>(&dgb));
-                    int gdot = 0;
-                    gdot = ggml_cuda_dp4a((int) wgv[0].x, xv[0], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[0].y, xv[1], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[0].z, xv[2], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[0].w, xv[3], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[1].x, xv[4], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[1].y, xv[5], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[1].z, xv[6], gdot);
-                    gdot = ggml_cuda_dp4a((int) wgv[1].w, xv[7], gdot);
-                    acc_gate += dwg * dx * (float) gdot;
-                }
-            }
-        }
-    } else if constexpr (LANES < 64) {
+    // NOTE (hotfix stockacc-restore): the original stage-1 RESTYLE branch (one fp32
+    // term per 32-value block, added 2026-11-06) was removed from this kernel. It
+    // was dead code: no call site ever passed the RESTYLE template argument, and it
+    // contradicted the shipped gate semantics - GGML_CUDA_REPACK_Q8_0_RESTYLE now
+    // launches mul_mat_vec_q8_0_repacked8 / _nc (four scaled fp32 terms per block,
+    // stock granularity) instead of restyling this kernel in place.
+    if constexpr (LANES < 64) {
         const uint32_t n_half = n_blocks * 2;
         const uint32_t hb_lo  = (n_half * k_slice) / WPR;
         const uint32_t hb_hi  = (n_half * (k_slice + 1)) / WPR;
