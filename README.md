@@ -79,6 +79,11 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_CONCAT_SMALL` | OFF (`=1` on) | flat-grid short-row concat kernel | CV port |
 | `GGML_CUDA_ASYNC_CKPT` | ON (`=0` off) | async recurrent-state checkpoint capture in the server (sync deferred to next synchronize) | fork server work (staging robustness under further investigation) |
 | `GGML_CUDA_GDN_CONV_SCATTER` | ON (`=0` off) | GDN conv-state ring written by direct kernel-side scatter instead of a gather+copy | mtp-pipe (default ON) |
+| `GGML_CUDA_GDN_SNAP_SCATTER` | ON (`=0` off) | GDN decode ring-snapshot staging: the kernel scatters state snapshots straight into the rollback-cache rows instead of the VIEW->CONT->[RESHAPE]->SET_ROWS copy chain; byte-identical data movement | mtp-pipe (default ON) |
+| `GGML_CUDA_MOE_CANONICAL` | unset = ON for every expert type except Q4_0 (`=0` forces OFF for all types, `=1` forces ON for all types, A/B) | MoE expert weights stay canonical (skip the repack buft); `mul_mat_vec_q_moe` serves verify-width expert mat-vecs; sealed bit-identical on Q4_K-class experts | E4 lane (Q11 default flip) |
+| `LLAMA_MTP_MOE_KV_ONLY` | ON (`=0` escape hatch) | MTP draft prefill replay builds a store-only graph (fused wqkv GEMM + K/V norm + cache store; Q-norm/attention/wo/MoE FFN skipped - their outputs were discarded); draft KV bit-identical, replay 235 ms -> 42-65 ms | mtp-pipe P2 prefill lane |
+| `LLAMA_MTP_DEFERRED_REARM` | ON (`=0` escape hatch) | keeps the deferred-prefill accumulator alive across requests and re-arms it at the start of each new prompt prefill; required companion to `LLAMA_MTP_MOE_KV_ONLY` - without it deferred prefill covers only the first request | mtp-pipe P2 prefill lane |
+| `GGML_SCHED_STABLE_UID` | OFF in source (`=1` on; production profile sets 1) | keeps split-graph uids across rebuilds of a structurally identical graph (FNV-1a hash of node/leaf addresses, ops, counts, flags) so the meta token-graph cache warms despite the MTP draft alternating two shapes through one res arena | fork sched work |
 | `LLAMA_MTP_FAST_SAMPLE` | ON (`=0` off) | MTP draft skips backend top-k chain construction and samples directly | mtp-pipe (default ON) |
 
 ### Tensor-parallel attention replication (single-KV-head models)

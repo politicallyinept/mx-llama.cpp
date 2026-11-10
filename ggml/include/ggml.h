@@ -2917,6 +2917,15 @@ extern "C" {
     //   GGML_CGRAPH_FLAG_SPEC_VERIFY: the graph computes a speculative-decoding verify
     //   batch (a multi-token decode batch with outputs at every position), as opposed
     //   to a prompt chunk (single output) or a plain single-token decode.
+    //   KNOWN LIMITATION (reviewer-hygiene batch): the stamp is a batch-shape heuristic
+    //   (all positions produce output AND n_tokens > n_seqs). Perplexity batches
+    //   (all-logits prompt chunks) and embedding batches match that shape and are stamped
+    //   SPEC_VERIFY too; the graph builder has no signal that separates them from a verify
+    //   batch - they are structurally identical. Consumers must treat the flag as
+    //   "multi-token all-output batch", not "spec decode is running". Every current
+    //   consumer (GDN conv/state staging-fuse matchers, repacked MoE coal mat-vec) is a
+    //   byte-identical data-movement or layout choice additionally gated on its own
+    //   structural matcher, so the mislabel is semantically sloppy but output-neutral.
 #define GGML_CGRAPH_FLAG_SPEC_VERIFY 0x00000001u
 
     GGML_API void                 ggml_cgraph_set_flags(struct ggml_cgraph * cgraph, uint32_t flags);
