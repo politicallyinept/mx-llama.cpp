@@ -41,11 +41,11 @@ The compute itself completed — dispatch banners print before the fault.
 
 ## Two real follow-ups
 
-1. **Latent bug (unfixed):** `ggml_backend_tensor_get()` calls
-   `buft->iface.get_tensor` without a null check. Any future caller reading a
-   repack-buft tensor gets a SIGSEGV instead of a clean error. Fix = null
-   guard: log once and return without copying (or GGML_ABORT with a clear
-   message).
+1. **Latent bug (FIXED in `fbf572e1e`):** `ggml_backend_tensor_get()` used to call
+   `buft->iface.get_tensor` without a null check; any caller reading a repack-buft
+   tensor got a SIGSEGV (rip=0x0) instead of a clean error. Fixed: the guard now
+   `GGML_ABORT`s with the tensor op and buffer name (production never reads
+   repack-buft tensors, so no behavior change on supported paths).
 2. **Diagnostic lesson:** tail-call frames made gdb attribute the fault to
    `run_dump` rather than `ggml_backend_tensor_get`. When a fault frame is
    `0x0 in ?? ()`, check the *return address* of the calling frame before

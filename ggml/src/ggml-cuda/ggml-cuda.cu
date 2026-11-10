@@ -4333,18 +4333,26 @@ static int ggml_cuda_try_gdn_cache_scatter(
         cache->nb[1] != (size_t) D * sizeof(float) || ((uintptr_t) cache->data) % 16 != 0) {
         return 0;
     }
-    // the staged rows buffer must feed nothing but the matched SET_ROWS
+    // the staged rows buffer must feed nothing but the matched SET_ROWS. When the values reach
+    // SET_ROWS through a RESHAPE (vals != cont), that RESHAPE sits inside the fused range and is
+    // never computed again, so it must have no consumer other than the matched SET_ROWS either
+    // (reviewer-hygiene batch: the assumption is now checked, it used to be silent). A reject is
+    // safe: the stock VIEW -> CONT -> [RESHAPE] -> SET_ROWS staging runs unchanged.
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (t == srows || t == vals) {
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (t->src[s] == cont) {
+            if (t->src[s] == cont || (vals != cont && t->src[s] == vals)) {
+                if (dbg) {
+                    fprintf(stderr, "[gdn-scatter] node %d: reject, node %d (%s) also consumes the staged buffer\n",
+                            node_idx, j, ggml_op_name(t->op));
+                }
                 return 0;
             }
         }
-        if (t->op == GGML_OP_VIEW && t->view_src == cont) {
+        if (t->op == GGML_OP_VIEW && (t->view_src == cont || (vals != cont && t->view_src == vals))) {
             return 0;
         }
     }
@@ -4464,18 +4472,25 @@ static int ggml_cuda_try_gdn_conv_scatter(
             return 0; // all snapshots of one layer must land in the same cache
         }
         cache = scache;
-        // the staged rows buffer must feed nothing but the matched SET_ROWS
+        // the staged rows buffer must feed nothing but the matched SET_ROWS. A RESHAPE between
+        // cont and SET_ROWS (svals != cont) sits inside the fused range and is never computed
+        // again, so it too must have no consumer other than the matched SET_ROWS (checked here;
+        // reviewer-hygiene batch). A reject is safe: the stock staging runs unchanged.
         for (int x = node_idx + 1; x < cgraph->n_nodes; ++x) {
             const ggml_tensor * n = cgraph->nodes[x];
             if (n == srows || n == svals) {
                 continue;
             }
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
-                if (n->src[s] == cont) {
+                if (n->src[s] == cont || (svals != cont && n->src[s] == svals)) {
+                    if (dbg) {
+                        fprintf(stderr, "[gdn-conv-scatter] node %d: reject, node %d (%s) also consumes the staged buffer\n",
+                                node_idx, x, ggml_op_name(n->op));
+                    }
                     return 0;
                 }
             }
-            if (n->op == GGML_OP_VIEW && n->view_src == cont) {
+            if (n->op == GGML_OP_VIEW && (n->view_src == cont || (svals != cont && n->view_src == svals))) {
                 return 0;
             }
         }
@@ -4517,7 +4532,7 @@ static int ggml_cuda_try_gdn_conv_scatter(
 // on which GDN kernel ran, the scatter launches on the same stream after the GDN kernel, reading
 // the tail the GDN kernel just wrote. Pure data movement: same floats, same rows as the chain it
 // replaces => byte-identical by construction, ring rollback semantics unchanged.
-// Gate GGML_CUDA_DFLASH_STAGE_FUSE (default OFF) + GGML_CGRAPH_FLAG_SPEC_VERIFY on the graph.
+// Gate GGML_CUDA_DFLASH_STAGE_FUSE (default ON, =0 disables) + GGML_CGRAPH_FLAG_SPEC_VERIFY on the graph.
 static int ggml_cuda_try_gdn_state_scatter(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gdn_state_scatter_args & out) {
     static const bool dbg = [] { const char * e = getenv("GGML_TP1_DEBUG"); return e && atoi(e) != 0; }();
@@ -4610,18 +4625,26 @@ static int ggml_cuda_try_gdn_state_scatter(
     if (((uintptr_t) tail->data) % 16 != 0) {
         return 0;
     }
-    // the staged rows buffer must feed nothing but the matched SET_ROWS
+    // the staged rows buffer must feed nothing but the matched SET_ROWS. When the values reach
+    // SET_ROWS through a RESHAPE (vals != cont), that RESHAPE sits inside the fused range and is
+    // never computed again, so it must have no consumer other than the matched SET_ROWS either
+    // (reviewer-hygiene batch: the assumption is now checked, it used to be silent). A reject is
+    // safe: the stock VIEW -> CONT -> [RESHAPE] -> SET_ROWS staging runs unchanged.
     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
         const ggml_tensor * t = cgraph->nodes[j];
         if (t == srows || t == vals) {
             continue;
         }
         for (int s = 0; s < GGML_MAX_SRC; ++s) {
-            if (t->src[s] == cont) {
+            if (t->src[s] == cont || (vals != cont && t->src[s] == vals)) {
+                if (dbg) {
+                    fprintf(stderr, "[gdn-scatter] node %d: reject, node %d (%s) also consumes the staged buffer\n",
+                            node_idx, j, ggml_op_name(t->op));
+                }
                 return 0;
             }
         }
-        if (t->op == GGML_OP_VIEW && t->view_src == cont) {
+        if (t->op == GGML_OP_VIEW && (t->view_src == cont || (vals != cont && t->view_src == vals))) {
             return 0;
         }
     }

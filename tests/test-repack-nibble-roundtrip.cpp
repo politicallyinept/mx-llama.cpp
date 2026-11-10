@@ -747,6 +747,13 @@ int main(void) {
     const int64_t shapes[][2] = { {256, 2}, {5120, 3}, {4096, 2}, {320, 1}, {1024, 5} };
 
     g_repack_host = resolve_repack_host();
+    if (!g_repack_host) {
+        printf("WARNING: P3 SKIPPED FOR EVERY CASE -- the shipped converter (repack_host) could not\n"
+               "WARNING: be resolved from libggml-hip.so.0 / libggml-cuda.so.0 (HIP backend library or\n"
+               "WARNING: ROCm runtime not on the loader path). The mirror was validated against itself\n"
+               "WARNING: only (P1/P2); P3 is the only check against the shipped converter. Build/run\n"
+               "WARNING: with the HIP backend library loadable to activate P3.\n");
+    }
 
     int rc = 0, cases = 0;
     for (ggml_type t : types) {

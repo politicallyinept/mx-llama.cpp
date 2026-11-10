@@ -1904,6 +1904,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // the scheduler snapshots per-split graph views at that point; graph reuse
         // is keyed on the same n_tokens/n_outputs that decide the hint, so a reused
         // graph always computes with the hint it was stamped with.
+        // KNOWN LIMITATION (reviewer-hygiene batch): perplexity batches (all-logits prompt
+        // chunks) and embedding batches match this shape test and are stamped SPEC_VERIFY as
+        // well; no discriminator is available at this site - the context cannot tell a verify
+        // batch from an all-output prompt batch, they are the same shape. Tightening the test
+        // would change which kernels fire on PPL/embedding graphs without a seal behind it, so
+        // the mislabel is documented instead; see the GGML_CGRAPH_FLAG_SPEC_VERIFY note in ggml.h.
         {
             bool all_outputs = ubatch.output != nullptr;
             for (uint32_t i = 0; i < ubatch.n_tokens && all_outputs; ++i) {
