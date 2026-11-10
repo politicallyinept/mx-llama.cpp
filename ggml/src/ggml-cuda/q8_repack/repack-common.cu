@@ -38,23 +38,52 @@ bool repack_sumw_plane_on() {
     return s_on;
 }
 
-// Resolve the Q8_0 repack admission: opt-in. An explicit GGML_CUDA_REPACK_Q8_0=1
-// forces admission ON (dense included), =0 forces it OFF; with no env the gate is
-// OFF. The MoE-conditional default (admit when the loaded model has 3D expert
-// tensors; the shape hint is per model: ggml_tensor_model_has_expert_tensors) is
-// reverted to opt-in: the RESTYLE GEMM was never wired at the repacked GEMM
-// dispatch sites (they hardcode the original repacked instantiation), so the
-// repacked prefill GEMM accumulates differently from stock on the shapes the
-// gcn_kq yield declines (9..31-token prefill etc) and the MoE-conditional default
-// is not bit-safe until the GEMM restyle is real. The loader still stamps the
-// shape hint per model (llama-model.cpp); it does not gate admission while the
-// default is opt-in.
-static bool q8_0_repack_admitted(void) {
+// Resolve the Q8_0 repack admission: opt-in AND shape-gated. Env levels:
+//   unset / =0 : OFF. The default path is untouched.
+//   =1         : admit QUALIFYING models only. A model qualifies when its own
+//                per-model shape hint says so: 3D expert tensors, dense (non-expert)
+//                Q8_0 at or above the GGML_CUDA_REPACK_Q8_0_MIN_DENSE floor, and
+//                tensor split - computed per model by the loader (llama-model.cpp).
+//                The hint is read from the TENSOR (ggml_tensor_model_has_expert_tensors):
+//                the loader stamps it on every weight tensor of the owning model
+//                before that model's buffers are allocated, and the meta backend
+//                copies it onto every per-lane tensor, so in a multi-model process
+//                (MoE main + small spec-decode draft) each model is admitted by its
+//                OWN shape - a small draft whose dense Q8_0 is below the floor is
+//                never admitted by the main model's hint (the buffer-doubling OOM
+//                on small drafts). A process-global latch would corrupt exactly
+//                this case: the main loads first and the draft inherits its value.
+//   >=2        : FORCE admission ON for every model (escape hatch for A/B on a
+//                model whose own shape declined admission; the small-draft
+//                buffer-doubling OOM is then the operator's own risk).
+// The repacked prefill GEMM is still not bit-identical to stock on the shapes the
+// gcn_kq yield declines (9..31-token prefill etc): the divergence is fp32
+// K-accumulation geometry (repacked: serial full-K per thread; stock: K split
+// across tile lanes + shared reduce - see the STOCK_ACC gate below for the
+// divergence map). Wiring the existing RESTYLE GEMM template branch would NOT
+// fix that: it only reorders the 8 dp4a ops of a 32-value block inside an exact
+// int32 accumulator, which is order-invariant.
+static int q8_0_repack_env_mode(void) {
     static const int env = [] {
         const char * e = getenv("GGML_CUDA_REPACK_Q8_0");
-        return e == nullptr ? 0 : (atoi(e) != 0 ? 1 : -1);
+        if (e == nullptr) {
+            return 0;
+        }
+        const int v = atoi(e);
+        if (v <= 0) {
+            return -1;              // explicit OFF
+        }
+        return v >= 2 ? 2 : 1;      // 1 = qualifying models only, 2 = forced for all
     }();
-    return env > 0;
+    return env;
+}
+
+static bool q8_0_repack_admitted(const ggml_tensor * t) {
+    switch (q8_0_repack_env_mode()) {
+        case 2:  return true;                                     // forced for every model
+        case 1:  return ggml_tensor_model_has_expert_tensors(t);  // per-model shape hint
+        default: return false;                                    // unset or =0: OFF
+    }
 }
 
 bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
@@ -118,9 +147,11 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // default (admit when the loaded model has 3D expert tensors), and is back to
     // opt-in: the RESTYLE GEMM is not wired at the repacked GEMM dispatch sites,
     // so the repacked prefill GEMM is not bit-identical to stock on the shapes the
-    // gcn_kq yield declines (9..31-token prefill etc). The MoE-conditional default
-    // returns once the GEMM restyle is real. GGML_CUDA_REPACK_Q8_0=1 forces
-    // admission ON (dense included, with STOCK_ACC=0); =0 forces it OFF.
+    // gcn_kq yield declines (9..31-token prefill etc). GGML_CUDA_REPACK_Q8_0=1
+    // admits only models whose own per-model shape hint qualifies (see
+    // q8_0_repack_admitted above: 3D expert tensors + dense-Q8_0 floor + tensor
+    // split, read per tensor); =2 forces admission ON for every model (escape
+    // hatch); =0 forces it OFF. Effective only together with STOCK_ACC=0.
     //
     // The repack is a layout repack of the 8-bit weights (dp4a-friendly row +
     // scale-plane layout); without RESTYLE the accumulation order differs from stock
@@ -128,10 +159,18 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     // Tier-3.3 stock-accumulation gate: GGML_CUDA_REPACK_Q8_0_STOCK_ACC defaults ON
     // (the pre-ship posture): Q8_0 matmuls stay on STOCK accumulation order (Q8_0
     // stays canonical, repack suppressed). The RESTYLE mat-vec kernels reproduce the
-    // stock accumulation order and granularity on the repacked layout, but the GEMM
-    // restyle is not wired at the dispatch sites, so the repacked prefill GEMM is
-    // not bit-identical to stock on the shapes the gcn_kq yield declines - the
-    // default stays stock until that lands. =0 opts into the repack path (together
+    // stock accumulation order and granularity on the repacked layout for the
+    // single-token MMV and nc verify at widths 2-5 (nc widths 6-8 diverge: stock
+    // GCN mmvq runs 1 warp there, the repacked nc kernel runs 2 - different
+    // reduce-tree geometry), but the GEMM restyle is not wired at the dispatch
+    // sites, so the repacked prefill GEMM is not bit-identical to stock on the
+    // shapes the gcn_kq yield declines - the default stays stock until that lands.
+    // Note: wiring the existing RESTYLE template branch at the GEMM dispatch sites
+    // is NOT that fix - the branch only reorders the 8 dp4a ops of a 32-value block
+    // inside an exact int32 accumulator (order-invariant); the real divergence is
+    // the fp32 K-accumulation geometry below (serial full-K per thread vs stock's
+    // tx-lane K split + shared reduce), which needs a re-derivation of the stock
+    // kernel geometry on the repacked layout. =0 opts into the repack path (together
     // with GGML_CUDA_REPACK_Q8_0=1) for A/B and for the validated MoE decode win.
     //
     // Divergence map (adopt-gdn-rows): the weight repack itself is lossless -
@@ -178,7 +217,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
     }();
     switch (t->type) {
         case GGML_TYPE_Q8_0: {
-            const bool adm = q8_0_repack_admitted() && !s_q8_0_stock_acc;
+            const bool adm = q8_0_repack_admitted(t) && !s_q8_0_stock_acc;
             // The gate decision is logged whenever it CHANGES (per-model shape hints
             // can differ between models in one process: MoE main + small spec-decode
             // draft), so the log shows each model's own admission instead of a
@@ -186,8 +225,9 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             static std::atomic<int> s_banner_adm(-1);
             const int adm_now = adm ? 1 : 0;
             if (s_banner_adm.exchange(adm_now) != adm_now) {
-                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s'): Q8_0 %s the gfx906 repack path (opt-in default)\n",
-                              adm ? "ACTIVE" : "inactive", ggml_get_name(t), adm ? "admitted to" : "stays canonical for");
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s', env mode %d): Q8_0 %s the gfx906 repack path (mode 1 = qualifying models only by per-model shape hint, mode 2 = forced for all)\n",
+                              adm ? "ACTIVE" : "inactive", ggml_get_name(t), q8_0_repack_env_mode(),
+                              adm ? "admitted to" : "stays canonical for");
             }
             return adm && t->ne[0] % 32 == 0;
         }
