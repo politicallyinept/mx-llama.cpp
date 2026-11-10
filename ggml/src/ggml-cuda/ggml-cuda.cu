@@ -6902,6 +6902,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
 
+    // GGML_DFLASH_PROF=1: one line per graph_compute call per device. TP lanes interleave
+    // on this function, so the call counter is PER DEVICE (group per device when reading:
+    // interleaved lanes offset each other by one call). mode: replay | capture | outer |
+    // owner-off | direct. ne11: ne[1] of the first mul_mat src1 == token width of this
+    // forward (the verify width on spec-decode steps). Timers live behind the static
+    // getenv check: unset env costs one branch and changes no behavior.
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -6927,6 +6936,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (graph->n_prop_resets >= 4 && graph->n_prop_resets * 10 > graph->n_prop_checks) {
                     graph->unstable_disabled = true;
                     if (g_graph_stats.on) { g_graph_stats.unstable[cuda_ctx->device]++; }
+                    if (dprof) { fprintf(stderr, "[DFLASH-PROF] cuda-graph-unstable dev=%d key=%p resets=%d checks=%d\n", cuda_ctx->device, (void *) graph_key, graph->n_prop_resets, graph->n_prop_checks); }
                     GGML_LOG_DEBUG("%s: disabling CUDA graph for unstable entry (%d resets / %d checks)\n",
                         __func__, graph->n_prop_resets, graph->n_prop_checks);
                 }
@@ -6984,6 +6994,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (dprof) {
+        static std::atomic<unsigned long long> dprof_calls[GGML_CUDA_MAX_DEVICES] = {};
+        int64_t dprof_ne11 = -1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
+                dprof_ne11 = cgraph->nodes[i]->src[1]->ne[1];
+                break;
+            }
+        }
+        fprintf(stderr, "[DFLASH-PROF] cuda-graph dev=%d call=%llu ne11=%lld mode=%s nodes=%d us=%lld\n",
+            cuda_ctx->device,
+            (unsigned long long) dprof_calls[cuda_ctx->device].fetch_add(1) + 1,
+            (long long) dprof_ne11,
+            use_cuda_graph ? (cuda_graph_update_required ? "capture" : "replay")
+                           : (g_cuda_outer_capture ? "outer" : (cuda_ctx->graphs_owner_disabled ? "owner-off" : "direct")),
+            cgraph->n_nodes, (long long) (ggml_time_us() - dprof_t0));
+    }
 
     return GGML_STATUS_SUCCESS;
 }

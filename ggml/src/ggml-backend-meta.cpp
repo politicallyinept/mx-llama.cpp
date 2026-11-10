@@ -5422,6 +5422,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // early graph_cache_disable leaves NOTHING replaying: every node direct-dispatched
     // (~0.5 us/node, ~2 ms/step on the ~3.9k-node MTP verify graph). Default ON;
     // GGML_META_TG_INNER_ON_FAIL=0 restores the old behavior.
+    // GGML_DFLASH_PROF=1: token-graph event lines (capture attempts with timing, replays,
+    // permanent disables, scratch-gen invalidations). Default off: nothing is timed or
+    // printed when the env is unset.
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+
     const bool inner_on_fail = [] {
         const char * e = getenv("GGML_META_TG_INNER_ON_FAIL");
         return e == nullptr || atoi(e) != 0;
@@ -5479,6 +5484,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         (size_t) cgraph->uid, (unsigned long long) tge->gen,
                         (unsigned long long) ggml_scratch_gen());
             }
+            if (dprof) { fprintf(stderr, "[DFLASH-PROF] tg-invalidate uid=%zu scratch-gen changed - re-warming\n", (size_t) cgraph->uid); }
             backend_ctx->tg_free_entry(*tge);
             tge->warm    = 0;
             tge->failed  = false;
@@ -5498,6 +5504,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (!ready) { break; }
             }
             if (ready) {
+                if (dprof) {
+                    static unsigned long long dprof_tg_replay = 0;
+                    const unsigned long long dprof_n = ++dprof_tg_replay;
+                    if (dprof_n <= 8 || (dprof_n % 100) == 0) {
+                        fprintf(stderr, "[DFLASH-PROF] tg-replay uid=%zu count=%llu\n", (size_t) cgraph->uid, dprof_n);
+                    }
+                }
                 const uint64_t prof_t0 = backend_ctx->prof ? ggml_meta_prof_now() : 0;
                 uint64_t prof_seam = 0;
                 for (const auto & r : tge->runs) {
@@ -5611,9 +5624,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     fprintf(stderr, "[tg-debug] uid %zu NOT ELIGIBLE (runs=%zu) - token graph permanently disabled for this shape\n",
                             (size_t) cgraph->uid, runs.size());
                 }
+                if (dprof) {
+                    fprintf(stderr, "[DFLASH-PROF] tg-not-eligible uid=%zu runs=%zu n_subgraphs=%zu - shape permanently on per-subgraph dispatch\n",
+                            (size_t) cgraph->uid, runs.size(), backend_ctx->n_subgraphs);
+                }
                 GGML_LOG_DEBUG("%s: uid %zu not eligible for token graph\n",
                                __func__, (size_t) cgraph->uid);
             } else {
+                const int64_t dprof_cap_t0 = dprof ? ggml_time_us() : 0;
                 backend_ctx->tg_free_entry(*tge);
                 tge->runs    = runs;
                 tge->covered = n_cap;
@@ -5714,6 +5732,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: uid %zu captured %zu runs x %zu lanes, %zu/%zu subgraphs\n",
                                    __func__, (size_t) cgraph->uid, tge->runs.size(),
                                    backend_ctx->tps, tge->covered, backend_ctx->n_subgraphs);
+                    if (dprof) {
+                        static unsigned long long dprof_cap_ok = 0;
+                        fprintf(stderr, "[DFLASH-PROF] tg-capture uid=%zu ok=1 runs=%zu lanes=%zu covered=%zu/%zu us=%lld\n",
+                                (size_t) cgraph->uid, tge->runs.size(), backend_ctx->tps,
+                                tge->covered, backend_ctx->n_subgraphs,
+                                (long long) (ggml_time_us() - dprof_cap_t0));
+                    }
                     if (tge->covered >= backend_ctx->n_subgraphs) {
                         return GGML_STATUS_SUCCESS;
                     }
@@ -5727,6 +5752,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (backend_ctx->dbg_tg) {
                     fprintf(stderr, "[tg-debug] uid %zu CAPTURE FAILED (ok=false) - token graph permanently disabled for this shape\n",
                             (size_t) cgraph->uid);
+                }
+                if (dprof) {
+                    static unsigned long long dprof_cap_fail = 0;
+                    fprintf(stderr, "[DFLASH-PROF] tg-capture uid=%zu ok=0 fails=%llu us=%lld - shape permanently on per-subgraph dispatch\n",
+                            (size_t) cgraph->uid, ++dprof_cap_fail,
+                            (long long) (ggml_time_us() - dprof_cap_t0));
                 }
                 GGML_LOG_DEBUG("%s: uid %zu capture failed, using per-subgraph dispatch\n",
                                __func__, (size_t) cgraph->uid);

@@ -4358,6 +4358,18 @@ private:
             g_srv_t.t_dec_k[batch.view.size()] += ggml_time_us() - tdc; g_srv_t.n_dec_k[batch.view.size()]++;
             g_srv_t.t_inner_k[batch.view.size()] += tw_end - tw_beg; g_srv_t.t_lat_k[batch.view.size()] += tw_beg - tdc;
         }
+        {
+            // GGML_DFLASH_PROF=1: per-call target forward witness. width == ne[1] of the
+            // verify batch when speculative decoding is active (1..n_draft+1); us covers
+            // submit+decode+sync, inner_us the work inside the yield.
+            static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+            if (dprof) {
+                static unsigned long long dprof_n_dec = 0;
+                fprintf(stderr, "[DFLASH-PROF] tgt-decode call=%llu width=%d us=%lld inner_us=%lld\n",
+                        ++dprof_n_dec, (int) batch.view.size(),
+                        (long long) (ggml_time_us() - tdc), (long long) (tw_end - tw_beg));
+            }
+        }
 
         if (ret != 0) {
             {

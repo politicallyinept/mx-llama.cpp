@@ -1535,6 +1535,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // n_embd_dec hidden state to carry between them.
                 {
                     common_time_meas tm_gather(is_pp ? t_pp_gather_us : t_gather_us, !gen_perf);
+                    // GGML_DFLASH_PROF=1: per-call gather timing + bytes copied
+                    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+                    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
                     features_buf.resize((size_t) n_chunk * n_embd_enc);
                     for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                         const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
@@ -1546,6 +1549,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             const float * src = layer + (size_t) rows[offset + i] * n_embd_tgt;
                             std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                         }
+                    }
+                    if (dprof) {
+                        static unsigned long long dprof_n_gather = 0;
+                        fprintf(stderr, "[DFLASH-PROF] draft-gather call=%llu bytes=%zu us=%lld\n",
+                                ++dprof_n_gather, features_buf.size() * sizeof(float),
+                                (long long) (ggml_time_us() - dprof_t0));
                     }
                 }
 
@@ -1567,7 +1576,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     // fused encode + inject: one decode does both, so this timer now
                     // covers the encode as well and t_encode/t_readnx stay zero
                     common_time_meas tm_inject(is_pp ? t_pp_inject_us : t_inject_us, !gen_perf);
+                    // GGML_DFLASH_PROF=1: per-call event line for the fused encode+inject
+                    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+                    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
                     rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                    if (dprof) {
+                        static unsigned long long dprof_n_inj = 0;
+                        fprintf(stderr, "[DFLASH-PROF] draft-inject call=%llu n_tokens=%d us=%lld rc=%d\n",
+                                ++dprof_n_inj, (int) n_chunk,
+                                (long long) (ggml_time_us() - dprof_t0), rc);
+                    }
                 }
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
@@ -1631,7 +1649,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
-        int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        int ret;
+        {
+            // GGML_DFLASH_PROF=1: per-call drafter forward timing + block width.
+            // The getenv is read once per process (function-local static); with the
+            // env unset nothing is timed and nothing is printed.
+            static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+            const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+            ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (dprof) {
+                static unsigned long long dprof_n_fwd = 0;
+                fprintf(stderr, "[DFLASH-PROF] draft-fwd call=%llu n_tokens=%d us=%lld rc=%d\n",
+                        ++dprof_n_fwd, (int) batch.size(),
+                        (long long) (ggml_time_us() - dprof_t0), ret);
+            }
+        }
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
             return;

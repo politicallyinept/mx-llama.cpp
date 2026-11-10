@@ -2429,6 +2429,13 @@ void common_prompt_checkpoint::update_tgt(
         return;
     }
 
+    // GGML_DFLASH_PROF=1: snapshot capture timing + host buffer pointer witness. The
+    // pointer identifies the checkpoint buffer: a NEW pointer for the SAME op across
+    // requests means the buffer was reallocated (pointer churn). Compare pointers of
+    // the same op across >=3 requests before concluding.
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_tgt.resize(ckpt_size);
@@ -2436,6 +2443,19 @@ void common_prompt_checkpoint::update_tgt(
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+
+    if (dprof) {
+        static unsigned long long dprof_n = 0;
+        static const void * dprof_last = nullptr;
+        static unsigned long long dprof_distinct = 0;
+        if ((const void *) data_tgt.data() != dprof_last) {
+            dprof_last = data_tgt.data();
+            dprof_distinct++;
+        }
+        fprintf(stderr, "[DFLASH-PROF] ckpt-update-tgt call=%llu seq=%d ptr=%p size=%zu distinct=%llu us=%lld\n",
+                ++dprof_n, (int) seq_id, (void *) data_tgt.data(), ckpt_size,
+                (unsigned long long) dprof_distinct, (long long) (ggml_time_us() - dprof_t0));
     }
 }
 
@@ -2447,6 +2467,10 @@ void common_prompt_checkpoint::update_dft(
         return;
     }
 
+    // GGML_DFLASH_PROF=1: see update_tgt for the pointer-churn reading rule
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
     data_dft.resize(ckpt_size);
@@ -2454,6 +2478,19 @@ void common_prompt_checkpoint::update_dft(
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+    }
+
+    if (dprof) {
+        static unsigned long long dprof_n = 0;
+        static const void * dprof_last = nullptr;
+        static unsigned long long dprof_distinct = 0;
+        if ((const void *) data_dft.data() != dprof_last) {
+            dprof_last = data_dft.data();
+            dprof_distinct++;
+        }
+        fprintf(stderr, "[DFLASH-PROF] ckpt-update-dft call=%llu seq=%d ptr=%p size=%zu distinct=%llu us=%lld\n",
+                ++dprof_n, (int) seq_id, (void *) data_dft.data(), ckpt_size,
+                (unsigned long long) dprof_distinct, (long long) (ggml_time_us() - dprof_t0));
     }
 }
 
@@ -2469,7 +2506,25 @@ bool common_prompt_checkpoint::load_tgt(
         return true;
     }
 
+    // GGML_DFLASH_PROF=1: snapshot restore timing + pointer witness (see update_tgt)
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
+
+    if (dprof) {
+        static unsigned long long dprof_n = 0;
+        static const void * dprof_last = nullptr;
+        static unsigned long long dprof_distinct = 0;
+        if ((const void *) data_tgt.data() != dprof_last) {
+            dprof_last = data_tgt.data();
+            dprof_distinct++;
+        }
+        fprintf(stderr, "[DFLASH-PROF] ckpt-load-tgt call=%llu seq=%d ptr=%p size=%zu distinct=%llu us=%lld\n",
+                ++dprof_n, (int) seq_id, (void *) data_tgt.data(), data_tgt.size(),
+                (unsigned long long) dprof_distinct, (long long) (ggml_time_us() - dprof_t0));
+    }
+
     return n == data_tgt.size();
 }
 
@@ -2485,7 +2540,25 @@ bool common_prompt_checkpoint::load_dft(
         return true;
     }
 
+    // GGML_DFLASH_PROF=1: snapshot restore timing + pointer witness (see update_tgt)
+    static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
+
+    if (dprof) {
+        static unsigned long long dprof_n = 0;
+        static const void * dprof_last = nullptr;
+        static unsigned long long dprof_distinct = 0;
+        if ((const void *) data_dft.data() != dprof_last) {
+            dprof_last = data_dft.data();
+            dprof_distinct++;
+        }
+        fprintf(stderr, "[DFLASH-PROF] ckpt-load-dft call=%llu seq=%d ptr=%p size=%zu distinct=%llu us=%lld\n",
+                ++dprof_n, (int) seq_id, (void *) data_dft.data(), data_dft.size(),
+                (unsigned long long) dprof_distinct, (long long) (ggml_time_us() - dprof_t0));
+    }
+
     return n == data_dft.size();
 }
 
