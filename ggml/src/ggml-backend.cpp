@@ -2382,10 +2382,21 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
             mixw((uint64_t) g->leafs[i]->ne[d]);
             mixw((uint64_t) g->leafs[i]->nb[d]);
         }
-        uint64_t op0, op1;
-        memcpy(&op0, g->leafs[i]->op_params, sizeof(op0));
-        memcpy(&op1, g->leafs[i]->op_params + 8, sizeof(op1));
-        mixw(op0); mixw(op1);
+        // Full op_params (all 64 bytes), not just the first 16: a captured
+        // kernel bakes every byte it reads, and ops such as MUL_MAT_ID /
+        // SET_ROWS / SOFT_MAX carry operands past offset 16. Mirrors the
+        // whole-graph stable-uid extension in split_graph.
+        for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+            uint64_t op;
+            memcpy(&op, g->leafs[i]->op_params + o * sizeof(uint64_t), sizeof(op));
+            mixw(op);
+        }
+        // src[] edge set: two graphs whose first 16 op_params bytes collide
+        // but whose tensors are wired differently would otherwise share one
+        // split uid and replay a capture that reads the wrong inputs.
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            mixw((uint64_t) (uintptr_t) g->leafs[i]->src[s]);
+        }
     }
     for (int i = 0; i < g->n_nodes; i++) {
         mixw((uint64_t) (uintptr_t) g->nodes[i]);
@@ -2399,10 +2410,14 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
             mixw((uint64_t) g->nodes[i]->ne[d]);
             mixw((uint64_t) g->nodes[i]->nb[d]);
         }
-        uint64_t op0, op1;
-        memcpy(&op0, g->nodes[i]->op_params, sizeof(op0));
-        memcpy(&op1, g->nodes[i]->op_params + 8, sizeof(op1));
-        mixw(op0); mixw(op1);
+        for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+            uint64_t op;
+            memcpy(&op, g->nodes[i]->op_params + o * sizeof(uint64_t), sizeof(op));
+            mixw(op);
+        }
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            mixw((uint64_t) (uintptr_t) g->nodes[i]->src[s]);
+        }
     }
 
     for (int i = 0; i < sched->n_splits; ++i) {
@@ -2417,15 +2432,36 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
         mixs((uint64_t) sg->n_nodes);
         mixs((uint64_t) sg->n_leafs);
         mixs((uint64_t) ggml_cgraph_get_flags(sg));
+        // The split graph is a view of the whole graph, but the backend's
+        // graph_optimize pass reorders nodes and rewires src[] inside the
+        // split view after the whole-graph hash ran, so the split hash must
+        // pin everything the captured kernels read: tensor identity, data
+        // address, ALL op_params bytes and the src[] edge set.
         for (int k = 0; k < sg->n_leafs; k++) {
             mixs((uint64_t) (uintptr_t) sg->leafs[k]);
             mixs((uint64_t) sg->leafs[k]->op);
             mixs((uint64_t) (uintptr_t) sg->leafs[k]->data);
+            for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+                uint64_t op;
+                memcpy(&op, sg->leafs[k]->op_params + o * sizeof(uint64_t), sizeof(op));
+                mixs(op);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                mixs((uint64_t) (uintptr_t) sg->leafs[k]->src[s]);
+            }
         }
         for (int k = 0; k < sg->n_nodes; k++) {
             mixs((uint64_t) (uintptr_t) sg->nodes[k]);
             mixs((uint64_t) sg->nodes[k]->op);
             mixs((uint64_t) (uintptr_t) sg->nodes[k]->data);
+            for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+                uint64_t op;
+                memcpy(&op, sg->nodes[k]->op_params + o * sizeof(uint64_t), sizeof(op));
+                mixs(op);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                mixs((uint64_t) (uintptr_t) sg->nodes[k]->src[s]);
+            }
         }
         for (int c = 0; c < ggml_backend_sched::UID_CACHE_SIZE; c++) {
             if (sched->uid_cache[c].hash == h && h != 0) {
