@@ -16,9 +16,10 @@ envs explicitly. Set `GGML_CUDA_W4A4_PROFILE=off` (or `none`), or the kill-switc
 `GGML_CUDA_W4A4_OFF=1`, for byte-identical stock behavior. The debug gates remain
 opt-in. Three small non-int4 items ride along: an opt-in
 `MXFP4` quantize ftype, a TP-3 entry in the custom-AllReduce auto-select list (only
-relevant when the fork's custom AllReduce is engaged), and a DSV4 KV-cache flag that
-reports checkpoint restore as unsupported (conservative: the compressed state cannot be
-restored losslessly).
+relevant when the fork's custom AllReduce is engaged), and a DSV4 KV-cache flag
+matching upstream: DSV4 prompt checkpointing follows the upstream default (the
+conservative restore-false override was removed to align with the merged upstream
+history; DSV4 users can still disable snapshots with the existing -ctxcp 0).
 
 ## Attribution / Provenance
 
