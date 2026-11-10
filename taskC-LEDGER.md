@@ -84,3 +84,7 @@ INVARIANT int32 headroom: |S| <= 32512 per 32-block                        PASS
 
 16 invariants, 0 FAIL
 SEAL_EXIT=0
+
+## 2026-11-10 - committed
+- 42983d62d7 on INT4-noquant: design doc + seal + HIP skeleton + this ledger. No push.
+- Next: GPU-QUEUED section above; resume only when RAM >= 12 GB free and a card is idle under gpu.lock.
