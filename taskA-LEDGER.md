@@ -24,3 +24,6 @@ Rules: append, never rewrite. Long children die to infra restarts; this file is 
 - RUN-CARD-ruquant-spec-redo.md authored + predicates verified on box (real outputs pasted
   in Appendix A). scripts/rq_gguf_kv.py added (rotation-metadata witness tool).
 - Committed run-card + ledger + kv script (see commit lines below). No pushes.
+
+- Commit fedccab916: RUN-CARD-ruquant-spec-redo.md + taskA-LEDGER.md + scripts/rq_gguf_kv.py on branch INT4-noquant. No pushes.
+- Task A non-GPU work COMPLETE. Remaining work is GPU-QUEUED (card sections 5-7 + F0 build); waits on two free GPUs (fleet off limits).
