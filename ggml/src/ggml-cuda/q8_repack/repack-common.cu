@@ -38,12 +38,18 @@ bool repack_sumw_plane_on() {
     return s_on;
 }
 
-// Resolve the Q8_0 repack admission: opt-in AND shape-gated. Env levels:
+// Resolve the Q8_0 repack admission: opt-in, with a shape-gated level. Env levels:
 //   unset / =0 : OFF. The default path is untouched.
-//   =1         : admit QUALIFYING models only. A model qualifies when its own
-//                per-model shape hint says so: 3D expert tensors, dense (non-expert)
-//                Q8_0 at or above the GGML_CUDA_REPACK_Q8_0_MIN_DENSE floor, and
-//                tensor split - computed per model by the loader (llama-model.cpp).
+//   =1         : FORCE admission ON for every model - the historical meaning of
+//                =1, kept backward-compatible with every existing script and A/B
+//                measurement config that exports it (escape hatch for A/B on a
+//                model whose own shape would decline admission; the dense-Q8_0
+//                buffer-doubling OOM is then the operator's own risk).
+//   >=2        : admit QUALIFYING models only (opt-in shape gate). A model
+//                qualifies when its own per-model shape hint says so: 3D expert
+//                tensors, dense (non-expert) Q8_0 at or above the
+//                GGML_CUDA_REPACK_Q8_0_MIN_DENSE floor, and tensor split -
+//                computed per model by the loader (llama-model.cpp).
 //                The hint is read from the TENSOR (ggml_tensor_model_has_expert_tensors):
 //                the loader stamps it on every weight tensor of the owning model
 //                before that model's buffers are allocated, and the meta backend
@@ -53,9 +59,11 @@ bool repack_sumw_plane_on() {
 //                never admitted by the main model's hint (the buffer-doubling OOM
 //                on small drafts). A process-global latch would corrupt exactly
 //                this case: the main loads first and the draft inherits its value.
-//   >=2        : FORCE admission ON for every model (escape hatch for A/B on a
-//                model whose own shape declined admission; the small-draft
-//                buffer-doubling OOM is then the operator's own risk).
+// The level semantics were SWAPPED on 2026-11-09: =1 had briefly become the
+// shape-gated level, which silently downgraded every existing =1 script on a
+// dense model or under layer-split to the stock path. =1 keeps its historical
+// force meaning; the shape-gated level got the new value (=2) that no existing
+// config had used, so the new mode is strictly opt-in.
 // The repacked prefill GEMM is still not bit-identical to stock on the shapes the
 // gcn_kq yield declines (9..31-token prefill etc): the divergence is fp32
 // K-accumulation geometry (repacked: serial full-K per thread; stock: K split
@@ -73,15 +81,15 @@ static int q8_0_repack_env_mode(void) {
         if (v <= 0) {
             return -1;              // explicit OFF
         }
-        return v >= 2 ? 2 : 1;      // 1 = qualifying models only, 2 = forced for all
+        return v >= 2 ? 2 : 1;      // 1 = forced for all (historical), 2 = shape-gated qualifying models only
     }();
     return env;
 }
 
 static bool q8_0_repack_admitted(const ggml_tensor * t) {
     switch (q8_0_repack_env_mode()) {
-        case 2:  return true;                                     // forced for every model
-        case 1:  return ggml_tensor_model_has_expert_tensors(t);  // per-model shape hint
+        case 1:  return true;                                     // forced for every model (=1, historical)
+        case 2:  return ggml_tensor_model_has_expert_tensors(t);  // per-model shape hint (=2)
         default: return false;                                    // unset or =0: OFF
     }
 }
@@ -225,7 +233,7 @@ bool ggml_cuda_repack_tensor_supported(const ggml_tensor * t) {
             static std::atomic<int> s_banner_adm(-1);
             const int adm_now = adm ? 1 : 0;
             if (s_banner_adm.exchange(adm_now) != adm_now) {
-                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s', env mode %d): Q8_0 %s the gfx906 repack path (mode 1 = qualifying models only by per-model shape hint, mode 2 = forced for all)\n",
+                GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0 gate %s (tensor '%s', env mode %d): Q8_0 %s the gfx906 repack path (mode 1 = forced for all, mode 2 = qualifying models only by per-model shape hint)\n",
                               adm ? "ACTIVE" : "inactive", ggml_get_name(t), q8_0_repack_env_mode(),
                               adm ? "admitted to" : "stays canonical for");
             }

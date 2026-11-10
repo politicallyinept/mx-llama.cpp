@@ -19,7 +19,14 @@ opt-in. Three small non-int4 items ride along: an opt-in
 relevant when the fork's custom AllReduce is engaged), and a DSV4 KV-cache flag
 matching upstream: DSV4 prompt checkpointing follows the upstream default (the
 conservative restore-false override was removed to align with the merged upstream
-history; DSV4 users can still disable snapshots with the existing -ctxcp 0).
+history; DSV4 users can still disable snapshots with the existing -ctxcp 0). Note:
+DSV4 prompt checkpoints now flow through this fork's async capture path
+(`GGML_CUDA_ASYNC_CKPT`, default ON); upstream validated DSV4 checkpointing with
+synchronous capture. The async path is code-audited for DSV4 compatibility (all
+DSV4 checkpoint state is serialized through the same `io.write_tensor` path and
+the async meta path mirrors the sync one) but has not been exercised at runtime on
+a full DSV4 model. If a DSV4 user hits checkpoint issues, `GGML_CUDA_ASYNC_CKPT=0`
+restores the sync capture path.
 
 ## Attribution / Provenance
 
@@ -61,11 +68,11 @@ int4-path knobs (`GGML_CUDA_W4A4_PROFILE`, `GGML_CUDA_W4A4_DOT8`, `GGML_CUDA_REP
 | `GGML_CUDA_DISABLE_FUSION` | OFF | kill switch: disables the whole CUDA fusion-matcher pass | upstream llama.cpp |
 | `GGML_CUDA_REPACK_KQUANT` | ON (`=0` off) | repacks Q4_K/Q5_K/Q6_K into the GEMM-friendly layout; `=0` keeps canonical layout (stock path) for A/B | gcn-repro A/B lane |
 | `GGML_CUDA_REPACK_KQUANT_MOE_FUSION` | ON (`=0` off) | admits K-quant/IQ4_NL expert tensors to the repacked MoE up/gate mat-vec fusion | repack MoE-fusion lane |
-| `GGML_CUDA_REPACK_Q8_0` | OFF (`=1` qualifying models only, `=2` force all, `=0` off) | admits Q8_0 weights to the gfx906 repack path. Opt-in AND shape-gated: `=1` admits only models whose own per-model shape hint qualifies (3D expert tensors, non-expert Q8_0 total at the `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` floor, and tensor split). The hint is stamped per model by the loader and read per tensor, so each model in a multi-model process is admitted by its own shape and a small spec-decode draft is never admitted by a MoE main model's hint (a draft below the floor shows its own gate-inactive banner and stays canonical). `=2` forces admission for every model (escape hatch for A/B on a model whose shape declined; the dual-layout canonical copy doubles the dense Q8_0 bytes and can OOM small drafts at this level). Stays opt-in because the repacked prefill GEMM is NOT restyled at the dispatch sites - the repack path is bit-identical to stock only on the mat-vec paths and the prefill shapes the gcn_kq yield takes, not on the shapes it declines (9..31-token prefill etc). The measured MoE win (+1.3..1.5% decode) is env-gated; wiring the existing RESTYLE GEMM template branch would NOT make prefill bit-identical - that branch only reorders the 8 dp4a ops of a 32-value block inside an exact int32 accumulator (order-invariant), while the real divergence is fp32 K-accumulation geometry (repacked: serial full-K per thread; stock: K split across tile lanes + shared reduce). `=1`/`=2` only take effect together with `GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0`. 3D non-expert tensors (MLA attn_k_b/attn_v_b) always stay canonical: the dense repacked dispatch has no per-slice offset | q8_0-repack E4 lane (hint wired into admission; force level added) |
-| `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` | 2 GiB (bytes) | floor used by the model-load shape-hint scan: models whose non-expert Q8_0 total is below this report the hint OFF (the dual-layout canonical copy costs ~1x those bytes in extra VRAM and OOMs small hybrid/graft/spec-draft models); `=0` removes the floor. With `GGML_CUDA_REPACK_Q8_0=1` the hint gates admission per model; `=2` bypasses the hint | q8_0-repack E4 lane |
+| `GGML_CUDA_REPACK_Q8_0` | OFF (`=1` force all (historical), `=2` qualifying models only, `=0` off) | admits Q8_0 weights to the gfx906 repack path. Opt-in. `=1` forces admission for every model - the historical meaning of `=1`, kept backward-compatible with every existing script and A/B measurement config that exports it (the dual-layout canonical copy doubles the dense Q8_0 bytes and can OOM small drafts at this level). `=2` is the shape-gated level: it admits only models whose own per-model shape hint qualifies (3D expert tensors, non-expert Q8_0 total at the `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` floor, and tensor split). The hint is stamped per model by the loader and read per tensor, so each model in a multi-model process is admitted by its own shape and a small spec-decode draft is never admitted by a MoE main model's hint (a draft below the floor shows its own gate-inactive banner and stays canonical). The level semantics were swapped on 2026-11-09: `=1` keeps its historical force meaning (no existing script silently loses behavior on a dense model or under layer-split) and the shape-gated level moved to the new value `=2` that no existing config had used. Stays opt-in because the repacked prefill GEMM is NOT restyled at the dispatch sites - the repack path is bit-identical to stock only on the mat-vec paths and the prefill shapes the gcn_kq yield takes, not on the shapes it declines (9..31-token prefill etc). The measured MoE win (+1.3..1.5% decode) is env-gated; wiring the existing RESTYLE GEMM template branch would NOT make prefill bit-identical - that branch only reorders the 8 dp4a ops of a 32-value block inside an exact int32 accumulator (order-invariant), while the real divergence is fp32 K-accumulation geometry (repacked: serial full-K per thread; stock: K split across tile lanes + shared reduce). `=1`/`=2` only take effect together with `GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0`. 3D non-expert tensors (MLA attn_k_b/attn_v_b) always stay canonical: the dense repacked dispatch has no per-slice offset | q8_0-repack E4 lane (hint wired into admission; level semantics swapped: `=1` force-all historical, `=2` shape-gated) |
+| `GGML_CUDA_REPACK_Q8_0_MIN_DENSE` | 2 GiB (bytes) | floor used by the model-load shape-hint scan: models whose non-expert Q8_0 total is below this report the hint OFF (the dual-layout canonical copy costs ~1x those bytes in extra VRAM and OOMs small hybrid/graft/spec-draft models); `=0` removes the floor. With `GGML_CUDA_REPACK_Q8_0=2` the hint gates admission per model; `=1` bypasses the hint | q8_0-repack E4 lane |
 | `GGML_CUDA_REPACK_Q8_0_RESTYLE` | ON (`=0` off) | repacked Q8_0 mat-vec (single-token MMV + nc verify) reproduces the stock accumulation order and granularity on the repacked layout: bit-identical decode and verify at widths 2-5; verify widths 6-8 diverge - stock GCN mmvq runs 1 warp at ncols_dst 6-8 while the repacked nc kernel runs 2 (warp-geometry reduce-tree difference; width 8 is the dflash verify width); `=0` restores the pre-RESTYLE per-half-block kernels. The GEMM restyle is NOT implemented: the repacked GEMM dispatch sites always run the original accumulation, so repacked-GEMM bit-safety is not established on the shapes the gcn_kq yield declines. Wiring the existing RESTYLE GEMM template branch would not change this: it only reorders the 8 dp4a ops of a 32-value block inside an exact int32 accumulator (order-invariant), while the real divergence is fp32 K-accumulation geometry (repacked: serial full-K per thread; stock: K split across tile lanes + shared reduce). Inert unless Q8_0 is admitted | q8_0-repack E4 lane |
 | `GGML_CUDA_REPACK_Q8_0_YIELD` | ON (`=0` off) | dense Q8_0 prefill GEMMs admitted by the gcn_kq gate yield to the gcn_kq v4 kernel via the canonical copy kept next to the repacked record; inert unless Q8_0 is admitted | q8_0-repack E4 lane |
-| `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | ON (`=0` off) | default: Q8_0 matmuls stay on stock accumulation order (Q8_0 stays canonical, repack suppressed) - the bit-safe default while the repacked-GEMM restyle is unwired; `=0` opts into the repack path together with `GGML_CUDA_REPACK_Q8_0=1` | anchor3 consolidation (default restored by hotfix/stockacc-restore) |
+| `GGML_CUDA_REPACK_Q8_0_STOCK_ACC` | ON (`=0` off) | default: Q8_0 matmuls stay on stock accumulation order (Q8_0 stays canonical, repack suppressed) - the bit-safe default while the repacked-GEMM restyle is unwired; `=0` opts into the repack path together with `GGML_CUDA_REPACK_Q8_0=1`/`=2` | anchor3 consolidation (default restored by hotfix/stockacc-restore) |
 | `GGML_Q8_YIELD_TRACE` | OFF (`=1` on) | debug trace of the yield branch decisions on stderr (capped); never affects output | q8_0-repack E4 lane |
 | `GGML_CUDA_DFLASH_STAGE_FUSE` | ON (`=0` off) | dflash width-8 GDN ring staging fusion: conv-state ring scatter and recurrent-state snapshot copies fold into the direct-scatter kernels on spec-verify graphs only; byte-identical output, +5.1% verify-width decode | dflash fix lane |
 | `GGML_CUDA_MOE_VEC` | OFF (`=1` on) | row-lane MoE decode kernel family (decode-shape admission) | CV port |
@@ -185,12 +192,22 @@ export GGML_CUDA_REPACK_KQUANT=0   # K-quant repack OFF (binary default is ON)
 export GGML_CUDA_MOE_VEC=1         # row-lane MoE decode kernels (default OFF)
 export GGML_CUDA_MOE_FUSE=1        # MoE gate/up + SwiGLU prefill fusion (default OFF)
 export GGML_GDN_COLTHREAD=1        # column-thread GDN kernel path (default OFF)
+export GGML_TP_AR_CSAR=1           # capture-safe TP all-reduce pools
+export GGML_SCHED_STABLE_UID=1     # stable split-graph uids across rebuilds
+export LLAMA_GRAPH_RES_PER_SHAPE=1 # per-shape res arenas
+export GGML_CUDA_MMVQ_GCN_RPB1=2   # mmvq GCN rows-per-block 2 (byte-identical)
+export GGML_CUDA_GDN_STATE_ROWS_KMAX=8  # GDN K>1 snapshot direct-read fusion (bit-identical)
 ```
 
 plus the rig-level runtime knobs already listed at the top of `docs/BENCH.md`
 (`GGML_ENABLE_CUSTOM_AR=1`, `HSA_XNACK=0`, `HSA_FORCE_FINE_GRAIN_PCIE=1`,
 `GPU_MAX_HW_QUEUES=8`). Because `GGML_CUDA_REPACK_Q4_0` defaults OFF in source, a
-run without this bundle does not engage the tiled/W4A4 repack paths at all.
+run without this bundle does not engage the tiled/W4A4 repack paths at all. The
+csAR trio (`GGML_TP_AR_CSAR` / `GGML_SCHED_STABLE_UID` / `LLAMA_GRAPH_RES_PER_SHAPE`),
+`GGML_CUDA_MMVQ_GCN_RPB1=2` and `GGML_CUDA_GDN_STATE_ROWS_KMAX=8` were adopted into
+the production bundle on 2026-11-04 (combined-levers bench: +4.4..4.7% decode on
+natural text, greedy byte-identity seals green). Production additionally exports
+`GGML_TP_AR_MTP_SAFE=1` on MTP-on legs (inert on trees without the getenv site).
 
 Gate-truth verification (2026-10-31, dual seal on the seal build): the
 env-profile seal bit-matches the promoted baselines in all cells -- and those

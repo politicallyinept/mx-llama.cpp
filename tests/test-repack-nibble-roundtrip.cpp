@@ -43,12 +43,20 @@
 // Shipped host converter (defined in ggml-cuda/q8_repack/repack-common.cu,
 // declared in repack-common.cuh). Resolved at runtime via dlopen/dlsym because
 // the test links only ggml-base (link-time weak refs are stripped by
-// --as-needed). P3 is skipped gracefully when the HIP backend library or the
-// ROCm runtime is unavailable.
+// --as-needed). A HIP/CUDA-enabled build (tests/CMakeLists.txt defines
+// TEST_REPACK_NIBBLE_REQUIRE_P3 when the backend target exists) MUST run P3:
+// an unresolvable backend library or converter symbol is a FAILURE there, not
+// a skip. The graceful skip is for genuinely non-HIP builds only, where the
+// shipped converter does not exist at all.
 typedef void (*repack_host_fn)(ggml_type type, const void * blocks, uint8_t * dst, int64_t ne0, int64_t ne1);
+
+enum p3_state { P3_ACTIVE, P3_LIB_ABSENT, P3_SYM_MISSING };
+
+static p3_state g_p3_state = P3_LIB_ABSENT;
 
 static repack_host_fn resolve_repack_host(void) {
     const char * names[] = { "libggml-hip.so.0", "libggml-cuda.so.0" };
+    bool any_lib = false;
     for (const char * n : names) {
         void * h = dlopen(n, RTLD_NOW | RTLD_NOLOAD);
         if (!h) {
@@ -57,12 +65,17 @@ static repack_host_fn resolve_repack_host(void) {
         if (!h) {
             continue;
         }
+        any_lib = true;
         // Itanium-ABI mangled name of repack_host(ggml_type, const void*, uint8_t*, int64_t, int64_t)
         void * sym = dlsym(h, "_Z11repack_host9ggml_typePKvPhll");
         if (sym) {
+            g_p3_state = P3_ACTIVE;
             return (repack_host_fn) sym;
         }
     }
+    // A backend library loaded but the symbol did not resolve: a real gap
+    // (stale backend build / renamed converter), never a legitimate skip.
+    g_p3_state = any_lib ? P3_SYM_MISSING : P3_LIB_ABSENT;
     return nullptr;
 }
 
@@ -747,15 +760,31 @@ int main(void) {
     const int64_t shapes[][2] = { {256, 2}, {5120, 3}, {4096, 2}, {320, 1}, {1024, 5} };
 
     g_repack_host = resolve_repack_host();
-    if (!g_repack_host) {
-        printf("WARNING: P3 SKIPPED FOR EVERY CASE -- the shipped converter (repack_host) could not\n"
-               "WARNING: be resolved from libggml-hip.so.0 / libggml-cuda.so.0 (HIP backend library or\n"
-               "WARNING: ROCm runtime not on the loader path). The mirror was validated against itself\n"
-               "WARNING: only (P1/P2); P3 is the only check against the shipped converter. Build/run\n"
-               "WARNING: with the HIP backend library loadable to activate P3.\n");
-    }
 
     int rc = 0, cases = 0;
+    if (g_p3_state == P3_SYM_MISSING) {
+        printf("FAIL: a HIP/CUDA ggml backend library loaded but the shipped converter symbol\n"
+               "FAIL: (repack_host) did not resolve from it. P3 is the only check against the\n"
+               "FAIL: shipped converter; in a HIP build this is a real gap, not a skip. Check that\n"
+               "FAIL: the backend was rebuilt and exports the symbol (nm -D libggml-hip.so.0).\n");
+        rc = 1;
+    } else if (g_p3_state == P3_LIB_ABSENT) {
+#ifdef TEST_REPACK_NIBBLE_REQUIRE_P3
+        printf("FAIL: this build has the HIP/CUDA backend enabled, but neither libggml-hip.so.0\n"
+               "FAIL: nor libggml-cuda.so.0 is loadable from this test, so P3 (shipped-converter\n"
+               "FAIL: cross-check) cannot run. A silently-passing P3 skip in a HIP build hides a\n"
+               "FAIL: real gap. Make the backend library loadable (LD_LIBRARY_PATH / RPATH) or\n"
+               "FAIL: run in a genuinely non-HIP build, where the skip is legitimate.\n");
+        rc = 1;
+#else
+        printf("WARNING: P3 SKIPPED FOR EVERY CASE -- the shipped converter (repack_host) could not\n"
+               "WARNING: be resolved from libggml-hip.so.0 / libggml-cuda.so.0 (no HIP backend in\n"
+               "WARNING: this build, or its runtime is not on the loader path). The mirror was\n"
+               "WARNING: validated against itself only (P1/P2); P3 is the only check against the\n"
+               "WARNING: shipped converter. Build/run with the HIP backend library loadable to\n"
+               "WARNING: activate P3.\n");
+#endif
+    }
     for (ggml_type t : types) {
         for (auto & s : shapes) {
             const int64_t ne0 = s[0], ne1 = s[1];

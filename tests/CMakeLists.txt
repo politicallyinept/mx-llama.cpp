@@ -184,6 +184,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # nibble-layout round-trip property test for the gfx906 repacked planes
     llama_build(test-repack-nibble-roundtrip.cpp)
     target_include_directories(test-repack-nibble-roundtrip PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+    if (TARGET ggml-cuda OR TARGET ggml-hip)
+        # HIP/CUDA-enabled build: P3 (shipped-converter cross-check) must run.
+        # A silently-passing P3 skip here hides a real gap (reviewer finding).
+        target_compile_definitions(test-repack-nibble-roundtrip PRIVATE TEST_REPACK_NIBBLE_REQUIRE_P3=1)
+    endif()
     llama_test(test-repack-nibble-roundtrip)
 
     # R4: tiled-repack vs generic kernel-level KL sweep (run manually — needs GPU;

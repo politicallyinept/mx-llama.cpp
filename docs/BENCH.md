@@ -2777,3 +2777,27 @@ Changes (this hotfix):
   template parameter and the branch are gone.
 * README flag table updated to the honest state (GEMM restyle NOT implemented;
   repacked-GEMM bit-safety not established; STOCK_ACC default ON).
+
+
+## 94. Q8_0 repack env semantics swap: =1 force-all (historical), =2 shape-gated (2026-11-09)
+
+The hint-wiring batch had made `GGML_CUDA_REPACK_Q8_0=1` mean "qualifying models
+only" and `=2` mean "force all". That silently changed behavior for every
+existing script and dense-model A/B config that exports `=1`: a dense model or a
+layer-split run that used to get the forced repack from `=1` now silently got
+the stock path. This batch swaps the levels back:
+
+* `=1` = FORCE admission for every model - the historical meaning, backward
+  compatible with every existing script and the dense A/B measurement configs.
+* `=2` = admit qualifying models only - the per-model shape-gated mode (3D
+  expert tensors, dense Q8_0 >= `GGML_CUDA_REPACK_Q8_0_MIN_DENSE`, tensor
+  split). The new mode is opt-in via a value no existing config had used.
+* unset / `=0` unchanged (OFF). `GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0` remains
+  required for any admission (unchanged).
+
+Gate banners, the gate comment, and the README flag table were updated to match.
+Verified on the release build: defaults-only greedy bit-id unchanged on the MoE
+TP2 cell; `=1` shows the gate-ACTIVE banner on both the MoE and the dense Q8_0
+model (restored force); `=2` shows gate-ACTIVE on the qualifying MoE and
+gate-inactive on the dense model; the small spec-decode draft stays gate-OFF
+under `=2` with a big MoE main.
