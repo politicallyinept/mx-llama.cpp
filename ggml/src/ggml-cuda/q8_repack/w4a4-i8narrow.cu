@@ -30,7 +30,6 @@ void quantize_row_i8split(const float * GGML_RESTRICT x, block_i8split * GGML_RE
     }
 }
 
-#if defined(GGML_USE_HIP) && defined(__gfx906__)
 
 // SIGNED weight sum of one raw Q4_0 qs uint4: (int) nib_sum_u4 - 256, cast to
 // int BEFORE subtracting (the milestone-3b unsigned-wrap class, see the warning
@@ -66,6 +65,7 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_i8narrow_q40(
         const uint32_t ne0, const uint32_t ne1,
         const uint32_t xs, const uint32_t ys,   // xs = blocks per token column (nkb)
         float * __restrict__ ksplit_ws) {       // KSPLIT partial workspace (or null)
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
     const typename rp_traits<GGML_TYPE_Q4_0>::geom wg(ne0, ne1);
     const uint32_t n_blocks = ne0 >> 5;
 
@@ -180,19 +180,33 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_i8narrow_q40(
         }
         // TODO(post-pause): epilogue reduce kernel, fixed order over blockIdx.z.
     }
+#else
+    __builtin_trap(); /* i8narrow requires HIP gfx906 */
+#endif
 }
 
-template <int T, int NWAVES, int KSPLIT, bool INTERLEAVED>
-void mul_mat_i8narrow_launch(const uint8_t * wbase, const void * hi, const void * lo,
+// Non-template dispatch (standard llama.cpp pattern): T at runtime, switch over
+// the kernel instantiations. KSPLIT>1 needs the second-pass reducer (TODO);
+// only KSPLIT=1 is dispatchable today.
+void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
         const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
-        uint32_t xs, uint32_t ys, float * ksplit_ws, cudaStream_t stream) {
-    // KSPLIT==1: NWAVES*64 rows per block; KSPLIT>1: 64 rows per block, the
-    // other waves split K (kernel geometry comment).
-    const dim3 grid(KSPLIT == 1 ? (ne1 + NWAVES * 64 - 1) / (NWAVES * 64)
-                                : (ne1 + 63) / 64, 1, KSPLIT);
-    mul_mat_i8narrow_q40<T, NWAVES, KSPLIT, INTERLEAVED>
-        <<<grid, NWAVES * 64, 0, stream>>>(wbase, (const uint8_t *) hi, (const uint8_t *) lo,
-                                           dplane, y, ne0, ne1, xs, ys, ksplit_ws);
+        uint32_t xs, uint32_t ys, cudaStream_t stream) {
+    constexpr int NWAVES = 4;
+    const dim3 grid((ne1 + NWAVES * 64 - 1) / (NWAVES * 64), 1, 1);
+    const dim3 blk(NWAVES * 64);
+    switch (T) {
+        case 1:  mul_mat_i8narrow_q40<1, NWAVES, 1, false><<<grid, blk>>>(
+                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        case 2:  mul_mat_i8narrow_q40<2, NWAVES, 1, false><<<grid, blk>>>(
+                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        case 4:  mul_mat_i8narrow_q40<4, NWAVES, 1, false><<<grid, blk>>>(
+                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        case 8:  mul_mat_i8narrow_q40<8, NWAVES, 1, false><<<grid, blk>>>(
+                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        case 16: mul_mat_i8narrow_q40<16, NWAVES, 1, false><<<grid, blk>>>(
+                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        default: GGML_ABORT("i8narrow: unsupported T");
+    }
 }
 
 // TODO(post-pause): quantize_mmq_i8split_cuda device kernel - mirror
@@ -207,35 +221,4 @@ void quantize_mmq_i8split_cuda(const float * __restrict__, void * __restrict__,
     GGML_ABORT("i8narrow device quantizer not authored yet (pre-pause skeleton)");
 }
 
-#else // !GGML_USE_HIP || !__gfx906__
-
-template <int T, int NWAVES, int KSPLIT, bool INTERLEAVED>
-void mul_mat_i8narrow_launch(const uint8_t *, const void *, const void *,
-        const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-        float *, cudaStream_t) {
-    GGML_ABORT("i8narrow requires HIP gfx906 device support");
-}
-void quantize_mmq_i8split_cuda(const float * __restrict__, void * __restrict__,
-        void * __restrict__, void * __restrict__, int64_t, int64_t, int64_t, int64_t,
-        int64_t, int, int, cudaStream_t) {
-    GGML_ABORT("i8narrow requires HIP gfx906 device support");
-}
-
-#endif
-
-// Explicit instantiation set for the microbench (widths 1/2/4/8/16, KSPLIT 1):
-template void mul_mat_i8narrow_launch<1, 4, 1, false>(const uint8_t *, const void *,
-    const void *, const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-    float *, cudaStream_t);
-template void mul_mat_i8narrow_launch<2, 4, 1, false>(const uint8_t *, const void *,
-    const void *, const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-    float *, cudaStream_t);
-template void mul_mat_i8narrow_launch<4, 4, 1, false>(const uint8_t *, const void *,
-    const void *, const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-    float *, cudaStream_t);
-template void mul_mat_i8narrow_launch<8, 4, 1, false>(const uint8_t *, const void *,
-    const void *, const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-    float *, cudaStream_t);
-template void mul_mat_i8narrow_launch<16, 4, 1, false>(const uint8_t *, const void *,
-    const void *, const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
-    float *, cudaStream_t);
+// The dispatch function's switch implicitly instantiates all five widths.

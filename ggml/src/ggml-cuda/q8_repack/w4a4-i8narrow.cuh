@@ -85,7 +85,6 @@ void quantize_mmq_i8split_cuda(const float * __restrict__ x, void * __restrict__
 // Launchers (defined in w4a4-i8narrow.cu). T = tokens (batch width), NWAVES =
 // waves per block, KSPLIT = grid.z K segments (1 = no workgroup split),
 // INTERLEAVED = wave-interleaved weight runs (§5.1 v2 knob).
-template <int T, int NWAVES, int KSPLIT, bool INTERLEAVED>
-void mul_mat_i8narrow_launch(const uint8_t * wbase, const void * hi, const void * lo,
+void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
         const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
-        uint32_t xs, uint32_t ys, float * ksplit_ws, cudaStream_t stream);
+        uint32_t xs, uint32_t ys, cudaStream_t stream);
