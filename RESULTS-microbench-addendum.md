@@ -72,3 +72,11 @@ step. THE VERIFY PASS (~60% of step) REMAINS THE ONLY LEVER THAT MATTERS -
 the i8narrow kernel line (items 3-4) is confirmed as the program's path by
 elimination. A further drafter win (f16 selector, better drafter arch) has
 <= 2% end-to-end ceiling at d4 and is NOT worth pursuing.
+
+### TheRock re-census cross-check (2026-11-11, after the toolchain rule)
+The original census object was built with the apt 7.2.3 clang. Re-census under the
+TheRock amdclang++ (the toolchain all builds must use): vgpr T=1/2/4/8/16 =
+46/46/47/62/62 (apt: 46/46/59/62/62 - T=4 BETTER under TheRock), sgpr
+30/44/62/92/98 (apt: 32/44/64/94/98). Conclusion unchanged: all <= 64 VGPR,
+4 waves/SIMD feasible at every width. Census numbers are compiler-dependent -
+always re-census under the same toolchain as the shipping build.
