@@ -213,12 +213,12 @@ template <int T, int NWAVES, int KSPLIT, bool INTERLEAVED>
 void mul_mat_i8narrow_launch(const uint8_t *, const void *, const void *,
         const ggml_half *, float *, uint32_t, uint32_t, uint32_t, uint32_t,
         float *, cudaStream_t) {
-    NO_DEVICE_CODE;
+    GGML_ABORT("i8narrow requires HIP gfx906 device support");
 }
 void quantize_mmq_i8split_cuda(const float * __restrict__, void * __restrict__,
         void * __restrict__, void * __restrict__, int64_t, int64_t, int64_t, int64_t,
         int64_t, int, int, cudaStream_t) {
-    NO_DEVICE_CODE;
+    GGML_ABORT("i8narrow requires HIP gfx906 device support");
 }
 
 #endif
