@@ -66,7 +66,7 @@ static_assert(sizeof(i8split_geom) >= 24, "i8split_geom layout sanity");
 
 // Wave-interleaved weight run offset (v2 knob, DESIGN §5.1): wave group of 64
 // rows x one 32-value block = one contiguous 1 KB run, 16 B per lane.
-static inline size_t i8narrow_w_interleaved_off(uint32_t row, uint32_t sb, uint32_t n_blocks) {
+static __host__ __device__ inline size_t i8narrow_w_interleaved_off(uint32_t row, uint32_t sb, uint32_t n_blocks) {
     return ((size_t) (row >> 6) * n_blocks + sb) * 1024 + (size_t) (row & 63) * 16;
 }
 
