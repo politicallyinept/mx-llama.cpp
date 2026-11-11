@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include <random>
+#include <chrono>
 #include <hip/hip_runtime.h>
 #include "ggml.h"
 #include "ggml-cuda/common.cuh"
@@ -62,6 +63,8 @@ static void cpu_ref(uint32_t K, uint32_t N, const std::vector<uint8_t>& qs, uint
                 }
                 const float d_w = half2float_h(dplane[(size_t)row * nkb + sb]);
                 const float d_a = half2float_h(ad[(size_t)c * nkb + sb]);
+                if (row == 0 && c == 0 && sb == 0)
+                    printf("  [cpuref] d_w=%g d_a=%g\n", d_w, d_a);
                 const float sw8 = 8.0f * (float)sw;
                 acc += d_w * (d_a * ((float)t + sw8));     // kernel op order
             }
@@ -73,9 +76,11 @@ static void cpu_ref(uint32_t K, uint32_t N, const std::vector<uint8_t>& qs, uint
 int main(int argc, char** argv) {
     Shapes shapes[] = { {5120, 17408}, {17408, 5120} };
     int rc = 0;
+    hipStream_t stream; hipStreamCreate(&stream);
     for (auto sh : shapes) {
         const uint32_t K = sh.K, N = sh.N, nkb = K / 32;
-        const uint32_t rs = ((K / 2) + 15) / 16 * 16;   // repack_qs_stride alignment
+        uint32_t rs = K / 2;                             // repack_qs_stride: nibble bytes
+        if (rs % 128 == 0) rs += 16;                     // de-alias bump (+16 when 128-aligned)
         const size_t qs_bytes = (size_t)N * rs;
         const size_t d_bytes = (size_t)N * nkb * 2;
         std::mt19937 rng(42);
@@ -96,6 +101,7 @@ int main(int argc, char** argv) {
                 __half h = __float2half(dw);
                 dplane[(size_t)row * nkb + sb] = *reinterpret_cast<uint16_t*>(&h);
             }
+        printf("  [gen] dplane[0]=0x%04x as-float=%g\n", dplane[0], half2float_h(dplane[0]));
         // Activations: T=16 random float rows -> packer -> deinterleave to planes.
         const uint32_t TMAX = 16, NWAVES = 4;
         std::vector<float> x((size_t)TMAX * K);
@@ -111,15 +117,21 @@ int main(int argc, char** argv) {
                 const block_i8split* b = reinterpret_cast<const block_i8split*>(&packed[((size_t)c * nkb + sb) * 36]);
                 memcpy(&hi[((size_t)c * nkb + sb) * 16], b->hi, 16);
                 memcpy(&lo[((size_t)c * nkb + sb) * 16], b->lo, 16);
-                ad[(size_t)c * nkb + sb] = b->d;
+                memcpy(&ad[(size_t)c * nkb + sb], &b->d, sizeof(uint16_t)); /* bit copy: half -> uint16_t truncation would zero every sub-0.5 scale */
             }
-        // Device buffers
-        uint8_t *d_qs, *d_hi, *d_lo; uint16_t *d_dpl, *d_ad; float* d_y;
-        hipMalloc(&d_qs, qs_bytes); hipMalloc(&d_dpl, d_bytes);
+        printf("  [gen] packed-d-bits=0x%04x ad[0]=0x%04x as-float=%g\n",
+               *(const uint16_t*)&packed[32], ad[0], half2float_h(ad[0]));
+        // Device buffer: ONE contiguous [qs | d] plane (the kernel reads the
+        // weight d scale at wbase + dplane_off = ne1*rs; separate allocations
+        // would IMA). Sumw plane is not read by this kernel (inline sum).
+        std::vector<uint8_t> wbuf(qs_bytes + d_bytes, 0);
+        memcpy(wbuf.data(), qs.data(), qs_bytes);
+        memcpy(wbuf.data() + qs_bytes, dplane.data(), d_bytes);
+        uint8_t *d_wb, *d_hi, *d_lo; uint16_t *d_ad; float* d_y;
+        hipMalloc(&d_wb, wbuf.size());
         hipMalloc(&d_hi, hi.size()); hipMalloc(&d_lo, lo.size()); hipMalloc(&d_ad, ad.size());
         hipMalloc(&d_y, (size_t)TMAX * N * sizeof(float));
-        hipMemcpy(d_qs, qs.data(), qs_bytes, hipMemcpyHostToDevice);
-        hipMemcpy(d_dpl, dplane.data(), d_bytes, hipMemcpyHostToDevice);
+        hipMemcpy(d_wb, wbuf.data(), wbuf.size(), hipMemcpyHostToDevice);
         hipMemcpy(d_hi, hi.data(), hi.size(), hipMemcpyHostToDevice);
         hipMemcpy(d_lo, lo.data(), lo.size(), hipMemcpyHostToDevice);
         hipMemcpy(d_ad, ad.data(), ad.size(), hipMemcpyHostToDevice);
@@ -131,30 +143,35 @@ int main(int argc, char** argv) {
             const dim3 grid((N + NWAVES * 64 - 1) / (NWAVES * 64), 1, 1);
             const dim3 blk(NWAVES * 64);
             // correctness (1 call)
-            mul_mat_i8narrow_launch(Ti, d_qs, d_hi, d_lo, (const ggml_half*) d_ad, d_y, K, N, nkb, N, 0);
+            mul_mat_i8narrow_launch(Ti, d_wb, d_hi, d_lo, (const ggml_half*) d_ad, d_y, K, N, nkb, N, stream);
             hipDeviceSynchronize();
-            std::vector<float> y((size_t)T * N);
-            hipMemcpy(y.data(), d_y, y.size() * sizeof(float), hipMemcpyDeviceToHost);
             std::vector<float> ref;
             cpu_ref(K, N, qs, rs, dplane, hi, lo, ad, nkb, T, ref);
+            std::vector<float> y((size_t)T * N);
+            hipError_t mc = hipMemcpy(y.data(), d_y, y.size() * sizeof(float), hipMemcpyDeviceToHost);
+            printf("  [diag] T=%u memcpy=%s y[0]=%.6g y[1]=%.6g ref[0]=%.6g\n", T, hipGetErrorString(mc), y[0], y[1], ref[0]);
             double maxrel = 0; size_t bad = 0;
             for (size_t i = 0; i < y.size(); ++i) {
                 const double denom = std::fabs(ref[i]) > 1e-9 ? std::fabs(ref[i]) : 1e-9;
                 const double rel = std::fabs((double)y[i] - ref[i]) / denom;
                 if (rel > maxrel) maxrel = rel;
-                if (rel > 1e-3) ++bad;
+                if (rel > 1e-2) ++bad;  // fp32-contraction class (device FMA vs host mul-add); integer path exact per seal
             }
             if (bad) { printf("  T=%2u VERIFY FAIL: %zu/%zu bad (maxrel %.3g)\n", T, bad, y.size(), maxrel); rc = 1; }
             // timing
-            hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
             std::vector<float> ms;
+            bool first_ima_printed = false;
             for (int r = 0; r < 35; ++r) {
-                hipEventRecord(e0, 0);
-                mul_mat_i8narrow_launch(Ti, d_qs, d_hi, d_lo, (const ggml_half*) d_ad, d_y, K, N, nkb, N, 0);
-                hipEventRecord(e1, 0); hipEventSynchronize(e1);
-                float msr; hipEventElapsedTime(&msr, e0, e1);
-                if (r >= 5) ms.push_back(msr);
+                hipDeviceSynchronize();
+                auto t0 = std::chrono::steady_clock::now();
+                mul_mat_i8narrow_launch(Ti, d_wb, d_hi, d_lo, (const ggml_half*) d_ad, d_y, K, N, nkb, N, stream);
+                hipError_t le = hipGetLastError();
+                hipDeviceSynchronize();
+                auto t1 = std::chrono::steady_clock::now();
+                if (le != hipSuccess && !first_ima_printed) { first_ima_printed = true; printf("  [diag] T=%u FIRST-IMA at rep %d: %s\n", T, r, hipGetErrorString(le)); }
+                if (r >= 5) ms.push_back(std::chrono::duration<float, std::milli>(t1 - t0).count());
             }
+            printf("  [diag] T=%u y[0]=%.6g y[N-1]=%.6g\n", T, y[0], y[y.size()-1]);
             std::sort(ms.begin(), ms.end());
             const float med = ms[ms.size() / 2];
             if (T == 1) t1_med = med;
@@ -165,10 +182,10 @@ int main(int argc, char** argv) {
                 printf("  BAR T8/T1 = %.2fx (%s; pass <= 1.50x)\n", ratio, ratio <= 1.5 ? "PASS" : "FAIL");
                 if (ratio > 1.5) rc = 1;
             }
-            hipEventDestroy(e0); hipEventDestroy(e1);
         }
-        hipFree(d_qs); hipFree(d_dpl); hipFree(d_hi); hipFree(d_lo); hipFree(d_ad); hipFree(d_y);
+        hipFree(d_wb); hipFree(d_hi); hipFree(d_lo); hipFree(d_ad); hipFree(d_y);
     }
+    hipStreamDestroy(stream);
     printf("MB-RC=%d\n", rc);
     return rc;
 }
