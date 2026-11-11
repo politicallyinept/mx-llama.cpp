@@ -104,3 +104,13 @@ NOTE: the old "floor off: gate1 bare + MTP = -40% decode - never ship" verdict
 does NOT reproduce on this config (DFlash2 d4 + DOT8=3 + repacked Q4_0 + Q4_0
 drafter) - floor-off is +20-24% here. Verdicts are config-specific; re-measure
 per config before citing old floor verdicts.
+
+
+## REVISIT (owner decision, 2026-11-11): floor-0 forced-W4A4 serving config
+The F5 config (GGML_CUDA_W4A4_MIN_TOKENS=0, env-only) is PARKED pending the rest of
+the int4 doc queue. Established: +20-24% spec tg (45.4 t/s), -3% acceptance, ~2x
+narrow-width KL (1.357 vs 0.684; BELOW rq's own 1.455), greedy first-decode token
+changes, wide-prefill KLD unchanged (byte-identical 0.065577). Revisit trigger:
+after the doc queue items are worked through; the config is env-only and reversible
+per fleet entry. The KLD ladder protocol + raw captures are committed for re-measurement
+(docs/KLD-LADDER-w4a4-forced.md; harness profiles kld{ref,cand}-*.json).
