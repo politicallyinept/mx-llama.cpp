@@ -37,3 +37,38 @@ Structural fixes to the skeleton (commit c3b7fcb1f5 + this commit):
 
 Open items: T=16 plane-corruption bug; shape-2 occupancy variant (row/K split);
 stock-nc-kernel head-to-head arm; KSPLIT>1 reducer.
+
+
+## DRAFTER-LEVER EXPERIMENT (F4q) + np4 PROBE — 2026-11-11 (late session)
+
+### Cell C2 correction (supersedes the cell-C finding above)
+The earlier "np4 + DFlash2 d7 soft-hangs the server at the slot-orchestration layer"
+claim is RETIRED - it was a DRIVER artifact, not a server defect (analysis doc:
+docs/ANALYSIS-np4-dflash-hang.md, commit de84e63b):
+1. leg_b_prof.sh read prompts.json key 'prompt'; the file uses 'text_pp' -> P1/P2
+   were empty -> 9 of 12 request bodies were malformed JSON (400 parse errors).
+2. The cell-C-only bare `wait` at leg_b_prof.sh:87 waited for ALL background jobs -
+   including the setsid'd llama-server child (setsid does not fork from a
+   non-interactive shell) -> blocked forever. Slots 0/1/2 never received work.
+CORRECTED PROBE (fixed key + explicit curl pids): np4 + DFlash2 d7 COMPLETED in
+54 s - 4 concurrent requests, slots launched and finished, acceptance 0.59/request,
+clean teardown. np4 concurrency with the draft path WORKS; latent hazard H2
+(deferred-encode flush, speculative.cpp:1055-1061/1253-1355) not exercised.
+
+### F4q: Q4_0-requantized drafter (the drafter-bandwidth lever)
+Drafter: z-lab DFlash2 Q8_0 (2.06 GB) -> Q4_0 (1.09 GB, sha 92d2e2d5...;
+all 49 Q8_0 tensors -> Q4_0, norms stayed F32, arch dflash + all 51 KV preserved;
+selector_predecessor/successor/hidden weights ALSO requantized - acceptance risk noted).
+Result (np1, d4, replicated, 8-prompt suite, same protocol as F1/F2):
+- tg256 median 36.6 t/s vs F1/F2 37.8/38.0 -> -3%, WITHIN NOISE, NOT A WIN.
+- acceptance UNCHANGED: pooled 2.396 vs 2.39; per-pos (0.620,0.394,0.268,0.184)
+  vs (0.624,0.388,0.269,0.185) - the 4-bit selector did NOT hurt acceptance.
+- phase-level (statistics dur): draft gen 43094 ms vs F1 51066 ms = -15.7%
+  per-call 14.13 -> 11.92 ms - the drafter IS faster, exactly tracking the
+  -46% drafter bytes at partial bandwidth sensitivity.
+CONCLUSION: the drafter lever is phase-real but END-TO-END IRRELEVANT at d4:
+the drafter is only ~14% of the step (11.9 of ~90 ms), so -16% drafter = ~-2%
+step. THE VERIFY PASS (~60% of step) REMAINS THE ONLY LEVER THAT MATTERS -
+the i8narrow kernel line (items 3-4) is confirmed as the program's path by
+elimination. A further drafter win (f16 selector, better drafter arch) has
+<= 2% end-to-end ceiling at d4 and is NOT worth pursuing.

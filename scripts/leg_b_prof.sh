@@ -20,26 +20,39 @@ done
 exec 9>/root/gpu.lock
 flock -w 1800 9 || { echo "LOCKFAIL B-$CELL"; exit 1; }
 awk '/MemAvailable/{exit !($2>=12582912)}' /proc/meminfo || { echo "GATE-RAM-FAIL"; exit 99; }
-DEVS=$(python3 -c '
+probe_gpus() {
+python3 -c '
 import subprocess,re
 o=subprocess.run(["rocm-smi","--showmeminfo","vram"],capture_output=True,text=True).stdout
 free=[]
 for l in o.splitlines():
     m=re.match(r"GPU\[(\d+)\].*Used Memory \(B\):\s*(\d+)",l)
     if m and int(m.group(2))<2*1024**3: free.append(m.group(1))
-print(",".join(free[:2]) if len(free)>=2 else "")')
-if [ -z "$DEVS" ] && rocm-smi --showpids 2>/dev/null | grep -q "No KFD PIDs"; then
-  DEVS=$(python3 -c '
+print(",".join(free[:2]) if len(free)>=2 else "")'
+}
+probe_leak() {
+python3 -c '
 import subprocess,re
 o=subprocess.run(["rocm-smi","--showmeminfo","vram"],capture_output=True,text=True).stdout
 free=[]
 for l in o.splitlines():
     m=re.match(r"GPU\[(\d+)\].*Used Memory \(B\):\s*(\d+)",l)
     if m and int(m.group(2))<25*1024**3: free.append(m.group(1))
-print(",".join(free[:2]) if len(free)>=2 else "")')
-  [ -n "$DEVS" ] && echo "LEAK-TOLERATED: $DEVS"
-fi
-[ -n "$DEVS" ] || { echo "GATE-GPU-FAIL"; exit 96; }
+print(",".join(free[:2]) if len(free)>=2 else "")'
+}
+# G3: WAIT for two free GPUs (fleet/other-agent co-tenants), max 60x60s, then leak-tolerated fallback
+DEVS=""
+for gi in $(seq 1 60); do
+  DEVS=$(probe_gpus)
+  [ -n "$DEVS" ] && break
+  if [ $gi -ge 2 ] && rocm-smi --showpids 2>/dev/null | grep -q "No KFD PIDs"; then
+    DEVS=$(probe_leak)
+    [ -n "$DEVS" ] && { echo "LEAK-TOLERATED: $DEVS"; break; }
+  fi
+  [ "$gi" = 60 ] && { echo "GATE-GPU-FAIL after wait"; exit 96; }
+  sleep 60
+done
+
 
 case "$CELL" in
   A) NMAX=7; NP=1; SPEC='--spec-type draft-dflash --spec-draft-n-max 7'; PORT=8613; MD="-md $D" ;;
@@ -74,8 +87,8 @@ grep -iE "draft-dflash|draft-mtp|n_max|speculative" "$LOG.server.log" | head -5 
 tr '\0' ' ' < /proc/$SRV/cmdline | tee -a "$LOG.witness"
 
 # Prompts: 2 prose from the natural set + 1 structured JSON-ish
-P1=$(python3 -c "import json;d=json.load(open('/root/mtp-natural/prompts.json'));ps=d['prompts'] if isinstance(d,dict) else d;print(json.dumps(ps[0]['prompt'] if isinstance(ps[0],dict) else ps[0]))")
-P2=$(python3 -c "import json;d=json.load(open('/root/mtp-natural/prompts.json'));ps=d['prompts'] if isinstance(d,dict) else d;print(json.dumps(ps[3]['prompt'] if isinstance(ps[3],dict) else ps[3]))")
+P1=$(python3 -c "import json;d=json.load(open('/root/mtp-natural/prompts.json'));ps=d['prompts'] if isinstance(d,dict) else d;e=ps[0];print(json.dumps(e.get('text_pp') or e.get('prompt') or e.get('text','')))")
+P2=$(python3 -c "import json;d=json.load(open('/root/mtp-natural/prompts.json'));ps=d['prompts'] if isinstance(d,dict) else d;e=ps[3];print(json.dumps(e.get('text_pp') or e.get('prompt') or e.get('text','')))")
 P3='"Write a JSON config for a web service: port 8443, 4 worker threads, TLS cert paths, a cache block with 3 backends and per-backend timeouts, then explain each field in one sentence."'
 req() { curl -s -m 900 "http://127.0.0.1:$PORT/completion" -d "{\"prompt\":$1,\"n_predict\":256,\"temperature\":0,\"cache_prompt\":false,\"ignore_eos\":true}" > /dev/null; }
 # warmups (2x same shape)
@@ -84,7 +97,8 @@ req "$P1"; req "$P1"
 req "$P1"; req "$P2"; req "$P1"; req "$P3"; req "$P2"; req "$P3"
 # np4 cell: fire 4 concurrent mid-run too
 if [ "$CELL" = C ]; then
-  req "$P1" & req "$P2" & req "$P3" & req "$P1" & wait
+  req "$P1" & c1=$!; req "$P2" & c2=$!; req "$P3" & c3=$!; req "$P1" & c4=$!
+  wait $c1 $c2 $c3 $c4
 fi
 grep -E 'draft acceptance' "$LOG.server.log" | tail -2 | tee -a "$LOG.log"
 grep -E 'server_loop_timing|t_dec_' "$LOG.server.log" | tail -3 | tee -a "$LOG.log"
