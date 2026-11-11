@@ -80,3 +80,27 @@ TheRock amdclang++ (the toolchain all builds must use): vgpr T=1/2/4/8/16 =
 30/44/62/92/98 (apt: 32/44/64/94/98). Conclusion unchanged: all <= 64 VGPR,
 4 waves/SIMD feasible at every width. Census numbers are compiler-dependent -
 always re-census under the same toolchain as the shipping build.
+
+
+## F5: FORCED W4A4 ACTIVATIONS (floor=0) — 2026-11-11 late session — MAJOR FINDING + QUALITY CAVEAT
+Config: Q4_0 drafter + GGML_CUDA_W4A4_MIN_TOKENS=0 (explicit; overrides the speed
+preset; profile otherwise speed/DOT8=3/KSPLIT=1/SUMW=1). Witness: resolution line
+"MIN_TOKENS=0 (explicit)" + "GGML_CUDA_W4A4_MIN_TOKENS=0 [explicit]" gate banner.
+RESULT (np1, d4, replicated, 8-prompt suite, same protocol as F1/F2/F4q):
+- tg256 median 45.4 t/s vs F4q 36.6 (+24%) and F1/F2 (Q8_0 drafter, floor ON) 37.8/38.0 (+20%).
+- acceptance 2.328 vs 2.396/2.39 = -3% only.
+- per-phase: TARGET VERIFY (width 5, n=3665) 33.5 ms/call vs F1-derived 44.6 = -25%
+  <- THE WIN IS TARGET-SIDE. The drafter is UNCHANGED (draft-fwd 11.40 ms vs 11.92).
+  The drafter-only variant would therefore win ~nothing - the lever is the
+  TARGET's verify batches going u4act at narrow widths.
+- pp4096 555.5 (flat); prefill chunks (w2048) 1.158 s/chunk with u4x16 in play.
+CAVEAT (the reason the floor exists): with floor=0 the TARGET model computes its
+decode/verify with 4-bit ACTIVATIONS - the served model's output quality moves to
+the u4act class (era-1 runtime KLD 0.0756 vs sealed 0.0499 = +51% KLD class on
+stock-weight Q4_0; this config is repacked-Q4_0 + u4act narrow decode + u4x16
+prefill - KLD NOT yet measured). The -3% acceptance is NOT the quality cost;
+the KLD ladder on this exact config is the missing number. Owner's Pareto call.
+NOTE: the old "floor off: gate1 bare + MTP = -40% decode - never ship" verdict
+does NOT reproduce on this config (DFlash2 d4 + DOT8=3 + repacked Q4_0 + Q4_0
+drafter) - floor-off is +20-24% here. Verdicts are config-specific; re-measure
+per config before citing old floor verdicts.
