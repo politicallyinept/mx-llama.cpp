@@ -30,7 +30,14 @@ static inline void signal_handler(int signal) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        // INT4-noquant branch fix (task M4): exit() is not async-signal-safe.
+        // When a second SIGTERM lands while the main thread is already in
+        // teardown/exit(), __run_exit_handlers runs reentrantly on the
+        // interrupted thread -> corrupted exit-function list (GP fault in
+        // libc) or futex deadlock. _exit() is async-signal-safe and matches
+        // the "terminate immediately" intent; the kernel reclaims mappings
+        // and GPU buffers via driver release on process teardown.
+        _exit(1);
     }
 
     shutdown_handler(signal);
