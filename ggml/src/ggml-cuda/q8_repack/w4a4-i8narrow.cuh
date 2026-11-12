@@ -88,3 +88,12 @@ void quantize_mmq_i8split_cuda(const float * __restrict__ x, void * __restrict__
 void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
         const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
         uint32_t xs, uint32_t ys, cudaStream_t stream);
+
+// KSPLIT-aware overload. ksplit=1 == the overload above (single pass, no ws).
+// ksplit in {2,4,8}: pass 1 grid=(ceil(ne1/64), 1, ksplit) writes per-workgroup
+// fp32 partials to ksplit_ws[ksplit][ne1][T] (CALLER-ALLOCATED, must outlive the
+// two launches), then a fixed-order second-pass reducer writes y. Deterministic:
+// no fp32 atomics anywhere.
+void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
+        const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
+        uint32_t xs, uint32_t ys, cudaStream_t stream, int ksplit, float * ksplit_ws);
