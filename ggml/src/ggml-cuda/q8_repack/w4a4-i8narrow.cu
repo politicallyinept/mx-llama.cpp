@@ -3,6 +3,7 @@
 // Design + seal references: docs/DESIGN-i8-narrow-kernel.md, seals/seal_i8split.cc.
 
 #include "w4a4-i8narrow.cuh"
+#include "../quantize.cuh"   // CUDA_QUANTIZE_BLOCK_SIZE_MMQ (quantizer grid math)
 
 #include <cassert>
 
@@ -272,16 +273,116 @@ void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, cons
             ksplit_ws, y, ne1, (uint32_t) T, ys, (uint32_t) ksplit);
 }
 
-// TODO(post-pause): quantize_mmq_i8split_cuda device kernel - mirror
-// quantize_mmq_q8_1_u4 (quantize.cu:579-672): same min/max shuffle reduce, same
-// roundf/clamp/f16-scale semantics as quantize_row_q8_1_ref, then emit the two
-// nibble planes + scale plane (token-major ib = (z*ne1 + x)*nkb + k_block,
-// quantize.cu:657-665). NOT authored yet: the microbench can seed activations
-// through the host packer first.
-void quantize_mmq_i8split_cuda(const float * __restrict__, void * __restrict__,
-        void * __restrict__, void * __restrict__, int64_t, int64_t, int64_t, int64_t,
-        int64_t, int, int, cudaStream_t) {
-    GGML_ABORT("i8narrow device quantizer not authored yet (pre-pause skeleton)");
+// ---------------------------------------------------------------------------
+// Device quantizer: fp32 -> three SPLIT planes (hi | lo | d), token-major.
+// Authored for task B2 (was a GGML_ABORT stub). Mirrors quantize_mmq_q8_1_u4
+// (quantize.cu:579-672): same thread mapping (one thread per 4 values, 8
+// threads per 32-value block, canonical Q4_0 pairing byte j = {val j low,
+// val j+16 high}), same shuffle-reduce style - but with the q8_1 SYMMETRIC
+// semantics of quantize_row_q8_1_ref (ggml-quants.c:302): amax over the
+// 32-value block, d = amax/127 (f32, stored f16), id = 1/d, a = roundf(x*id)
+// clamped to [-127,127]. That produces bit-identical int8 codes to the stock
+// q8_1 activation path (seal invariant), then the lossless nibble split
+// a_hi = (a>>4)&0xF, lo stored (a&0xF)^8 (dot8 sees the signed a&0xF - 8).
+//
+// LAYOUT (i8split_geom, w4a4-i8narrow.cuh): three separate planes,
+//   ib = (z*ne1 + x)*nkb + k_block   (token-major; nkb = ne0/32)
+//   hi[ib] 16 B, lo[ib] 16 B, d[ib] 2 B (f16 bits).
+// Out-of-range threads (i0 in [ne00, ne0)) write the zero-input pattern
+// (a = 0, d = 0) into the row padding, exactly like the q8_1 MMQ quantizer;
+// the padding blocks are never read by the kernel (it stops at ne00/32).
+static __global__ void quantize_mmq_i8split(
+        const float * __restrict__ x,
+        void * __restrict__ vhi, void * __restrict__ vlo, void * __restrict__ vd,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int ne1, const int ne2) {
+
+    const int64_t i0 = ((int64_t) blockDim.x*blockIdx.y + threadIdx.x)*4;
+
+    if (i0 >= ne0) {
+        return;
+    }
+
+    const int64_t i2  = blockIdx.z % ne2;
+    const int64_t i3  = blockIdx.z / ne2;
+    const int64_t i01 = blockIdx.x;
+    const int64_t base_idx = i3*s03 + i2*s02 + i01*s01;
+
+    const int64_t k_block = i0 / 32; // 32-value block index in the channel
+    const int64_t iqs     = i0 % 32; // value index in the block (0, 4, ..., 28)
+
+    // De-interleaved value mapping mirroring the canonical Q4_0 WEIGHT layout
+    // (same as quantize_mmq_q8_1_u4: thread t of the 8 covering one block owns
+    // output bytes 2t,2t+1: low nibbles = values 2t,2t+1; high = 2t+16,2t+17).
+    const int64_t blk = i0 - iqs;
+    const int     t   = (int) (iqs / 4);
+
+    const float2 va = (blk + 2*t + 1  < ne00)
+        ? *(const float2 *) (x + base_idx + blk + 2*t)      : make_float2(0.0f, 0.0f);
+    const float2 vb = (blk + 2*t + 17 < ne00)
+        ? *(const float2 *) (x + base_idx + blk + 2*t + 16) : make_float2(0.0f, 0.0f);
+
+    // amax across the 8 threads covering one 32-value block (exact under any
+    // fold order; same shuffle idiom as quantize_mmq_q8_1_u4).
+    float amax = fmaxf(fmaxf(fabsf(va.x), fabsf(va.y)), fmaxf(fabsf(vb.x), fabsf(vb.y)));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+
+    // quantize_row_q8_1_ref semantics: f32 d/id, f16 STORE of d, roundf,
+    // clamp [-127,127] (the clamp is a no-op in range - |x*id| <= 127 - and
+    // guards NaN/inf edges exactly like the stock device quantizer).
+    const float d  = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+
+    int a0 = (int) roundf(va.x * id);   // value 2t
+    int a1 = (int) roundf(va.y * id);   // value 2t+1
+    int a2 = (int) roundf(vb.x * id);   // value 2t+16
+    int a3 = (int) roundf(vb.y * id);   // value 2t+17
+    a0 = a0 < -127 ? -127 : (a0 > 127 ? 127 : a0);
+    a1 = a1 < -127 ? -127 : (a1 > 127 ? 127 : a1);
+    a2 = a2 < -127 ? -127 : (a2 > 127 ? 127 : a2);
+    a3 = a3 < -127 ? -127 : (a3 > 127 ? 127 : a3);
+
+    // Nibble split, canonical pairing: byte 2t   = {val 2t hi/lo, val 2t+16},
+    // byte 2t+1 = {val 2t+1, val 2t+17}. hi nibble = (a>>4)&0xF (arithmetic
+    // shift then mask - same expression as the host packer quantize_row_i8split);
+    // lo nibble stored (a&0xF)^8 so dot8 sees the signed value (a&0xF)-8.
+    const uint32_t hi_packed =  ((uint32_t) ((a0 >> 4) & 0xF))
+                             | ((uint32_t) ((a2 >> 4) & 0xF) <<  4)
+                             | ((uint32_t) ((a1 >> 4) & 0xF) <<  8)
+                             | ((uint32_t) ((a3 >> 4) & 0xF) << 12);
+    const uint32_t lo_packed =  ((uint32_t) ((a0 & 0xF) ^ 8))
+                             | ((uint32_t) ((a2 & 0xF) ^ 8) <<  4)
+                             | ((uint32_t) ((a1 & 0xF) ^ 8) <<  8)
+                             | ((uint32_t) ((a3 & 0xF) ^ 8) << 12);
+
+    const int64_t nkb = ne0 / 32; // 32-value blocks per channel column
+    const int64_t ib  = ((int64_t) blockIdx.z * ne1 + blockIdx.x) * nkb + k_block;
+
+    // one 16-bit store per plane for the nibble pair, one 16-bit d store by
+    // the block's first thread (planes are separate allocations - i8split_geom).
+    *(uint16_t *) ((char *) vhi + ib*16 + 2*t) = (uint16_t) hi_packed;
+    *(uint16_t *) ((char *) vlo + ib*16 + 2*t) = (uint16_t) lo_packed;
+    if (iqs == 0) {
+        *(uint16_t *) ((char *) vd + ib*2) = __half_as_ushort((ggml_half) d);
+    }
+}
+
+void quantize_mmq_i8split_cuda(const float * __restrict__ x, void * __restrict__ vhi,
+        void * __restrict__ vlo, void * __restrict__ vd,
+        int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+        int64_t ne0, int ne1, int ne2, int ne3, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % 4 == 0);
+    GGML_ASSERT(ne0 % 32 == 0);
+    // Grid/block structure identical to quantize_mmq_q8_1_u4_cuda: one block.y
+    // per 512 padded values, block.x = 128 threads (4 values each), z = slices.
+    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    const dim3 num_blocks((unsigned) ne1, (unsigned) block_num_y, (unsigned) (ne2*ne3));
+    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
+    quantize_mmq_i8split<<<num_blocks, block_size, 0, stream>>>(
+        x, vhi, vlo, vd, ne00, s01, s02, s03, ne0, (int) ne1, (int) ne2);
 }
 
 // The dispatch function's switch implicitly instantiates all five widths.

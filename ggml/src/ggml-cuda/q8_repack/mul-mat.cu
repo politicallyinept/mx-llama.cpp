@@ -5,6 +5,7 @@
 #include "repack-kernels.cuh"
 #include "gcn-u4-gemm.cuh"   // Tier-3.7b: GGML_CUDA_REPACK_Q4_0_TILED tiled GEMM
 #include "w4a4-profile.h"   // GGML_CUDA_W4A4_PROFILE: resolved int4-knob presets
+#include "w4a4-i8narrow.cuh"   // task B2: GGML_CUDA_I8NARROW narrow-batch route
 #include "../quantize.cuh"
 #include "../mmq.cuh"
 #include "../gcn-q8-gemm.cuh"   // E4 gcn_kq yield: ggml_cuda_gcn_kq_gemm
@@ -52,6 +53,24 @@ static bool rp_q8_0_restyle_on(void) {
         const bool r = e == nullptr || atoi(e) != 0;
         if (r) {
             GGML_LOG_WARN("CUDA repack: GGML_CUDA_REPACK_Q8_0_RESTYLE gate ACTIVE: repacked Q8_0 mat-vec uses four scaled fp32 terms per 32-value block (stock granularity); GEMM restyle not wired\n");
+        }
+        return r;
+    }();
+    return on;
+}
+
+// task B2 (INT4-noquant-dispatch): GGML_CUDA_I8NARROW=1 routes the repacked
+// Q4_0 narrow-batch window onto the i8narrow exact-8-bit-split kernel
+// (mul_mat_i8narrow_launch, q8_repack/w4a4-i8narrow.cu). DEFAULT OFF: with
+// the env unset/0 the dispatch-site branch is never taken and the serving
+// path is byte-identical to the pre-gate build (the gate is a dispatch-site
+// if; no numeric change anywhere else).
+static bool rp_i8narrow_on(void) {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_I8NARROW");
+        const bool r = e != nullptr && atoi(e) != 0;
+        if (r) {
+            GGML_LOG_WARN("[I8NARROW] gate ACTIVE: repacked Q4_0 narrow-batch window (T in {1,2,4,8,16}) routes to mul_mat_i8narrow_launch (exact 8-bit split activations, [qs|d] planes)\n");
         }
         return r;
     }();
@@ -349,6 +368,52 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         // for reference; `u4p_decode` is a constant false so the branch is
         // unreachable at runtime while the template instantiation survives.
         // Gate=2 decode runs the per-32 u4act path (same as gate=1).
+        // ---- task B2: i8narrow env-gated route (DEFAULT OFF) ----
+        // Admission mirrors this window's repacked-Q4_0 identification: the
+        // call reached ggml_cuda_mul_mat_repacked only when
+        // ggml_cuda_repack_mul_mat_should_fire(src0) held (the q8_repack
+        // admission; Q4_0 is the GGML_CUDA_REPACK_Q4_0 opt-in in
+        // repack-common.cu), and the repacked Q4_0 record IS the i8narrow-
+        // compatible [qs|d] two-plane layout the kernel reads (rp_traits<
+        // Q4_0>: raw nibble plane + f16 d plane at ne1*qs_stride; the kernel
+        // sums nibbles inline, so no SUMW plane is required). Only the
+        // instantiated widths {1,2,4,8,16} route here; 3/5/6/7 fall through
+        // to the existing path below. With the gate OFF this branch is a
+        // constant false and every line below is untouched code.
+        if (rp_i8narrow_on() && src0->type == GGML_TYPE_Q4_0 && ggml_cuda_repack_mul_mat_should_fire(src0) &&
+                (ne11 == 1 || ne11 == 2 || ne11 == 4 || ne11 == 8 || ne11 == 16)) {
+            const int64_t i8_s11 = src1->nb[1] / sizeof(float);
+            const int64_t i8_s12 = src1->nb[2] / sizeof(float);
+            const int64_t i8_s13 = src1->nb[3] / sizeof(float);
+            // ALLOC MATH: same block COUNT as the u4 narrow path (ne13*ne12*
+            // ne11*x_stride blocks), three planes at 16 B / 16 B / 2 B per
+            // block (i8split_geom). Bypasses the q8_1 activation cache: the
+            // split layout must not share cache entries with variant 0.
+            const size_t i8_nblk = (size_t) (ne13 * ne12 * ne11 * x_stride);
+            ggml_cuda_pool_alloc<uint8_t>   i8_hi(ctx.pool()); i8_hi.alloc(i8_nblk * 16);
+            ggml_cuda_pool_alloc<uint8_t>   i8_lo(ctx.pool()); i8_lo.alloc(i8_nblk * 16);
+            ggml_cuda_pool_alloc<ggml_half> i8_d(ctx.pool());  i8_d.alloc(i8_nblk);
+            // ne0 = ne10_padded: the kernel indexes activations with xs =
+            // x_stride (padded blocks per token), same convention as the
+            // u4 narrow-path quantizer call below.
+            quantize_mmq_i8split_cuda((const float *) src1->data, i8_hi.get(), i8_lo.get(), i8_d.get(),
+                ne10, i8_s11, i8_s12, i8_s13, ne10_padded, ne11, ne12, ne13, stream);
+            const uint32_t i8_dst_s1 = dst->nb[1] / sizeof(float);
+            for (int64_t i3 = 0; i3 < ne13; i3++) {
+            for (int64_t i2 = 0; i2 < ne12; i2++) {
+                // PLANE OFFSETS in the planes' own element size (16 B / 16 B /
+                // 2 B per block), block COUNT identical across planes - the
+                // same per-slice offset pattern as the u4 path below.
+                const size_t i8_off = (size_t) (i3 * ne12 + i2) * ne11 * x_stride;
+                float * dst_d = (float *)((char *) dst->data + i3 * dst->nb[3] + i2 * dst->nb[2]);
+                mul_mat_i8narrow_launch((int) ne11, w,
+                    i8_hi.get() + i8_off * 16, i8_lo.get() + i8_off * 16, i8_d.get() + i8_off,
+                    dst_d, (uint32_t) ne00, (uint32_t) ne01,
+                    (uint32_t) x_stride, i8_dst_s1, stream);
+            }
+            }
+            return;
+        }
         const bool u4p_decode = false;
         ggml_cuda_pool_alloc<block_q8_1> src1_q8_1_own;
         ggml_cuda_pool_alloc<block_q8_1_u4> src1_u4_own(ctx.pool());
