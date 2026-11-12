@@ -80,7 +80,7 @@ void quantize_row_i8split(const float * GGML_RESTRICT x, block_i8split * GGML_RE
 void quantize_mmq_i8split_cuda(const float * __restrict__ x, void * __restrict__ vhi,
         void * __restrict__ vlo, void * __restrict__ vd,
         int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
-        int64_t ne0, int ne1, int ne2, cudaStream_t stream);
+        int64_t ne0, int ne1, int ne2, int ne3, cudaStream_t stream);
 
 // Launchers (defined in w4a4-i8narrow.cu). T = tokens (batch width), NWAVES =
 // waves per block, KSPLIT = grid.z K segments (1 = no workgroup split),
