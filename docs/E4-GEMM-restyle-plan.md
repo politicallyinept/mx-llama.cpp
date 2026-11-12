@@ -97,3 +97,15 @@ Ship gate: all green -> flip STOCK_ACC default + README in a separate commit. Ro
 2 widths x dense/HAS_IDS 4-7 d; wiring + gate/banner/docs 1 d; microbench bring-up 2-3 d;
 full gate battery 3-4 d of GPU legs (gpu.lock-serialized). Optional nc 6-8 fold-in: +1-2 d.
 GPU legs unavoidable (bit-identity is a runtime property); scoping needs none.
+
+## Step 0 verdict (2026-11-11, task E1): the restyle premise is REFUTED
+Microbench + ISA forensics (see taskE1-LEDGER.md, docs/E4-step0-results.csv,
+docs/E4-step0-isa-evidence.txt): stock MMQ and the repacked Q8_0 GEMM are BIT-IDENTICAL
+on identical input bytes at 171/171 grid shapes (incl. M<128 fallback and K%256!=0
+classes), both launch-deterministic, and both bit-identical to an independent ascending-K
+fmaf CPU reference. ISA: both emit v_cvt_f32_i32 -> v_mul_f32(d_w,d_x) -> v_fmac_f32 with
+8:1 dp4a:fp32 ratio and zero cross-lane ops; stock stores its per-thread fp32 accumulator
+registers directly. The maps "stock K-split + shared reduce" mechanism does not exist in
+the dp4a path. Step 1 (epilogue restyle) is unnecessary for bit-identity; re-scope to the
+byte-generation checks listed in the ledger (GPU-vs-host repack equivalence, repack vs
+gcn_kq family, HAS_IDS).

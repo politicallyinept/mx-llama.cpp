@@ -1,0 +1,52 @@
+E4 STEP0 ISA EVIDENCE (llvm-objdump, gfx906 code object from mb_e4_gemm fatbin)
+kernels: mul_mat_q<Q8_0,J=64,fb=false> (stock) vs mmq_gemm_repacked_w32<Q8_0> (repacked)
+
+== instruction mix ==
+-- stock_j64
+    512 v_dot4_i32_i8
+    175 v_add_u32_e32
+     64 v_mul_f32_e32
+     64 v_fmac_f32_e32
+     64 v_cvt_f32_i32_e32
+     18 v_add_co_u32_e32
+     18 v_addc_co_u32_e32
+      4 v_add3_u32
+-- rep_w32
+     64 v_dot4_i32_i8
+     10 v_add_u32_e32
+      8 v_mul_f32_e32
+      8 v_fmac_f32_e32
+      8 v_cvt_f32_i32_e32
+      8 v_add_co_u32_e32
+      8 v_addc_co_u32_e32
+      6 v_add_co_u32_e64
+
+== stock fma sites (contraction) ==
+	v_fmac_f32_e32 v53, v3, v2                                 // 00000004107C: 766A0503
+	v_fmac_f32_e32 v54, v5, v4                                 // 000000041138: 766C0905
+	v_mul_f32_e32 v5, v2, v17                                  // 000000041214: 0A0A2302
+	v_fmac_f32_e32 v51, v5, v4                                 // 000000041220: 76660905
+	v_fmac_f32_e32 v52, v20, v19                               // 000000041234: 76682714
+	v_mul_f32_e32 v5, v2, v20                                  // 0000000412F4: 0A0A2902
+	v_fmac_f32_e32 v49, v5, v4                                 // 000000041300: 76620905
+	v_mul_f32_e32 v19, v6, v20                                 // 000000041348: 0A262906
+
+== repack fma sites (contraction) ==
+	v_fmac_f32_e32 v33, v64, v63                               // 00000001EB1C: 76427F40
+	v_mul_f32_e32 v26, v62, v26                                // 00000001EBA4: 0A34353E
+	v_fmac_f32_e32 v34, v26, v71                               // 00000001EBB0: 76448F1A
+	v_fmac_f32_e32 v35, v26, v63                               // 00000001EBE4: 76467F1A
+	v_fmac_f32_e32 v42, v26, v27                               // 00000001EC64: 7654371A
+	v_mul_f32_e32 v26, v62, v26                                // 00000001ECC8: 0A34353E
+	v_fmac_f32_e32 v30, v26, v27                               // 00000001ECCC: 763C371A
+	v_mul_f32_e32 v26, v62, v26                                // 00000001ED34: 0A34353E
+
+== cross-lane ops (permlane|dpp) ==
+stock_j64.dis:0
+rep_w32.dis:0
+
+== stock writeback: stores target the fma accumulator regs ==
+	global_store_dword v[3:4], v53, off                        // 0000000430B4: DC708000 007F3503
+	global_store_dword v[3:4], v54, off offset:256             // 0000000430BC: DC708100 007F3603
+	global_store_dword v[3:4], v52, off                        // 000000043108: DC708000 007F3403
+	global_store_dword v[3:4], v51, off offset:256             // 000000043110: DC708100 007F3303
