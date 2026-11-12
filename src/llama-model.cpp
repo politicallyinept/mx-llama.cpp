@@ -37,6 +37,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -580,9 +581,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool dflash_dsv4_split = dflash_dsv4 && tp_width_eff > 0 &&
                                    hparams.dsv4_o_group_count % tp_width_eff == 0 &&
                                    hparams.n_head() % tp_width_eff == 0;
+    static std::once_flag dsv4_warn_once;
     if (dflash_dsv4 && !dflash_dsv4_split) {
-        LLAMA_LOG_WARN("%s: DSV4 draft backbone cannot be split %zu ways, replicating it\n",
-                       __func__, tp_width_eff);
+        std::call_once(dsv4_warn_once, [&] {
+            LLAMA_LOG_WARN("%s: DSV4 draft backbone cannot be split %zu ways, replicating it (per-load; further lines suppressed)\n",
+                           __func__, tp_width_eff);
+        });
     }
 
     // MQA under tensor-parallel: when the TP group has more lanes than KV heads, the KV
@@ -605,9 +609,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool mqa_cannot_head_split = tp_width_eff > 1 &&
                                        n_head_kv_min > 0 &&
                                        n_head_kv_min < (uint32_t) tp_width_eff;
+    static std::once_flag mqa_warn_once;
     if (mqa_cannot_head_split) {
-        LLAMA_LOG_WARN("%s: %u KV heads cannot be split across %zu TP lanes, replicating attention\n",
-                       __func__, n_head_kv_min, tp_width_eff);
+        std::call_once(mqa_warn_once, [&] {
+            LLAMA_LOG_WARN("%s: %u KV heads cannot be split across %zu TP lanes, replicating attention (per-load; further lines suppressed)\n",
+                           __func__, n_head_kv_min, tp_width_eff);
+        });
     }
 
     const bool replicate_attention = llm_arch_sm_tensor_replicates_attention(ud->model->arch) ||
@@ -646,8 +653,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool head_split_attention = mla_tp_env && replicate_attention &&
                                       (ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
                                        ud->model->arch == LLM_ARCH_DEEPSEEK41 || dflash_dsv4_split);
+    static std::once_flag mla_tp_note_once;
     if (mla_tp_env && replicate_attention && !head_split_attention) {
-        LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A\n", __func__);
+        std::call_once(mla_tp_note_once, [&] {
+            LLAMA_LOG_WARN("%s: LLAMA_MLA_TP is only implemented for deepseek4, using design A (per-load; further lines suppressed)\n", __func__);
+        });
     }
     if (head_split_attention) {
         // A device must own whole output groups for the wo_a group split to be valid, and
