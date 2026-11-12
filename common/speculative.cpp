@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
 #include <cinttypes>
 #include <cmath>
 
@@ -1044,6 +1045,65 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // block-internal attention
     bool causal_attn = false;
 
+    // taskH1: adaptive per-request draft depth (LLAMA_DFLASH_ADAPTIVE=1).
+    // The block width is baked into the draft graph shape, so depth is sticky per
+    // request and only switches in begin(): a mid-request switch would rebuild the
+    // draft graph (~40 ms on MI50, as much as a verification). The decision signal
+    // is (a) a prompt-class heuristic over the prompt text (code/tech markers) and
+    // (b) a chain-saturation memory: the mean accept len the same prompt (hashed)
+    // achieved at the shallow depth in an earlier request.
+    struct depth_ctl {
+        bool    on = false;
+        int32_t n_shallow = 0;
+        int32_t n_deep    = 0;
+        float   sat_thresh = 4.4f;
+
+        struct seq_state {
+            int32_t  depth    = 0;   // active depth for the current request
+            uint64_t hash     = 0;   // prompt hash of the current request
+            uint64_t drafts   = 0;   // verified draft steps in the current request
+            uint64_t accepted = 0;   // accepted tokens in the current request
+        };
+        std::vector<seq_state> seq;
+
+        std::unordered_map<uint64_t, float> sat_len; // prompt hash -> mean accept len at shallow depth
+    };
+    depth_ctl dctl;
+
+    static uint64_t depth_prompt_hash(const llama_tokens & prompt) {
+        uint64_t h = 1469598103934665603ull; // FNV-1a 64
+        for (const auto id : prompt) {
+            const uint64_t v = (uint64_t) (int64_t) id;
+            for (int b = 0; b < 8; ++b) {
+                h ^= (v >> (8*b)) & 0xff;
+                h *= 1099511628211ull;
+            }
+        }
+        return h;
+    }
+
+    // count distinct code/tech markers in the prompt text; >=2 hits => "deep" class
+    int depth_class_hits(llama_context * ctx_tgt, const llama_tokens & prompt) const {
+        static const char * markers[] = {
+            "```", "std::", "=>", "ggml", "llama.cpp", "llama-server",
+            "def ", "import ", "function ", "()", "::", ".cpp", ".cu", ".py", "--spec",
+        };
+        std::string text;
+        for (const auto id : prompt) {
+            if (text.size() >= 8192) {
+                break;
+            }
+            text += common_token_to_piece(ctx_tgt, id);
+        }
+        int hits = 0;
+        for (const char * m : markers) {
+            if (text.find(m) != std::string::npos) {
+                hits++;
+            }
+        }
+        return hits;
+    }
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1142,6 +1202,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        // taskH1: adaptive per-request depth controller (default OFF).
+        // The flag value --spec-draft-n-max stays the UPPER bound (deep depth) so all
+        // output-buffer/graph sizing (n_outputs_max = n_parallel*(n_max+1)) is reserved
+        // for the widest block; the controller drafts the shallow depth when it
+        // predicts depth does not pay. Sizing the server at the shallow bound and
+        // drafting deeper aborts on GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max).
+        {
+            const char * s = getenv("LLAMA_DFLASH_ADAPTIVE");
+            if (s && atoi(s) != 0) {
+                if (!is_dflash2) {
+                    LOG_WRN("%s: LLAMA_DFLASH_ADAPTIVE set but the drafter is not DFlash2 - adaptive depth disabled\n", __func__);
+                } else {
+                    dctl.on = true;
+                    dctl.n_deep    = this->params.n_max;
+                    dctl.n_shallow = 4;
+                    if (const char * t = getenv("LLAMA_DFLASH_SHALLOW")) {
+                        dctl.n_shallow = atoi(t);
+                    }
+                    if (const char * t = getenv("LLAMA_DFLASH_SAT")) {
+                        dctl.sat_thresh = (float) atof(t);
+                    }
+                    if (dctl.n_shallow < 1 || dctl.n_shallow >= dctl.n_deep) {
+                        dctl.on = false;
+                        LOG_WRN("%s: adaptive depth needs 1 <= shallow (%d) < deep (%d) - disabled\n",
+                                __func__, dctl.n_shallow, dctl.n_deep);
+                    } else {
+                        dctl.seq.resize(n_seq);
+                        LOG_INF("%s: adaptive depth ON shallow=%d deep=%d sat_thresh=%.2f\n",
+                                __func__, dctl.n_shallow, dctl.n_deep, dctl.sat_thresh);
+                    }
+                }
+            }
+        }
+
         batch        = common_batch(ctx_dft);
         batch_inject = common_batch(ctx_dft);
 
@@ -1182,6 +1276,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
+        // taskH1: LLAMA_DFLASH_CAUSAL=1/0 overrides the block-internal attention mode after
+        // init - used to A/B whether the trailing MASK slots of a wide block contaminate the
+        // early positions (root-cause probe for the width-5 vs width-8 acceptance gap).
+        {
+            const char * s = getenv("LLAMA_DFLASH_CAUSAL");
+            if (s) {
+                const bool v = atoi(s) != 0;
+                if (v != causal_attn) {
+                    causal_attn = v;
+                    llama_set_causal_attn(ctx_dft, causal_attn);
+                    LOG_WRN("%s: block attention overridden to causal=%d by LLAMA_DFLASH_CAUSAL\n",
+                            __func__, (int) causal_attn);
+                }
+            }
+        }
         // pay the flagged scheduler re-reserve now - inside the first decode it
         // lands in the measured prompt processing time
         llama_sched_reserve(ctx_tgt);
@@ -1226,6 +1335,34 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+
+        // taskH1: sticky per-request depth decision. Flush the previous request's
+        // acceptance into the saturation memory, then pick this request's depth from
+        // the prompt-class heuristic and/or the saturation of this prompt at shallow
+        // depth in an earlier request. Switching here (request start) pays at most one
+        // draft-graph rebuild per switch; mid-request switches never happen.
+        if (dctl.on) {
+            auto & st = dctl.seq[seq_id];
+            if (st.drafts > 0) {
+                const float mean_len = 1.0f + (float) st.accepted / (float) st.drafts;
+                if (st.depth == dctl.n_shallow && dctl.sat_len.size() < 4096) {
+                    dctl.sat_len[st.hash] = mean_len; // saturation signal only from shallow runs
+                }
+                LOG_INF("%s: dflash-depth: seq=%d prev_mean_len=%.3f prev_depth=%d\n",
+                        __func__, (int) seq_id, mean_len, (int) st.depth);
+            }
+
+            st.hash     = depth_prompt_hash(prompt);
+            st.drafts   = 0;
+            st.accepted = 0;
+
+            const int hits = depth_class_hits(params.ctx_tgt, prompt);
+            const auto it  = dctl.sat_len.find(st.hash);
+            const float sat = it != dctl.sat_len.end() ? it->second : -1.0f;
+            st.depth = (hits >= 2 || sat >= dctl.sat_thresh) ? dctl.n_deep : dctl.n_shallow;
+            LOG_INF("%s: dflash-depth: seq=%d depth=%d class_hits=%d sat=%.3f\n",
+                    __func__, (int) seq_id, (int) st.depth, hits, sat);
         }
 
         // replay any chunks still deferred (matches what the eager path would have
@@ -1634,7 +1771,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            // taskH1: per-request sticky depth when the controller is on
+            const int32_t n_draft = dctl.on ? dctl.seq[seq_id].depth : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
@@ -1686,6 +1824,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // GGML_DFLASH_LATTICE=1: dump the per-position selector walk (chosen token,
+                // top-1 candidate, argmax softmax confidence, full top-k set) so width-5 vs
+                // width-8 runs on identical prompts can be diffed position by position.
+                static const bool dlatt = [] () { const char * e = getenv("GGML_DFLASH_LATTICE"); return e != nullptr && atoi(e) != 0; }();
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1693,6 +1836,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
+                    if (dlatt) {
+                        float sum = 0.0f;
+                        for (int k = 0; k < selector_top_k; ++k) {
+                            sum += std::exp(scores[k] - scores[predecessor]);
+                        }
+                        fprintf(stderr, "[DFLASH-LATTICE] seq=%d pos0=%d w=%d i=%d tok=%d top1=%d conf=%.4f topk=",
+                                (int) seq_id, (int) dp.pos0, (int) n_block_tokens, (int) i,
+                                (int) (llama_token) row[predecessor], (int) (llama_token) row[0], 1.0f / sum);
+                        for (int k = 0; k < selector_top_k; ++k) {
+                            fprintf(stderr, "%d%s", (int) (llama_token) row[k], k + 1 < selector_top_k ? "," : "\n");
+                        }
+                    }
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
@@ -1772,8 +1927,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        // taskH1: per-request acceptance bookkeeping for the adaptive depth controller
+        if (is_other || !dctl.on || seq_id < 0 || seq_id >= (llama_seq_id) dctl.seq.size()) {
+            return;
+        }
+        dctl.seq[seq_id].drafts++;
+        dctl.seq[seq_id].accepted += n_accepted;
     }
 };
 
