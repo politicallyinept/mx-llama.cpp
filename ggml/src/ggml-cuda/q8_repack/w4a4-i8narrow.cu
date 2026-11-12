@@ -228,15 +228,15 @@ void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, cons
         const dim3 grid((ne1 + NWAVES * 64 - 1) / (NWAVES * 64), 1, 1);
         const dim3 blk(NWAVES * 64);
         switch (T) {
-            case 1:  mul_mat_i8narrow_q40<1, NWAVES, 1, false><<<grid, blk>>>(
+            case 1:  mul_mat_i8narrow_q40<1, NWAVES, 1, false><<<grid, blk, 0, stream>>>(
                          wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-            case 2:  mul_mat_i8narrow_q40<2, NWAVES, 1, false><<<grid, blk>>>(
+            case 2:  mul_mat_i8narrow_q40<2, NWAVES, 1, false><<<grid, blk, 0, stream>>>(
                          wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-            case 4:  mul_mat_i8narrow_q40<4, NWAVES, 1, false><<<grid, blk>>>(
+            case 4:  mul_mat_i8narrow_q40<4, NWAVES, 1, false><<<grid, blk, 0, stream>>>(
                          wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-            case 8:  mul_mat_i8narrow_q40<8, NWAVES, 1, false><<<grid, blk>>>(
+            case 8:  mul_mat_i8narrow_q40<8, NWAVES, 1, false><<<grid, blk, 0, stream>>>(
                          wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-            case 16: mul_mat_i8narrow_q40<16, NWAVES, 1, false><<<grid, blk>>>(
+            case 16: mul_mat_i8narrow_q40<16, NWAVES, 1, false><<<grid, blk, 0, stream>>>(
                          wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
             default: GGML_ABORT("i8narrow: unsupported T");
         }
