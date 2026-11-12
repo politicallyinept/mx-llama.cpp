@@ -732,16 +732,25 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
     if constexpr (WT == GGML_TYPE_Q8_0 && !U4ACT && !U4P8 && !U4Q41) {
         if (rp_q8_0_restyle_on()) {
             const dim3 grid((unsigned) ne01, 1, 1);
-#define RP_R8NC_LAUNCH(NC) mul_mat_vec_q8_0_repacked8_nc<2, NC> \
-    <<<grid, dim3(64, 2), 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys)
+#define RP_R8NC_LAUNCH(NW, NC) mul_mat_vec_q8_0_repacked8_nc<NW, NC> \
+    <<<grid, dim3(64, NW), 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys)
             switch (ne11) {
-                case 2: RP_R8NC_LAUNCH(2); break;
-                case 3: RP_R8NC_LAUNCH(3); break;
-                case 4: RP_R8NC_LAUNCH(4); break;
-                case 5: RP_R8NC_LAUNCH(5); break;
-                case 6: RP_R8NC_LAUNCH(6); break;
-                case 7: RP_R8NC_LAUNCH(7); break;
-                case 8: RP_R8NC_LAUNCH(8); break;
+                case 2: RP_R8NC_LAUNCH(2, 2); break;
+                case 3: RP_R8NC_LAUNCH(2, 3); break;
+                case 4: RP_R8NC_LAUNCH(2, 4); break;
+                case 5: RP_R8NC_LAUNCH(2, 5); break;
+                // E4 step 3 (task E2): the stock GCN mmvq table runs nwarps=1
+                // at ncols_dst 6-8 (calc_nwarps: 2 warps only for 1-4 plus the
+                // Q8_0 width-5 special case). The warp count sets
+                // blocks_per_iter = vdr*nwarps*warp_size/qi (16 at 1 warp vs 32
+                // at 2), i.e. the kbx->thread partition and the per-thread fp32
+                // accumulation order, and it drops the cross-warp shared
+                // partial. Match the stock geometry per width or 6-8 diverge
+                // (width 8 = dflash verify). mb_nc68_test.cu is the bit-match
+                // harness for this table.
+                case 6: RP_R8NC_LAUNCH(1, 6); break;
+                case 7: RP_R8NC_LAUNCH(1, 7); break;
+                case 8: RP_R8NC_LAUNCH(1, 8); break;
                 default: GGML_ABORT("nc mat-vec: unsupported batch width");
             }
 #undef RP_R8NC_LAUNCH

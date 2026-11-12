@@ -613,7 +613,10 @@ static __global__ void __launch_bounds__(NWARPS*64, 1) mul_mat_vec_q8_0_repacked
 // per 8-value chunk (two dp4a each, VDR_Q8_0_Q8_1_MMVQ=2). This kernel is
 // mul_mat_vec_q8_0_repacked8 generalized to NCOLS token columns per block:
 // identical (block, quarter) partition (kbx = tid/(qi/vdr), kqs = vdr*(qi%)),
-// identical 64-lane x NWARPS=2 launch and shared-partial + 64-lane shfl
+// identical 64-lane launch at the stock warp count for the width (E4 step 3:
+// NWARPS=2 for NCOLS 2-5, NWARPS=1 for 6-8, matching the GCN calc_nwarps table
+// in mmvq.cu -- the warp count sets blocks_per_iter and the cross-warp partial)
+// and shared-partial + 64-lane shfl
 // reduce. The weight chunk (2 ints) and the fp16 scale are loaded once per
 // kbx iteration and shared across the column tile, so the weight traffic
 // stays one row pass per launch. Each column's accumulation is bit-identical
