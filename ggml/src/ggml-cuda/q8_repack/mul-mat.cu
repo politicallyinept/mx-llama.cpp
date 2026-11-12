@@ -59,6 +59,25 @@ static bool rp_q8_0_restyle_on(void) {
     return on;
 }
 
+// taskH2 (width-8 warp A/B): GGML_CUDA_RP_NC68_WARPS=2 forces the 2-warp
+// geometry at nc widths 6-8. The default (unset/1) keeps the task E2 table:
+// 1 warp at 6-8 to bit-match the stock GCN mmvq geometry (d67cd96f0f). At 2
+// warps blocks_per_iter doubles (32 vs 16), the per-thread fp32 accumulation
+// order changes and a cross-warp shared partial appears - NUMERIC DIVERGENCE
+// from stock is expected by design; this gate exists to A/B the perf question
+// (is 1-warp already optimal at width 8?) before any bit-id policy call.
+static int rp_nc68_warps(void) {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_RP_NC68_WARPS");
+        const int r = (e && atoi(e) == 2) ? 2 : 1;
+        if (r == 2) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_RP_NC68_WARPS=2 ACTIVE: nc widths 6-8 launch 2 warps (stock bit-match intentionally broken, A/B only)\n");
+        }
+        return r;
+    }();
+    return n;
+}
+
 // task B2 (INT4-noquant-dispatch): GGML_CUDA_I8NARROW=1 routes the repacked
 // Q4_0 narrow-batch window onto the i8narrow exact-8-bit-split kernel
 // (mul_mat_i8narrow_launch, q8_repack/w4a4-i8narrow.cu). DEFAULT OFF: with
@@ -748,9 +767,9 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
                 // partial. Match the stock geometry per width or 6-8 diverge
                 // (width 8 = dflash verify). mb_nc68_test.cu is the bit-match
                 // harness for this table.
-                case 6: RP_R8NC_LAUNCH(1, 6); break;
-                case 7: RP_R8NC_LAUNCH(1, 7); break;
-                case 8: RP_R8NC_LAUNCH(1, 8); break;
+                case 6: if (rp_nc68_warps() == 2) { RP_R8NC_LAUNCH(2, 6); } else { RP_R8NC_LAUNCH(1, 6); } break;
+                case 7: if (rp_nc68_warps() == 2) { RP_R8NC_LAUNCH(2, 7); } else { RP_R8NC_LAUNCH(1, 7); } break;
+                case 8: if (rp_nc68_warps() == 2) { RP_R8NC_LAUNCH(2, 8); } else { RP_R8NC_LAUNCH(1, 8); } break;
                 default: GGML_ABORT("nc mat-vec: unsupported batch width");
             }
 #undef RP_R8NC_LAUNCH
