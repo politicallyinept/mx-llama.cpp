@@ -109,3 +109,14 @@ registers directly. The maps "stock K-split + shared reduce" mechanism does not 
 the dp4a path. Step 1 (epilogue restyle) is unnecessary for bit-identity; re-scope to the
 byte-generation checks listed in the ledger (GPU-vs-host repack equivalence, repack vs
 gcn_kq family, HAS_IDS).
+
+## Step 1a verdict (2026-11-11, task E4-bytegen): GPU-vs-host repack bytes are EQUIVALENT
+Microbench mb_e4_bytegen_test.cu (see taskE4-bytegen-LEDGER.md,
+docs/E4-step1a-bytegen-results.csv): repack_q8_0_kernel (GPU, runtime async path) and
+repack_q8_0_host (used by E1 microbench) produce BYTE-IDENTICAL records at 26/26 shapes
+(E1 dense grid, MoE 64-expert incl. the 65535-grid-cap shape, no-gap K, tiny edges),
+launch-deterministic, FNV-equal records. Sole difference: the 16 B de-alias stride gap
+(ne0%128==0) is memset-zeroed by the host but never written by the kernel (runtime leaves
+it uninitialized); consumer kernels guard sb < n_sub so gap bytes are never read --
+cosmetic, comment at buffer.cu:136 should be fixed. The item-#5 defect is NOT in
+GPU-vs-host byte generation; remaining suspects: gcn_kq-baseline identity, HAS_IDS.
