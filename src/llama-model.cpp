@@ -581,9 +581,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool dflash_dsv4_split = dflash_dsv4 && tp_width_eff > 0 &&
                                    hparams.dsv4_o_group_count % tp_width_eff == 0 &&
                                    hparams.n_head() % tp_width_eff == 0;
+    static std::once_flag dsv4_warn_once;
     if (dflash_dsv4 && !dflash_dsv4_split) {
-        LLAMA_LOG_WARN("%s: DSV4 draft backbone cannot be split %zu ways, replicating it\n",
-                       __func__, tp_width_eff);
+        std::call_once(dsv4_warn_once, [&] {
+            LLAMA_LOG_WARN("%s: DSV4 draft backbone cannot be split %zu ways, replicating it (per-load; further lines suppressed)\n",
+                           __func__, tp_width_eff);
+        });
     }
 
     // MQA under tensor-parallel: when the TP group has more lanes than KV heads, the KV
