@@ -178,35 +178,98 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_i8narrow_q40(
             for (int c = 0; c < T; ++c)
                 ksplit_ws[((size_t) blockIdx.z * ne1 + row) * T + c] = acc[c];
         }
-        // TODO(post-pause): epilogue reduce kernel, fixed order over blockIdx.z.
     }
 #else
     __builtin_trap(); /* i8narrow requires HIP gfx906 */
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Second-pass reducer (KSPLIT > 1). Pass 1 wrote per-workgroup fp32 partials to
+// ksplit_ws[z][row*T + c]; this kernel sums them over z = 0..KSPLIT-1 in FIXED
+// ORDER (deterministic; no fp32 atomics) and writes y[c*ys + row]. One thread
+// per output element: reads are coalesced in the ws layout (consecutive i =
+// row*T + c), the strided write is fine at these sizes (N*T <= 278528 floats).
+// The fp32 sum order here (0 + p0 + p1 + ...) matches the CPU mirror in the
+// microbench; empty z segments never occur (dispatch guarantees seg coverage).
+static __global__ void mul_mat_i8narrow_reduce_q40(
+        const float * __restrict__ ksplit_ws, float * __restrict__ y,
+        const uint32_t ne1, const uint32_t T, const uint32_t ys,
+        const uint32_t ksplit) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ne1 * T) return;
+    const uint32_t row = i / T;
+    const uint32_t c   = i - row * T;
+    float s = 0.0f;
+    for (uint32_t z = 0; z < ksplit; ++z)
+        s += ksplit_ws[(size_t) z * ne1 * T + i];   // fixed z order
+    y[(size_t) c * ys + row] = s;
+}
+
 // Non-template dispatch (standard llama.cpp pattern): T at runtime, switch over
-// the kernel instantiations. KSPLIT>1 needs the second-pass reducer (TODO);
-// only KSPLIT=1 is dispatchable today.
+// the kernel instantiations. ksplit=1 keeps the original single-pass path
+// (grid.z=1, no workspace); ksplit in {2,4,8} launches pass 1 with grid.z=ksplit
+// (all NWAVES waves cooperate on one 64-row group, splitting K per wave) writing
+// partials to the CALLER-OWNED workspace [ksplit][ne1][T] floats, then the
+// fixed-order reducer above. KSPLIT is a template parameter because the kernel
+// derives its K segmentation from it at compile time - grid.z must equal it.
 void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
         const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
         uint32_t xs, uint32_t ys, cudaStream_t stream) {
+    mul_mat_i8narrow_launch(T, wbase, hi, lo, dplane, y, ne0, ne1, xs, ys, stream, 1, nullptr);
+}
+
+void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, const void * lo,
+        const ggml_half * dplane, float * y, uint32_t ne0, uint32_t ne1,
+        uint32_t xs, uint32_t ys, cudaStream_t stream, int ksplit, float * ksplit_ws) {
     constexpr int NWAVES = 4;
-    const dim3 grid((ne1 + NWAVES * 64 - 1) / (NWAVES * 64), 1, 1);
+    if (ksplit <= 1) {
+        const dim3 grid((ne1 + NWAVES * 64 - 1) / (NWAVES * 64), 1, 1);
+        const dim3 blk(NWAVES * 64);
+        switch (T) {
+            case 1:  mul_mat_i8narrow_q40<1, NWAVES, 1, false><<<grid, blk>>>(
+                         wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+            case 2:  mul_mat_i8narrow_q40<2, NWAVES, 1, false><<<grid, blk>>>(
+                         wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+            case 4:  mul_mat_i8narrow_q40<4, NWAVES, 1, false><<<grid, blk>>>(
+                         wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+            case 8:  mul_mat_i8narrow_q40<8, NWAVES, 1, false><<<grid, blk>>>(
+                         wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+            case 16: mul_mat_i8narrow_q40<16, NWAVES, 1, false><<<grid, blk>>>(
+                         wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+            default: GGML_ABORT("i8narrow: unsupported T");
+        }
+        return;
+    }
+
+    GGML_ASSERT(ksplit_ws != nullptr && "i8narrow KSPLIT>1 needs a caller-allocated [ksplit][ne1][T] float workspace");
+    const dim3 grid((ne1 + 64 - 1) / 64, 1, ksplit);
     const dim3 blk(NWAVES * 64);
+#define I8N_KSPLIT_CASE(TV, KV) \
+        mul_mat_i8narrow_q40<TV, NWAVES, KV, false><<<grid, blk, 0, stream>>>( \
+            wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, ksplit_ws)
+#define I8N_KSPLIT_SWITCH(TV)                                                    \
+        switch (ksplit) {                                                        \
+            case 2: I8N_KSPLIT_CASE(TV, 2); break;                               \
+            case 4: I8N_KSPLIT_CASE(TV, 4); break;                               \
+            case 8: I8N_KSPLIT_CASE(TV, 8); break;                               \
+            default: GGML_ABORT("i8narrow: unsupported KSPLIT (want 1/2/4/8)");  \
+        }
     switch (T) {
-        case 1:  mul_mat_i8narrow_q40<1, NWAVES, 1, false><<<grid, blk>>>(
-                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-        case 2:  mul_mat_i8narrow_q40<2, NWAVES, 1, false><<<grid, blk>>>(
-                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-        case 4:  mul_mat_i8narrow_q40<4, NWAVES, 1, false><<<grid, blk>>>(
-                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-        case 8:  mul_mat_i8narrow_q40<8, NWAVES, 1, false><<<grid, blk>>>(
-                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
-        case 16: mul_mat_i8narrow_q40<16, NWAVES, 1, false><<<grid, blk>>>(
-                     wbase, (const uint8_t *) hi, (const uint8_t *) lo, dplane, y, ne0, ne1, xs, ys, nullptr); break;
+        case 1:  I8N_KSPLIT_SWITCH(1);  break;
+        case 2:  I8N_KSPLIT_SWITCH(2);  break;
+        case 4:  I8N_KSPLIT_SWITCH(4);  break;
+        case 8:  I8N_KSPLIT_SWITCH(8);  break;
+        case 16: I8N_KSPLIT_SWITCH(16); break;
         default: GGML_ABORT("i8narrow: unsupported T");
     }
+#undef I8N_KSPLIT_SWITCH
+#undef I8N_KSPLIT_CASE
+
+    // Pass 2: fixed-order reduce of the [ksplit][ne1][T] partials into y.
+    const uint32_t total = ne1 * (uint32_t) T;
+    mul_mat_i8narrow_reduce_q40<<<(total + 255) / 256, 256, 0, stream>>>(
+            ksplit_ws, y, ne1, (uint32_t) T, ys, (uint32_t) ksplit);
 }
 
 // TODO(post-pause): quantize_mmq_i8split_cuda device kernel - mirror
