@@ -78,13 +78,10 @@ for arm in ("base", "lds"):
                 print(arm, "|", l.strip())
 
 print("\n== plain llama-bench pp512/tg256 ==")
-from collections import defaultdict
 for arm in ("base", "lds"):
     f = f"{B}/plain-{arm}-r1.jsonl"
     if os.path.exists(f):
-        rows = [json.loads(l) for l in open(f) if l.strip()]
-        g = defaultdict(list)
-        for r in rows:
-            g[(r["n_pp"], r["n_pred"])].append(r["test_count"] / r["test_time"] * 1000)
-        for k in sorted(g):
-            print(f"plain-{arm}: pp{k[0]}/tg{k[1]} = {statistics.median(g[k]):.2f} t/s")
+        for l in open(f):
+            r = json.loads(l)
+            kind = f"pp{r['n_prompt']}" if r["n_prompt"] else f"tg{r['n_gen']}"
+            print(f"plain-{arm}: {kind} = {r['avg_ts']:.2f} t/s")

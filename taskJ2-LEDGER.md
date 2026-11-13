@@ -52,12 +52,11 @@ T=8 101.7->79.8 (+27.4%; upstream ratio 90->70 = 1.27x reproduced). lm_head 5120
 * Suite acceptance (all 24 tg256 runs): lds 3777/16233 accepted vs base 3708/16674 (+4.6% rel) -
   accumulation-order drift flips a few accepts; output remains target-model distribution.
 * KLD (taskI1 protocol, llama-perplexity -b 8 pp batches exercising the nc width-8 window,
-  64KB wikitext subset): base leg DONE rc=0 (j2-base-f16.logits, 3.9 GB f16, kld-base.log).
-  lds leg queued behind sibling GPU traffic (follow.sh retry loop, /root/taskJ2/chain4.log);
-  result will land in kld-lds.log as "Mean KLD / Maximum KLD" lines. Given the greedy probe is
-  byte-identical and suite acceptance differs by <5% relative, expect KLD in the same band as
-  taskI1's kernel-reorder precedents; the acceptance-count delta (s4) confirms logits differ
-  slightly by design (accumulation order), which is exactly what this protocol bounds.
+  64KB wikitext subset): DONE both legs rc=0. base logits j2-base-f16.logits (3.9 GB f16);
+  lds vs base: Mean KLD 0.000495 +/- 0.000020, Maximum KLD 0.077935, Mean dp -0.000 +/- 0.007 %,
+  Maximum dp 9.765 %. Mean drift is accumulation-order noise (same band as taskI1 kernel-reorder
+  precedents); rare-token max drift is what flipped a few suite accepts (s4) without moving the
+  greedy argmax. Gate GREEN.
 
 ## 5. End-to-end A/B: 27B Qwen3.8-27B Q8_0 TP2, DFlash2 n_max 7 (8-token verify)
 
@@ -88,12 +87,17 @@ delta is stack-position-dependent, not a contradiction.
 
 ## 5a. Plain decode reference (llama-bench pp512/tg256, TP2, same envs)
 
-First attempt failed on a llama-bench arg bug (-c is not a bench flag); fixed in drive2.sh,
-queued in follow2.sh (chain5.log). Results land in plain-base-r1.jsonl / plain-lds-r1.jsonl
-(agg.py prints pp512/tg256 medians). Context: on the Q4_0 stack (taskI2) plain decode was 46.99
-vs DFlash-on 38.10; on this Q8_0 stack DFlash2-on lds already runs 39.66 t/s, so the port moves
-DFlash2-on decisively toward (and likely past) plain Q8_0 decode, whose bandwidth floor is
-~29 GB/step / ~1.2 TB/s TP2 aggregate ~= 24 t/s.
+Measured (avg_ts, llama-bench -p 512 -n 256):
+| arm  | pp512 t/s | tg256 t/s |
+|------|-----------|-----------|
+| base | 642.3     | 37.06     |
+| lds  | 650.5     | 37.40     |
+Plain decode is M=1: the LDS gate does not touch it (+0.9% noise, as designed).
+
+DELIVERABLE ANSWER: before the port, DFlash2-on LOST to plain decode on this stack (25.13 vs
+37.06 t/s - the spec path was 32% slower, same pattern as taskI2's Q4_0 38.10 vs 46.99). After
+the port, DFlash2-on BEATS plain decode (39.66 vs 37.06, +7.0%). The port doesn't just close
+the gap, it flips the sign.
 
 ## 5b. ruquant engine same-protocol (parent item 3)
 
@@ -102,10 +106,14 @@ tensor, their recipe env (META_TOKEN_GRAPH=0, META_SPIN=2e6, DISABLE_GRAPHS=1). 
 load: ggml_abort in ggml_backend_sched_backend_id_from_cur <- split_graph <- resolve_fused_ops
 during the DRAFTER ctx sched_reserve (main ctx reserved fine). Their repack posture is
 unconditional (no env gate in their tree), so their Q8_0 repack + TP meta split + dflash drafter
-path aborts on this config on our box. Retry with RQ_FUSE_*=0: see below. Consequence: their
-published 91-107 t/s DFlash2 numbers are NOT reproducible on this box with their own engine at
-Q8_0 main + Q8_0 drafter; our fork at lds reaches 39.7 t/s on the same protocol (their 60.5
-published figure is the Q4_0 stack per taskI2 s4/s5 - different axis).
+path aborts on this config on our box. RETRY with RQ_FUSE_ADD_NORM/GDN_GATES/L2_PAIR/NORM_GATE=0:
+same crash (backtrace identical; log shows the abort right after "resolve_fused_ops: fused
+DeepSeek V4 HC pre/comb/post enabled" on the drafter graph - that HC fusion path has no env
+off-switch in their tree). Consequence: their published 91-107 t/s DFlash2 numbers are NOT
+reproducible on this box with their own engine at Q8_0 main + Q8_0 drafter; our fork at lds
+reaches 39.7 t/s on the same protocol (their 60.5 published figure is the Q4_0 stack per
+taskI2 s4/s5 - different axis). Their engine DID serve this box fine with their W4A4H drafter
+(taskG4), so the crash is specific to Q8_0-drafter + TP-meta in their tree.
 
 ## 6. Third item survey: W4A4 skinny-kernel perf (b9543c0)
 
@@ -119,9 +127,10 @@ medium effort, own A/B needed - NOT trivial, not implemented per instruction.
 
 PORT LANDED, GATES GREEN, LARGE WIN ON THIS STACK:
 * Env gate GGML_CUDA_RP_Q8_NC_LDS default OFF; gate-off byte-identical to old binary (proven).
-* Kernel bit-exact vs our generic repacked nc shape; greedy probe byte-identical base vs lds.
+* Kernel bit-exact vs our generic repacked nc shape; greedy probe byte-identical base vs lds;
+  KLD mean 4.95e-4 (accumulation noise band), gate GREEN.
 * 27B Q8_0 DFlash2 8-token verify: +57.8% end-to-end (25.13 -> 39.66 t/s), verify fwd -39%,
-  draft fwd unchanged. Toward plain decode: see s5a (lds 39.66 vs Q8_0 plain floor ~24 t/s).
+  draft fwd unchanged. DFlash2-on flips from -32% vs plain decode to +7% vs plain decode (s5a).
 * Upstream kernel ratio reproduces (1.27x ssm_out); upstream e2e +2% is their baseline position
   (repack-generic default), ours measures canonical->repack+LDS.
 * rq engine itself crashes on this config (their bug, backtrace in rq-r1.server.log).
