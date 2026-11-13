@@ -28,6 +28,8 @@ arm_env() {
     f0q4)    echo "GGML_CUDA_W4A4_MIN_TOKENS=0 GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0 GGML_CUDA_RP_Q8_NC_LDS=8 GGML_CUDA_RP_Q4_NC_LDS=8" ;;
     f128lds) echo "GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0 GGML_CUDA_RP_Q8_NC_LDS=8" ;;
     f128q4)  echo "GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0 GGML_CUDA_RP_Q8_NC_LDS=8 GGML_CUDA_RP_Q4_NC_LDS=8" ;;
+    f128q4w4) echo "GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0 GGML_CUDA_RP_Q8_NC_LDS=8 GGML_CUDA_RP_Q4_NC_LDS=4" ;;
+    f0q4w4)  echo "GGML_CUDA_W4A4_MIN_TOKENS=0 GGML_CUDA_REPACK_Q8_0=1 GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0 GGML_CUDA_RP_Q8_NC_LDS=8 GGML_CUDA_RP_Q4_NC_LDS=4" ;;
     *) return 1 ;;
   esac
 }
@@ -130,8 +132,8 @@ kld() { # $1 arm ; taskJ2 narrow-window protocol: -b 8 pp batches exercise the n
   case "$arm" in
     f0lds)   PARENT="" ;;
     f128lds) PARENT="" ;;
-    f0q4)    PARENT=f0lds ;;
-    f128q4)  PARENT=f128lds ;;
+    f0q4|f0q4w4)    PARENT=f0lds ;;
+    f128q4|f128q4w4) PARENT=f128lds ;;
     *) return 2 ;;
   esac
   gates || return $?
