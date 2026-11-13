@@ -120,8 +120,32 @@ q4_0 KV costs ~12% tg vs f16 in the stock dequant path - the gap the v_dot8 kern
 Natural-suite DFlash2 A/B legs (bench.py 8 prompts x 3 reps tg256, GGML_DFLASH_PROF step-phase,
 greedy 64-token temp0 seed42 raw-/completion probe per leg): arms off-f16, on-f16(n4),
 on-q40(n4), on-q40dot8(n4), on-q40krotdot8(n4), on7-q40(n7), on7-q40dot8(n7), r2 reps of
-on-f16/on-q40/on-q40dot8. Running under phase-hold lock (~7 min/leg).
-(taskI2 context, same model/box: natural tg 46.99 off / 38.10 on.)
+on-f16/on-q40/on-q40dot8. (taskI2 context, same model/box: natural tg 46.99 off / 38.10 on.)
+
+Interim results (tg256 median t/s, natural suite, KV ~4.3k per prompt):
+
+| arm                          | tg t/s | accept | acc_len | verify tgt-decode w=5 |
+|---|---|---|---|---|
+| off-f16 (plain decode)       | 47.14  | -      | -       | -                     |
+| on-f16  (DFlash2 n4)         | 37.88  | 0.3482 | 2.393   | (see below)           |
+| on-q40  (kernel OFF)         | 53.74  | 0.4463 | 2.785   | 41.8 ms               |
+| on-q40dot8 (kernel ON)       | 42.68  | 0.3659 | 2.464   | 41.6 ms               |
+| on7-q40dot8 (n7)             | 30.62  | 0.2720 | 2.904   | -                     |
+
+Reproduction control: on-f16 37.88/0.3482 vs taskI2 38.10/0.3482 - same box, same suite.
+
+Step-phase (GGML_DFLASH_PROF, on-q40dot8 n4): verify tgt-decode w=5 med 41.6 ms, draft-fwd
+(n=5) 13.8 ms, draft-inject 0.84 ms, gather 0.03 ms -> ~56 ms/step x 2.46 tok/step = 43.6 t/s
+(AGG 42.68, consistent). Kernel-off control: tgt-decode w=5 med 41.8 ms - the kernel changes
+verify wall-time by ~0 at ~4k KV even though the isolated microbench says 1.8-3x on the
+attention call alone: at this context the attention slice is a few % of the 27B step.
+
+Surprise: q4_0 KV *without* the kernel (on-q40) is the big lever on this suite - DFlash2-on
+jumps 37.9 -> 53.7 (+42%, and +14% over plain decode), with acceptance rising 0.348 -> 0.446.
+The kernel arm loses acceptance vs the dequant path (0.446 -> 0.366) at equal step time, i.e.
+int4-Q attention numerics shift verify logits enough to hurt draft agreement at ~4k KV.
+Long-context probe (benchlong: llama-bench pp16384/tg256, kernel off vs on) added to test
+where the microbench win (3-5x at 16k-64k) should show up in full-model decode.
 Ops notes: first driver chain died mid-leg ~21:32 (no OOM; sibling taskJ2 pkill collateral);
 kld() unbound-$NAME fix; env-prefix must use `env VAR=..` (expanded VAR=x words are not
 assignments in bash); load-avg gate removed (starved under sibling 16-thread servers - flock +
