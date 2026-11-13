@@ -96,10 +96,14 @@ RESULT (np1, d4, replicated, 8-prompt suite, same protocol as F1/F2/F4q):
 - pp4096 555.5 (flat); prefill chunks (w2048) 1.158 s/chunk with u4x16 in play.
 CAVEAT (the reason the floor exists): with floor=0 the TARGET model computes its
 decode/verify with 4-bit ACTIVATIONS - the served model's output quality moves to
-the u4act class (era-1 runtime KLD 0.0756 vs sealed 0.0499 = +51% KLD class on
+the u4act class (era-1 runtime KLD 0.0756 vs plain-Q4 anchor 0.0499 = +51% KLD class on
 stock-weight Q4_0; this config is repacked-Q4_0 + u4act narrow decode + u4x16
 prefill - KLD NOT yet measured). The -3% acceptance is NOT the quality cost;
 the KLD ladder on this exact config is the missing number. Owner's Pareto call.
+LABEL FIX (taskP): per docs/KLD-LADDER-w4a4-forced.md the 0.0499 anchor is plain Q4
+weights scored via the sibling (ruquant) engine, NOT the fork-sealed repack.
+Correct labels: 0.0499 = plain Q4 via sibling engine; fork repack-OFF = 0.0490;
+fork sealed repack = 0.0656; ruquant W4A4 = 0.0653.
 NOTE: the old "floor off: gate1 bare + MTP = -40% decode - never ship" verdict
 does NOT reproduce on this config (DFlash2 d4 + DOT8=3 + repacked Q4_0 + Q4_0
 drafter) - floor-off is +20-24% here. Verdicts are config-specific; re-measure
