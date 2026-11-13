@@ -105,8 +105,25 @@ companion to the kernel, matching taskI1's verdict.
 
 ### 3.3 27B end-to-end A/B
 
-llama-bench pp512/tg256 (this binary, -r 2): f16 KV pp512 586.06, tg256 44.17 t/s.
-(taskI2 context on same model/box: natural tg 46.99 off / 38.10 on.)
-Ops note: first driver chain died mid-leg at ~21:32 (cause not found: no OOM, sibling
-teardown is pid-scoped and polite); relaunched under setsid with a 4x idempotent retry
-loop (skip-if-exists). Fixed kld() local-var ordering bug (unbound $NAME under set -u).
+llama-bench plain (27B, TP2, pp512/tg256, r=2):
+
+| arm | pp512 | tg256 |
+|---|---|---|
+| f16 KV (this binary)      | 586.06 | 44.17 |
+| q4_0 KV, kernel OFF       | 525.77 | 38.98 |
+| q4_0 KV, DOT8=1           | queued | queued |
+| q4_0 KV + KROT, DOT8=1    | queued | queued |
+
+q4_0 KV costs ~12% tg vs f16 in the stock dequant path - the gap the v_dot8 kernel targets
+(microbench 3.1 says it should beat f16 at long context, be roughly even at short).
+
+Natural-suite DFlash2 A/B legs (bench.py 8 prompts x 3 reps tg256, GGML_DFLASH_PROF step-phase,
+greedy 64-token temp0 seed42 raw-/completion probe per leg): arms off-f16, on-f16(n4),
+on-q40(n4), on-q40dot8(n4), on-q40krotdot8(n4), on7-q40(n7), on7-q40dot8(n7), r2 reps of
+on-f16/on-q40/on-q40dot8. Running under phase-hold lock (~7 min/leg).
+(taskI2 context, same model/box: natural tg 46.99 off / 38.10 on.)
+Ops notes: first driver chain died mid-leg ~21:32 (no OOM; sibling taskJ2 pkill collateral);
+kld() unbound-$NAME fix; env-prefix must use `env VAR=..` (expanded VAR=x words are not
+assignments in bash); load-avg gate removed (starved under sibling 16-thread servers - flock +
+GPU-free picker suffice); lock now held once per phase, not per leg (sibling legs >900s caused
+per-leg LOCKFAIL churn); gate failures exit the phase for the retry loop.
