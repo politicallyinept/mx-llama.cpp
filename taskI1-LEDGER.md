@@ -88,11 +88,18 @@ made with RAW q4_0 KV, so the first q40 scoring leg was q4_0-vs-itself:
   PPL(Q) 5.912044 vs 5.925301 raw q4_0 -> rotation IMPROVES PPL by 0.22% over raw q4_0
   (quantization error spread across channels, no anomaly-channel outlier). Saved as
   /root/taskI1/kld-q40krot-vs-q40raw.log.
-True f16-base KLD legs + greedy + llama-bench re-running after the DFlash2 legs (driver2).
+True f16-base KLD legs + greedy + llama-bench all completed (driver2/driver4).
 
 ### DFlash2 tg baseline (f16 KV, DFlash2-Q8_0 drafter d4, natural suite, 24 tg256 reps)
 - tg256 median 80.54 t/s; pp4096 median 1962.1 t/s; accept_rate 0.3581; mean_accept_len 2.4324.
   (/root/taskI1/f16.reps.jsonl.agg.json)
+
+### Plain llama-bench pp512/tg256 (same binary, -r 2 aggregated, type_k/type_v witnessed in jsonl)
+| arm | pp512 t/s | tg256 t/s | tg256 vs f16 |
+|---|---|---|---|
+| f16     | 2255.7 | 110.74 | -     |
+| q40     | 2268.4 | 104.52 | -5.6% |
+| q40krot | 2176.7 | 100.16 | -9.6% |
 
 ### DFlash2 tg arms (same suite, same binary, interleaved by phase order)
 | arm | tg256 t/s | vs f16 | pp4096 t/s | accept_rate | mean_accept_len |
@@ -130,8 +137,9 @@ off; n_rot_v = 0 in both (V rotation is a separate gate, not exercised). DFlash2
 2.3573): the drafter pays a small extra acceptance cost for the rotated cache even though the
 target's distribution is closer to f16.
 
-Perf summary (see section 4 table): q4_0 KV is NOT a throughput lever at pp512/tg256 shapes
-(-5.0% tg, -0.5% pp4096; dequant dominates at short context). The ruquant prior got its win
+Perf summary (tables above): q4_0 KV is NOT a throughput lever at pp512/tg256 shapes
+(plain llama-bench tg256 -5.6% q40 / -9.6% q40krot, pp512 neutral-to-3.5%-worse; DFlash2 tg
+-5.0%/-6.9%, pp4096 -0.5%/-0.5%; dequant dominates at short context). The ruquant prior got its win
 (44.7 -> 38.5 ms decode) only at 64k depth AND with a dedicated v_dot8 q4_0 FA kernel
 (ruquant-src e509cee) that this fork does not carry. What q4_0-KV buys today on this fork is
 ~4x KV VRAM compression at a modest numerics cost that the rotation gate measurably reduces.
@@ -150,3 +158,5 @@ for any perf claim and is out of scope here.
   temp-0 probe captured on the DFlash2 legs (spec decode is lossless vs target greedy).
 - llama-bench rejects -c/--fit in this vintage; bench legs use its native context sizing.
 - Driver: /root/taskI1-drive.sh + drive2.sh; raw artifacts /root/taskI1/.
+- f16-KV base logits kept for re-scoring: /root/taskI1/i1-base-f16.logits (8.1 GB,
+  --save-all-logits, same binary 80389528db). Delete when review closes.
