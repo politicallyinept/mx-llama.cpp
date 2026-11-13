@@ -2608,6 +2608,153 @@ static __global__ void __launch_bounds__(64 * W) rp_q8_nc_lds(
 #endif
 }
 
+// taskQ (port of the taskJ2 rp_q8_nc_lds pattern to Q4_0): the Q4_0 narrow-batch
+// mat-vec at widths 4..8 with each step's activation blocks staged in LDS once per
+// workgroup. mul_mat_vec_repacked_nc<2, 1, T, 2, 64, Q4_0, U4ACT, false, false,
+// false, SUMW> loads every token's activation block per lane and step from L2;
+// at verify widths the activation side is several times the weight bytes per step
+// (Q4_0 weights are half a byte per value). This kernel keeps the same lanes,
+// block order, products, sums and reduction as that shape (BIT-IDENTICAL to it,
+// both decode variants) and stages each step's blocks in LDS once per W-wave
+// workgroup: the 2W rows of a workgroup share the staged copy. Env gate at the
+// dispatch site: GGML_CUDA_RP_Q4_NC_LDS (default 0, OFF) in q8_repack/mul-mat.cu.
+// U4ACT selects the dp8a decode over the raw Q4_0 nibbles (the floor-0 / W4A4
+// arm, activations block_q8_1_u4); the default is the shipped q8_1 affine decode
+// (load_w nibble split + {d, 8d} epilogue). SUMW threads the precomputed weight
+// sum plane exactly like the generic impl (bit-identity requires matching it).
+template <int T, int W, bool U4ACT = false, bool SUMW = false>
+static __global__ void __launch_bounds__(64 * W) rp_q4_nc_lds(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t xs, const uint32_t ys) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    // two rows per lane, same geometry as rp_q8_nc_lds (see its note).
+    constexpr int RPL = 2;
+    __shared__ int4  sq[T][64][2]; // a step's activation codes: token, block, 32 values
+    __shared__ float sd[T][64];    // affine: activation scale dx;  u4: activation d4
+    __shared__ float sm[T][64];    // affine: activation sum sx;    u4: activation m
+    const int lane = threadIdx.x % 64;
+    const int row  = (blockIdx.x * W + threadIdx.x / 64) * RPL;
+    const typename rp_traits<GGML_TYPE_Q4_0>::geom wg(ne0, ne1);
+    const uint32_t n_blocks = ne0 >> 5;
+    uint32_t wrows[RPL];
+    bool     rvalid[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        wrows[r]  = min((uint32_t) (row + r), ne1 - 1);
+        rvalid[r] = row + r < (int) ne1;
+    }
+    float acc[RPL][T] = {};
+    for (uint32_t s0 = 0; s0 < n_blocks; s0 += 64) {
+        const uint32_t sb     = s0 + lane;
+        const bool     active = sb < n_blocks;
+        // This step's weights first, in flight while the activations are staged.
+        // (The rp_q8_nc_lds note applies: a register software pipeline costs more
+        // in occupancy than it saves.)
+        [[maybe_unused]] uint4  wv0[RPL], wv1[RPL];
+        [[maybe_unused]] float2 dw2[RPL];
+        [[maybe_unused]] uint4  wtc[RPL];
+        [[maybe_unused]] float  dw[RPL];
+        [[maybe_unused]] float  sw[RPL];
+        if (active) {
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                uint16_t db;
+                if constexpr (U4ACT) {
+                    // Raw packed nibbles + XOR-8 two's-complement form, term for
+                    // term the generic impl's U4ACT branch (incl. the SIGNED sw
+                    // requirement and the SUMW plane gate). sw is summed over the
+                    // RAW excess-8 codes BEFORE the XOR (the -256 seal), signed
+                    // before the float cast (the 3b root-cause class).
+                    rp_traits<GGML_TYPE_Q4_0>::load_w_raw(wbase, wg, wrows[r], sb, wtc[r], db);
+                    if constexpr (SUMW) {
+                        sw[r] = (float) rp_traits<GGML_TYPE_Q4_0>::load_sw(wbase, wg, wrows[r], sb);
+                    } else {
+                        sw[r] = (float) ((int) nib_sum_u4(wtc[r]) - 256);
+                    }
+                    wtc[r] = make_uint4(wtc[r].x ^ 0x88888888u, wtc[r].y ^ 0x88888888u,
+                                        wtc[r].z ^ 0x88888888u, wtc[r].w ^ 0x88888888u);
+                    dw[r] = rp_traits<GGML_TYPE_Q4_0>::scale(rp_slot_keep(db, rvalid[r]));
+                } else {
+                    rp_traits<GGML_TYPE_Q4_0>::load_w(wbase, wg, wrows[r], sb, wv0[r], wv1[r], db);
+                    dw2[r] = rp_traits<GGML_TYPE_Q4_0>::scale2(rp_slot_keep(db, rvalid[r]));
+                }
+            }
+        }
+        __syncthreads(); // the previous step's reads are done
+        if constexpr (U4ACT) {
+            const block_q8_1_u4 * xq4 = reinterpret_cast<const block_q8_1_u4 *>(xq);
+            for (int i = threadIdx.x; i < T * 64; i += 64 * W) {
+                const int t = i / 64, j = i % 64;
+                if (s0 + j < n_blocks) {
+                    const block_q8_1_u4 * xb4 = xq4 + (size_t) t * xs + s0 + j;
+                    const uint32_t * q32 = reinterpret_cast<const uint32_t *>(xb4->qs);
+                    sq[t][j][0] = make_int4(q32[0], q32[1], q32[2], q32[3]);
+                    sd[t][j]    = __half2float(xb4->d4);
+                    sm[t][j]    = __half2float(xb4->m);
+                }
+            }
+        } else {
+            for (int i = threadIdx.x; i < T * 64; i += 64 * W) {
+                const int t = i / 64, j = i % 64;
+                if (s0 + j < n_blocks) {
+                    const block_q8_1 * xb = xq + (size_t) t * xs + s0 + j;
+                    const int * q = reinterpret_cast<const int *>(xb->qs);
+                    sq[t][j][0] = make_int4(q[0], q[1], q[2], q[3]);
+                    sq[t][j][1] = make_int4(q[4], q[5], q[6], q[7]);
+                    sd[t][j]    = __low2float(xb->ds);
+                    sm[t][j]    = __high2float(xb->ds);
+                }
+            }
+        }
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const float dx = sd[t][lane];
+                const float sx = sm[t][lane];
+                if constexpr (U4ACT) {
+                    const int4 a4 = sq[t][lane][0];
+                    const uint4 a = make_uint4(a4.x, a4.y, a4.z, a4.w);
+#pragma unroll
+                    for (int r = 0; r < RPL; ++r) {
+                        const int idot = mmvq_dp8a_u4(wtc[r], a);
+                        acc[r][t] += dw[r] * (dx * ((float) idot + 8.0f * sw[r]) + sx * sw[r]);
+                    }
+                } else {
+                    const int4 x0 = sq[t][lane][0], x1 = sq[t][lane][1];
+#pragma unroll
+                    for (int r = 0; r < RPL; ++r) {
+                        int ilo = 0, ihi = 0;
+                        ilo = ggml_cuda_dp4a((int) wv0[r].x, x0.x, ilo);
+                        ilo = ggml_cuda_dp4a((int) wv0[r].y, x0.y, ilo);
+                        ilo = ggml_cuda_dp4a((int) wv0[r].z, x0.z, ilo);
+                        ilo = ggml_cuda_dp4a((int) wv0[r].w, x0.w, ilo);
+                        ihi = ggml_cuda_dp4a((int) wv1[r].x, x1.x, ihi);
+                        ihi = ggml_cuda_dp4a((int) wv1[r].y, x1.y, ihi);
+                        ihi = ggml_cuda_dp4a((int) wv1[r].z, x1.z, ihi);
+                        ihi = ggml_cuda_dp4a((int) wv1[r].w, x1.w, ihi);
+                        acc[r][t] += dw2[r].x * dx * (float) (ilo + ihi) - dw2[r].y * sx;
+                    }
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float a = rp_warp_reduce_sum<64>(acc[r][t]);
+            if (lane == 0 && rvalid[r]) {
+                y[(size_t) t * ys + row + r] = a;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // MoE narrow batch: one assignment per block, one launch for all of them.
 // Expert token counts are per expert, so at verify widths nearly every active
 // expert holds a single assignment and the 32-wide tile computes 32 columns to
