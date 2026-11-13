@@ -84,9 +84,24 @@ than int4 (decode 64k 273.8 us, verify 1590 us - 2x the v_dot8 work) but still 4
 stock; kept as the higher-accuracy option, not the perf arm. Raw files
 /root/taskJ1/micro-perf-dot8{0,1,2}.txt.
 
-### 3.2 KLD gate (taskI1 protocol re-score, 35B Q8_0 TP2, f16 base logits)
+### 3.2 KLD gate (taskI1 protocol re-score, 35B Q8_0 TP2, f16 base logits) - PASS
 
-(pending - legs queued behind sibling on gpu.lock)
+| arm | Mean KLD vs f16 | Max KLD | PPL(Q)-PPL(f16) | taskI1 ref (kernel off) |
+|---|---|---|---|---|
+| q40 + DOT8=1      | 0.011223 +/- 0.000237 | 1.351633 | +0.0375 (+0.64%) | 0.011223 / 1.35 / +0.64% |
+| q40krot + DOT8=1  | 0.009821 +/- 0.000204 | 1.289141 | +0.0243 (+0.41%) | 0.009821 / 1.29 / +0.41% |
+
+Both arms reproduce taskI1's numbers to the last digit (deterministic pp scoring). This is the
+expected shape: the protocol is pure prefill (ubatch 2048 > the kernel's 16-token width cap), so
+the kernel is inert there - the legs certify (a) the shipped q4_0-KV numerics envelope is
+unchanged by the port and (b) the new binary reproduces the pre-fork-gate prefill numerics
+exactly (non-regression control). The kernel fired only in the startup warmup graph
+([FA-DOT8] ncols=2 n_kv=256 banner), which does not touch scored logits.
+The kernel's own numerics are gated by: test-backend-ops 359/359 vs CPU (int4-Q NMSE < 1e-3,
+section 3.1), the 64-token greedy probes vs f16-KV baseline (3.3), and DFlash2 acceptance (3.3 -
+spec decode is lossless, so acceptance is a distribution-shift readout of the verify path).
+Rotation-vs-raw ordering preserved (0.0098 < 0.0112): the KROT arm remains the recommended
+companion to the kernel, matching taskI1's verdict.
 
 ### 3.3 27B end-to-end A/B
 
