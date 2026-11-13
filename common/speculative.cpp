@@ -3555,7 +3555,22 @@ common_speculative_init_result::common_speculative_init_result(
     // A sidecar draft shares its target's devices, and the tensor-parallel
     // splitter cannot mix repacked and canonical layouts in one group. Drafts
     // are decode-bound where the repack is neutral, so they load canonical.
-    mparams.use_extra_bufts = false;
+    // GGML_CUDA_DRAFT_REPACK=1 opts the sidecar draft into the device repack
+    // admission (train-free activation-side lever: paired with
+    // GGML_CUDA_W4A4_MIN_TOKENS=0, the draft q4_0 tensors then reach the u4act
+    // path at draft width, which the process-global floor alone could never
+    // reach because canonically-loaded tensors never enter repack admission).
+    // Default OFF = byte-identical to the canonical draft load. Intended
+    // pairing: a q4_0 draft under a repack-admitted target, so one TP group
+    // never mixes repacked and canonical layouts.
+    static const bool s_draft_repack = [] () {
+        const char * e = getenv("GGML_CUDA_DRAFT_REPACK");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    mparams.use_extra_bufts = s_draft_repack;
+    if (s_draft_repack) {
+        LOG_INF("%s: draft repack admission ON (GGML_CUDA_DRAFT_REPACK)\n", __func__);
+    }
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
