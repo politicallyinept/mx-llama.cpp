@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1695,7 +1696,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     if (dprof) {
-                        static unsigned long long dprof_n_gather = 0;
+                        static std::atomic<unsigned long long> dprof_n_gather = 0;
                         fprintf(stderr, "[DFLASH-PROF] draft-gather call=%llu bytes=%zu us=%lld\n",
                                 ++dprof_n_gather, features_buf.size() * sizeof(float),
                                 (long long) (ggml_time_us() - dprof_t0));
@@ -1725,7 +1726,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
                     rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                     if (dprof) {
-                        static unsigned long long dprof_n_inj = 0;
+                        static std::atomic<unsigned long long> dprof_n_inj = 0;
                         fprintf(stderr, "[DFLASH-PROF] draft-inject call=%llu n_tokens=%d us=%lld rc=%d\n",
                                 ++dprof_n_inj, (int) n_chunk,
                                 (long long) (ggml_time_us() - dprof_t0), rc);
@@ -1807,7 +1808,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
             ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (dprof) {
-                static unsigned long long dprof_n_fwd = 0;
+                static std::atomic<unsigned long long> dprof_n_fwd = 0;
                 fprintf(stderr, "[DFLASH-PROF] draft-fwd call=%llu n_tokens=%d us=%lld rc=%d\n",
                         ++dprof_n_fwd, (int) batch.size(),
                         (long long) (ggml_time_us() - dprof_t0), ret);
