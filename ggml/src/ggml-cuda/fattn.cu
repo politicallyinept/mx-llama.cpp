@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "rq-fattn.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -735,7 +736,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
-    switch (kernel) {
+    switch (ggml_cuda_rq_fattn_q4_applies(dst, device) ? BEST_FATTN_KERNEL_NONE : kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
@@ -762,6 +763,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (ggml_cuda_flash_attn_ext_dense_gcn(ctx, dst)) {
         return;
     }
+    // taskJ1 port: ruquant's v_dot8 q4_0 KV attention for decode / verify widths
+    // (env gate GGML_CUDA_FA_DOT8=1|2, default off; gfx906 only)
+    if (ggml_cuda_rq_fattn_q4_applies(dst, ggml_cuda_get_device())) {
+        ggml_cuda_rq_fattn_q4(ctx, dst);
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -778,5 +785,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (ggml_cuda_rq_fattn_q4_applies(dst, device)) {
+        return true;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

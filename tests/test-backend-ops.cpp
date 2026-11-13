@@ -8460,6 +8460,16 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// taskJ1: the ruquant q4_0 attention at the 27B's shapes (rq-fattn.cu, GGML_CUDA_FA_DOT8=1|2): it quantizes Q to
+// int4 by default, and against the CPU, which takes Q as q8_0, its output is 4-5.5e-4 NMSE. With the gate off these
+// cases exercise the stock q4_0 fattn path and pass at its usual margin.
+struct test_flash_attn_ext_rq_q4 : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+    double max_nmse_err() override {
+        return 1e-3;
+    }
+};
+
 // large Q values, so the online softmax has to rescale the partial results
 struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     static constexpr int q_range = 20;
@@ -11689,6 +11699,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quantized cache, deep enough to take the sparse path
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+    // taskJ1: ruquant q4_0 KV attention (rq-fattn.cu, GGML_CUDA_FA_DOT8 1 / 2 on gfx906): head size 256,
+    // 6 query heads per KV head, decode and verify widths
+    for (int64_t nb : {1, 2, 8, 16}) {
+        for (int64_t kv : {256, 4096}) {
+            test_cases.emplace_back(new test_flash_attn_ext_rq_q4(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                                  GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
     // single head with quantized K (MMQ on Vulkan)
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 1, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_1, GGML_TYPE_Q4_1, {0, 1, 2, 3}, true, false, 512));
@@ -12243,6 +12261,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // taskJ1: q4_0 KV attention at the 27B's decode and DFlash2 verify widths, per GPU at TP2 (2 KV heads,
+    // 12 query heads each) and whole on one GPU (4 KV heads). Gate GGML_CUDA_FA_DOT8 off = stock vec/tile path.
+    for (int64_t kv : {16384, 65536}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+    for (int64_t nb : {1, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {
