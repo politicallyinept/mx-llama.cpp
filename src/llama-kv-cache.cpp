@@ -378,6 +378,19 @@ llama_kv_cache::llama_kv_cache(
         const char * LLAMA_KV_KROT_V = getenv("LLAMA_KV_KROT_V");
         const bool kv_krot_v = LLAMA_KV_KROT_V ? atoi(LLAMA_KV_KROT_V) != 0 : false;
 
+        // taskP: once-per-process activation banner, the same static-lambda
+        // convention the other numerics-changing gates use (GGML_CUDA_FA_DOT8 in
+        // rq-fattn.cu, the speculative.cpp gate banners). The env values are
+        // fixed for the process lifetime, so the first construction decides.
+        static const bool krot_banner = [kv_krot, kv_krot_v] () {
+            if (kv_krot || kv_krot_v) {
+                LLAMA_LOG_WARN("llama_kv_cache: LLAMA_KV_KROT gate ACTIVE (K=%d V=%d): Hadamard rotation of quantized KV is ON - numerics-changing, opt-in\n",
+                               (int) kv_krot, (int) kv_krot_v);
+            }
+            return true;
+        }();
+        (void) krot_banner;
+
         bool attn_rot_k =
             kv_krot &&
             !attn_rot_disable &&
