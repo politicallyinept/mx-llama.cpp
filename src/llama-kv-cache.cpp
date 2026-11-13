@@ -366,7 +366,20 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
         }
 
+        // taskI1: in this fork, Hadamard rotation of quantized KV is opt-in via
+        // LLAMA_KV_KROT=1 (K) / LLAMA_KV_KROT_V=1 (V), default off - the fork
+        // convention is that numerics-changing levers are env-gated and inert by
+        // default. Upstream auto-enables rotation whenever the KV type is
+        // quantized; the DeepSeek lightning indexer override below is
+        // intentionally left ungated (those caches require the rotation).
+        const char * LLAMA_KV_KROT = getenv("LLAMA_KV_KROT");
+        const bool kv_krot = LLAMA_KV_KROT ? atoi(LLAMA_KV_KROT) != 0 : false;
+
+        const char * LLAMA_KV_KROT_V = getenv("LLAMA_KV_KROT_V");
+        const bool kv_krot_v = LLAMA_KV_KROT_V ? atoi(LLAMA_KV_KROT_V) != 0 : false;
+
         bool attn_rot_k =
+            kv_krot &&
             !attn_rot_disable &&
             n_embd_head_k_all > 0 &&
             ggml_is_quantized(type_k) &&
@@ -380,6 +393,7 @@ llama_kv_cache::llama_kv_cache(
         }
 
         const bool attn_rot_v =
+            kv_krot_v &&
             !attn_rot_disable &&
             n_embd_head_v_all > 0 &&
             ggml_is_quantized(type_v) &&
