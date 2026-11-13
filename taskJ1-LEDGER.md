@@ -130,7 +130,9 @@ Interim results (tg256 median t/s, natural suite, KV ~4.3k per prompt):
 | on-f16  (DFlash2 n4)         | 37.88  | 0.3482 | 2.393   | (see below)           |
 | on-q40  (kernel OFF)         | 53.74  | 0.4463 | 2.785   | 41.8 ms               |
 | on-q40dot8 (kernel ON)       | 42.68  | 0.3659 | 2.464   | 41.6 ms               |
-| on7-q40dot8 (n7)             | 30.62  | 0.2720 | 2.904   | -                     |
+| on-q40krotdot8 (kernel+KROT) | 46.56  | 0.4159 | 2.664   | -                     |
+| on7-q40  (n7, kernel OFF)    | 35.27  | 0.2591 | 2.814   | w8: 61.5 ms           |
+| on7-q40dot8 (n7, kernel ON)  | 30.62  | 0.2720 | 2.904   | w8: 61.2 ms           |
 
 Reproduction control: on-f16 37.88/0.3482 vs taskI2 38.10/0.3482 - same box, same suite.
 
@@ -146,6 +148,13 @@ The kernel arm loses acceptance vs the dequant path (0.446 -> 0.366) at equal st
 int4-Q attention numerics shift verify logits enough to hurt draft agreement at ~4k KV.
 Long-context probe (benchlong: llama-bench pp16384/tg256, kernel off vs on) added to test
 where the microbench win (3-5x at 16k-64k) should show up in full-model decode.
+
+n7 pair: step-phase profiles are identical within noise (verify w=8 61.5 vs 61.2 ms, draft-fwd
+18.5 vs 18.5 ms, inject 1.0 ms both) and acceptance is equal-to-better with the kernel (0.259 ->
+0.272), yet suite median says 35.3 vs 30.6. Per-prompt medians swing +/-40% in BOTH directions
+(math 39.8->64.4, tech 42.7->30.4): at this KV the suite median is dominated by acceptance
+lotteries from attention-numerics perturbation, not kernel speed. Treat single-run n4/n7 t/s
+deltas <15% as noise; the r2 reps quantify it.
 Ops notes: first driver chain died mid-leg ~21:32 (no OOM; sibling taskJ2 pkill collateral);
 kld() unbound-$NAME fix; env-prefix must use `env VAR=..` (expanded VAR=x words are not
 assignments in bash); load-avg gate removed (starved under sibling 16-thread servers - flock +
