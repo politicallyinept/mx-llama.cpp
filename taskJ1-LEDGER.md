@@ -86,8 +86,12 @@ stock; kept as the higher-accuracy option, not the perf arm. Raw files
 
 ### 3.2 KLD gate (taskI1 protocol re-score, 35B Q8_0 TP2, f16 base logits)
 
-(pending)
+(pending - legs queued behind sibling on gpu.lock)
 
 ### 3.3 27B end-to-end A/B
 
-(pending)
+llama-bench pp512/tg256 (this binary, -r 2): f16 KV pp512 586.06, tg256 44.17 t/s.
+(taskI2 context on same model/box: natural tg 46.99 off / 38.10 on.)
+Ops note: first driver chain died mid-leg at ~21:32 (cause not found: no OOM, sibling
+teardown is pid-scoped and polite); relaunched under setsid with a 4x idempotent retry
+loop (skip-if-exists). Fixed kld() local-var ordering bug (unbound $NAME under set -u).
