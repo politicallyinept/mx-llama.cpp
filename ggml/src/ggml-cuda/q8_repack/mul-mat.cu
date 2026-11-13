@@ -770,6 +770,43 @@ static void rp_q8_nc_lds_launch(const uint8_t * w, const block_q8_1 * xq, float 
     }
 }
 
+// taskQ: GGML_CUDA_RP_Q4_NC_LDS=<2|4|8|16> routes the repacked Q4_0 narrow-batch
+// window (widths 4..8) to the LDS-staged kernel rp_q4_nc_lds (repack-kernels.cuh);
+// the value is waves per workgroup (2 rows per lane), same convention as the Q8_0
+// gate above. DEFAULT 0 = OFF: the dispatch-site branch is never taken and every
+// existing REPACK path is byte-identical to the pre-gate build. Unlike the Q8_0
+// gate this one fires on BOTH Q4_0 decode arms the nc window can reach: the stock
+// q8_1-affine arm (floor-ON / no-floor-0 serving) and the U4ACT dp8a arm (floor-0),
+// each bit-identical to its own generic <2,1,T,2,64,Q4_0,...> shape (same lanes,
+// block order, products, sums, reduction) - the gate is a perf lever with the
+// generic shape as its numeric reference, not a new numeric state.
+static int rp_q4_nc_lds_waves(void) {
+    static const int w = [] {
+        const char * e = getenv("GGML_CUDA_RP_Q4_NC_LDS");
+        const int r = e ? atoi(e) : 0;
+        const int v = (r == 2 || r == 4 || r == 8 || r == 16) ? r : 0;
+        if (v) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_RP_Q4_NC_LDS=%d ACTIVE: repacked Q4_0 nc widths 4-8 route to the LDS-staged kernel; bit-identical to the generic nc shape per decode arm\n", v);
+        }
+        return v;
+    }();
+    return w;
+}
+
+template <int T, bool U4ACT, bool SUMW>
+static void rp_q4_nc_lds_launch(const uint8_t * w, const block_q8_1 * xq, float * dst_d,
+        const int64_t ne00, const int64_t ne01, const uint32_t xs, const uint32_t ys,
+        cudaStream_t stream) {
+    const int W = rp_q4_nc_lds_waves();
+    const dim3 grid((unsigned) ((ne01 + 2 * W - 1) / (2 * W)), 1, 1);
+    switch (W) {
+        case 2:  rp_q4_nc_lds<T, 2,  U4ACT, SUMW><<<grid,  128, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        case 4:  rp_q4_nc_lds<T, 4,  U4ACT, SUMW><<<grid,  256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        case 16: rp_q4_nc_lds<T, 16, U4ACT, SUMW><<<grid, 1024, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        default: rp_q4_nc_lds<T, 8,  U4ACT, SUMW><<<grid,  512, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+    }
+}
+
 // Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
 template <ggml_type WT, bool U4ACT, bool U4P8, bool U4Q41, bool SUMW>
 static void ggml_cuda_mul_mat_repacked_nc_t(
@@ -793,6 +830,26 @@ static void ggml_cuda_mul_mat_repacked_nc_t(
                 case 6: rp_q8_nc_lds_launch<6>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
                 case 7: rp_q8_nc_lds_launch<7>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
                 case 8: rp_q8_nc_lds_launch<8>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                default: break;
+            }
+        }
+    }
+    // taskQ: LDS-staged Q4_0 nc at widths 4..8 (rp_q4_nc_lds), env-gated default
+    // OFF. Fires on whichever decode arm reached this window: the stock q8_1-affine
+    // arm (U4ACT=false, the floor-ON / no-floor-0 serving path) or the U4ACT dp8a
+    // arm (floor-0); SUMW is threaded so the U4ACT instantiation matches the
+    // generic dispatch's (repack_sumw_plane_on). Bit-identical to the generic
+    // <2,1,T,2,64,Q4_0,U4ACT,false,false,false,SUMW> shape below per arm (same
+    // lanes, block order, products, sums, reduction); widths 2-3 keep the existing
+    // shapes (the staging does not amortize below 4 tokens, taskJ2 finding).
+    if constexpr (WT == GGML_TYPE_Q4_0 && !U4P8 && !U4Q41) {
+        if (rp_q4_nc_lds_waves() > 0 && ne11 >= 4 && ne11 <= 8) {
+            switch (ne11) {
+                case 4: rp_q4_nc_lds_launch<4, U4ACT, SUMW>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 5: rp_q4_nc_lds_launch<5, U4ACT, SUMW>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 6: rp_q4_nc_lds_launch<6, U4ACT, SUMW>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 7: rp_q4_nc_lds_launch<7, U4ACT, SUMW>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 8: rp_q4_nc_lds_launch<8, U4ACT, SUMW>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
                 default: break;
             }
         }
