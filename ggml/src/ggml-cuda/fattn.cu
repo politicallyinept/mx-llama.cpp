@@ -736,6 +736,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     bool need_f16_K = false;
     bool need_f16_V = false;
 
+    // taskP: same-device assumption. `device` here is the BUFFER's device (the
+    // alloc-size callback), while ggml_cuda_flash_attn_ext below consults
+    // ggml_cuda_rq_fattn_q4_applies with the compute context's device. applies()
+    // uses `device` only for the gfx906 CC check, so on a mixed-CC rig a graph
+    // whose buffers live on a different device than the computing context could
+    // skip the f16 K/V buffers here while a stock kernel still needs them. The
+    // CUDA backend computes each graph on the device that owns its buffers (one
+    // context per device), so the two devices coincide; that invariant is what
+    // keeps these two consults consistent - enforce it here if that ever changes.
     switch (ggml_cuda_rq_fattn_q4_applies(dst, device) ? BEST_FATTN_KERNEL_NONE : kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
@@ -765,7 +774,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
     // taskJ1 port: ruquant's v_dot8 q4_0 KV attention for decode / verify widths
     // (env gate GGML_CUDA_FA_DOT8=1|2, default off; gfx906 only)
-    if (ggml_cuda_rq_fattn_q4_applies(dst, ggml_cuda_get_device())) {
+    // taskP: consult with ctx.device, the same device the alloc-size path pairs
+    // with (see ggml_cuda_flash_attn_ext_get_alloc_size). ggml_cuda_set_device
+    // (ctx.device) ran above, so this equals ggml_cuda_get_device(); naming the
+    // context device explicitly documents the same-device assumption.
+    if (ggml_cuda_rq_fattn_q4_applies(dst, ctx.device)) {
         ggml_cuda_rq_fattn_q4(ctx, dst);
         return;
     }
