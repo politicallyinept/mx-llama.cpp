@@ -26,6 +26,7 @@
 #include "fattn-common.cuh"
 #include "rq-fattn.cuh"
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -556,6 +557,13 @@ void ggml_cuda_rq_fattn_q4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int ncols = (int) Q->ne[1], nheads = (int) Q->ne[2], nkvh = (int) K->ne[2];
     const int gqa = nheads / nkvh, R = gqa * ncols;
+    // engagement witness, once per process (fork banner convention, cf. [MOE-FUSE])
+    static bool witnessed = false;
+    if (!witnessed) {
+        witnessed = true;
+        fprintf(stderr, "[FA-DOT8] q4_0 KV v_dot8 attention engaged: mode=%d ncols=%d gqa=%d nkvh=%d n_kv=%d\n",
+                rq_fa_mode(), ncols, gqa, nkvh, (int) K->ne[1]);
+    }
     if (rq_fa_mode() == 2) {
         rq_fa_run_r<2>(ctx, dst, scale, R, ncols, gqa);
     } else {
