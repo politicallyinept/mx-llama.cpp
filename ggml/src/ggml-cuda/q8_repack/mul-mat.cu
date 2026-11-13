@@ -735,12 +735,68 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
     }
 }
 
+// taskJ2 (ruquant 82c73b5 port): GGML_CUDA_RP_Q8_NC_LDS=<2|4|8|16> routes the
+// repacked Q8_0 narrow-batch window (widths 4..8) to the LDS-staged kernel
+// rp_q8_nc_lds (repack-kernels.cuh); the value is waves per workgroup (2 rows
+// per lane). DEFAULT 0 = OFF: the dispatch-site branch is never taken and every
+// existing REPACK path is byte-identical to the pre-gate build. Upstream's own
+// gate (RQ_Q8_NC_WAVES) defaults to 8 there; the fork convention is opt-in.
+// Upstream measurements, Qwen3.8-27B one MI50 8-token forward: 8 waves
+// 37.4-37.7 ms, 4 waves 38.1-38.2, 16 waves 38.2, unstaged kernel 38.5-38.6.
+static int rp_q8_nc_lds_waves(void) {
+    static const int w = [] {
+        const char * e = getenv("GGML_CUDA_RP_Q8_NC_LDS");
+        const int r = e ? atoi(e) : 0;
+        const int v = (r == 2 || r == 4 || r == 8 || r == 16) ? r : 0;
+        if (v) {
+            GGML_LOG_WARN("CUDA repack: GGML_CUDA_RP_Q8_NC_LDS=%d ACTIVE: repacked Q8_0 nc widths 4-8 route to the LDS-staged kernel; accumulation order differs from the RESTYLE default (not bit-identical to stock)\n", v);
+        }
+        return v;
+    }();
+    return w;
+}
+
+template <int T>
+static void rp_q8_nc_lds_launch(const uint8_t * w, const block_q8_1 * xq, float * dst_d,
+        const int64_t ne00, const int64_t ne01, const uint32_t xs, const uint32_t ys,
+        cudaStream_t stream) {
+    const int W = rp_q8_nc_lds_waves();
+    const dim3 grid((unsigned) ((ne01 + 2 * W - 1) / (2 * W)), 1, 1);
+    switch (W) {
+        case 2:  rp_q8_nc_lds<T, 2> <<<grid,  128, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        case 4:  rp_q8_nc_lds<T, 4> <<<grid,  256, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        case 16: rp_q8_nc_lds<T, 16><<<grid, 1024, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+        default: rp_q8_nc_lds<T, 8> <<<grid,  512, 0, stream>>>(w, xq, dst_d, (uint32_t) ne00, (uint32_t) ne01, xs, ys); break;
+    }
+}
+
 // Narrow batch (2..8 tokens): one multi-column mat-vec pass per slice.
 template <ggml_type WT, bool U4ACT, bool U4P8, bool U4Q41, bool SUMW>
 static void ggml_cuda_mul_mat_repacked_nc_t(
         const uint8_t * w, const block_q8_1 * xq, float * dst_d,
         const int64_t ne00, const int64_t ne01, const int64_t ne11,
         const uint32_t xs, const uint32_t ys, cudaStream_t stream) {
+    // taskJ2: LDS-staged Q8_0 nc at widths 4..8 (ruquant 82c73b5 port), env-gated
+    // default OFF. When enabled it takes precedence over the RESTYLE arm: the LDS
+    // kernel is bit-identical to the generic <2,1,T,2,64> shape below (same lanes,
+    // block order, products, sums, reduction) but NOT to the RESTYLE default
+    // (stock 4-terms-per-block granularity), so the gate is a perf lever with its
+    // own numeric seal, not a bit-match. Widths 2-3 keep the existing shapes: the
+    // LDS staging does not amortize below 4 tokens. Unlike upstream there is no
+    // separate tall/lm_head arm here: this tree has no 16-lane shape at widths
+    // 4-8, the LDS kernel covers tall matrices with the same bit-identity.
+    if constexpr (WT == GGML_TYPE_Q8_0 && !U4ACT && !U4P8 && !U4Q41) {
+        if (rp_q8_nc_lds_waves() > 0 && ne11 >= 4 && ne11 <= 8) {
+            switch (ne11) {
+                case 4: rp_q8_nc_lds_launch<4>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 5: rp_q8_nc_lds_launch<5>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 6: rp_q8_nc_lds_launch<6>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 7: rp_q8_nc_lds_launch<7>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                case 8: rp_q8_nc_lds_launch<8>(w, xq, dst_d, ne00, ne01, xs, ys, stream); return;
+                default: break;
+            }
+        }
+    }
     // E4 stage 3 (2026-11-07, RESTYLE8-NC): under the RESTYLE gate the Q8_0
     // narrow-batch window (MTP speculative verify, widths 2..8) runs
     // mul_mat_vec_q8_0_repacked8_nc: stock 4-terms-per-32-block accumulation
