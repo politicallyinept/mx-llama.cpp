@@ -363,10 +363,14 @@ int main(int argc, char ** argv) {
     run_cell<8, 0>(17408, 5120, rng, false);
     // U4ACT (floor-0) arm, SUMW plane on
     run_cell<4, 1>(5120, 6144, rng, false);
+    run_cell<5, 1>(5120, 6144, rng, false);
     run_cell<8, 1>(5120, 6144, rng, false);
     run_cell<4, 1>(5120, 17408, rng, false);
+    run_cell<5, 1>(5120, 17408, rng, false);
     run_cell<8, 1>(5120, 17408, rng, false);
+    run_cell<5, 1>(5120, 10240, rng, false);
     run_cell<8, 1>(5120, 10240, rng, false);
+    run_cell<5, 1>(17408, 5120, rng, false);
     run_cell<8, 1>(17408, 5120, rng, false);
     run_ref<1>(5120, 17408, rng);
     run_ref<2>(5120, 17408, rng);
