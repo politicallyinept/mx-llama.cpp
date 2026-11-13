@@ -150,11 +150,12 @@ Long-context probe (benchlong: llama-bench pp16384/tg256, kernel off vs on) adde
 where the microbench win (3-5x at 16k-64k) should show up in full-model decode.
 
 n7 pair: step-phase profiles are identical within noise (verify w=8 61.5 vs 61.2 ms, draft-fwd
-18.5 vs 18.5 ms, inject 1.0 ms both) and acceptance is equal-to-better with the kernel (0.259 ->
-0.272), yet suite median says 35.3 vs 30.6. Per-prompt medians swing +/-40% in BOTH directions
-(math 39.8->64.4, tech 42.7->30.4): at this KV the suite median is dominated by acceptance
-lotteries from attention-numerics perturbation, not kernel speed. Treat single-run n4/n7 t/s
-deltas <15% as noise; the r2 reps quantify it.
+18.5 vs 18.5 ms, inject 1.0 ms both), yet t/s differs 35.3 vs 30.6. NOT run noise: on-q40dot8-r2
+reproduced r1 to 0.2% (42.60 vs 42.68) and acceptance to the digit (0.3659 both) - greedy verify
+makes acceptance deterministic. The deltas are systematic numerics effects: per-prompt medians
+swing +/-40% in BOTH directions (math 39.8->64.4, tech 42.7->30.4) because int4-Q attention
+perturbs which tokens the draft hits. Aggregate acceptance is equal-or-better with the kernel at
+n7 (0.259->0.272) while the suite median falls - the median tracks the low-acceptance prompts.
 Ops notes: first driver chain died mid-leg ~21:32 (no OOM; sibling taskJ2 pkill collateral);
 kld() unbound-$NAME fix; env-prefix must use `env VAR=..` (expanded VAR=x words are not
 assignments in bash); load-avg gate removed (starved under sibling 16-thread servers - flock +
