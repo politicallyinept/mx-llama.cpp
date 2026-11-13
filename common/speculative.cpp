@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1346,7 +1347,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // the prompt-class heuristic and/or the saturation of this prompt at shallow
         // depth in an earlier request. Switching here (request start) pays at most one
         // draft-graph rebuild per switch; mid-request switches never happen.
-        if (dctl.on) {
+        // taskP: bounds guard mirroring accept() - never index dctl.seq without
+        // the same seq_id < dctl.seq.size() check accept() uses. Only evaluated
+        // when the gate is on, so the gate-off path stays byte-identical.
+        if (dctl.on && seq_id >= 0 && seq_id < (llama_seq_id) dctl.seq.size()) {
             auto & st = dctl.seq[seq_id];
             if (st.drafts > 0) {
                 const float mean_len = 1.0f + (float) st.accepted / (float) st.drafts;
@@ -1692,7 +1696,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
                     if (dprof) {
-                        static unsigned long long dprof_n_gather = 0;
+                        static std::atomic<unsigned long long> dprof_n_gather = 0;
                         fprintf(stderr, "[DFLASH-PROF] draft-gather call=%llu bytes=%zu us=%lld\n",
                                 ++dprof_n_gather, features_buf.size() * sizeof(float),
                                 (long long) (ggml_time_us() - dprof_t0));
@@ -1722,7 +1726,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
                     rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
                     if (dprof) {
-                        static unsigned long long dprof_n_inj = 0;
+                        static std::atomic<unsigned long long> dprof_n_inj = 0;
                         fprintf(stderr, "[DFLASH-PROF] draft-inject call=%llu n_tokens=%d us=%lld rc=%d\n",
                                 ++dprof_n_inj, (int) n_chunk,
                                 (long long) (ggml_time_us() - dprof_t0), rc);
@@ -1776,7 +1780,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int32_t n = (int32_t) dp.pos0;
 
             // taskH1: per-request sticky depth when the controller is on
-            const int32_t n_draft = dctl.on ? dctl.seq[seq_id].depth : params.n_max;
+            // taskP: bounds guard (same check as accept()): an out-of-range
+            // seq_id falls back to the static bound instead of indexing past the
+            // vector. Gate-off (dctl.on false) and gate-on in-range are unchanged.
+            const int32_t n_draft = (dctl.on && seq_id >= 0 && seq_id < (llama_seq_id) dctl.seq.size())
+                ? dctl.seq[seq_id].depth : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.size();
@@ -1800,7 +1808,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
             ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
             if (dprof) {
-                static unsigned long long dprof_n_fwd = 0;
+                static std::atomic<unsigned long long> dprof_n_fwd = 0;
                 fprintf(stderr, "[DFLASH-PROF] draft-fwd call=%llu n_tokens=%d us=%lld rc=%d\n",
                         ++dprof_n_fwd, (int) batch.size(),
                         (long long) (ggml_time_us() - dprof_t0), ret);

@@ -161,3 +161,8 @@ AGENTS.local.md
 # sources seal_sumw_plane.cc are the committed ground truth)
 /seals/seal_gen.h
 /seals/seal_sumw_plane
+
+# ISA-census build artifacts (scripts/isa_census.sh regenerates these; the
+# script is the committed source, the dumps and test binaries are not)
+scripts/**/*.elf
+scripts/**/*.hsaco

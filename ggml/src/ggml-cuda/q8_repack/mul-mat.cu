@@ -89,7 +89,7 @@ static bool rp_i8narrow_on(void) {
         const char * e = getenv("GGML_CUDA_I8NARROW");
         const bool r = e != nullptr && atoi(e) != 0;
         if (r) {
-            GGML_LOG_WARN("[I8NARROW] gate ACTIVE: repacked Q4_0 narrow-batch window (T in {1,2,4,8,16}) routes to mul_mat_i8narrow_launch (exact 8-bit split activations, [qs|d] planes)\n");
+            GGML_LOG_WARN("[I8NARROW] gate ACTIVE: repacked Q4_0 narrow-batch window (T in {1,2,4,8}) routes to mul_mat_i8narrow_launch (exact 8-bit split activations, [qs|d] planes)\n");
         }
         return r;
     }();
@@ -396,11 +396,18 @@ void ggml_cuda_mul_mat_repacked(ggml_backend_cuda_context & ctx,
         // compatible [qs|d] two-plane layout the kernel reads (rp_traits<
         // Q4_0>: raw nibble plane + f16 d plane at ne1*qs_stride; the kernel
         // sums nibbles inline, so no SUMW plane is required). Only the
-        // instantiated widths {1,2,4,8,16} route here; 3/5/6/7 fall through
+        // instantiated widths {1,2,4,8} route here; 3/5/6/7 fall through
         // to the existing path below. With the gate OFF this branch is a
         // constant false and every line below is untouched code.
+        // taskP: width 16 REMOVED from the admitted set pending the GPU re-proof
+        // of determinism at T=16 on the fixed harness. taskB2 section 6 flagged
+        // the T=16 corruption; taskA2 + b392f48d root-caused it to the harness
+        // d-plane under-copy (element count vs bytes), but the determinism
+        // re-proof on the fixed harness is a separate future lane - the
+        // conservative resolution is to not admit the width until that re-proof
+        // lands. The gate is default OFF, so default serving is unaffected.
         if (rp_i8narrow_on() && src0->type == GGML_TYPE_Q4_0 && ggml_cuda_repack_mul_mat_should_fire(src0) &&
-                (ne11 == 1 || ne11 == 2 || ne11 == 4 || ne11 == 8 || ne11 == 16)) {
+                (ne11 == 1 || ne11 == 2 || ne11 == 4 || ne11 == 8)) {
             const int64_t i8_s11 = src1->nb[1] / sizeof(float);
             const int64_t i8_s12 = src1->nb[2] / sizeof(float);
             const int64_t i8_s13 = src1->nb[3] / sizeof(float);
