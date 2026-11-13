@@ -1054,6 +1054,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // achieved at the shallow depth in an earlier request.
     struct depth_ctl {
         bool    on = false;
+        bool    use_class = true;
         int32_t n_shallow = 0;
         int32_t n_deep    = 0;
         float   sat_thresh = 4.4f;
@@ -1223,6 +1224,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (const char * t = getenv("LLAMA_DFLASH_SAT")) {
                         dctl.sat_thresh = (float) atof(t);
                     }
+                    if (const char * t = getenv("LLAMA_DFLASH_CLASS")) {
+                        dctl.use_class = atoi(t) != 0;
+                    }
                     if (dctl.n_shallow < 1 || dctl.n_shallow >= dctl.n_deep) {
                         dctl.on = false;
                         LOG_WRN("%s: adaptive depth needs 1 <= shallow (%d) < deep (%d) - disabled\n",
@@ -1357,7 +1361,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             st.drafts   = 0;
             st.accepted = 0;
 
-            const int hits = depth_class_hits(params.ctx_tgt, prompt);
+            const int hits = dctl.use_class ? depth_class_hits(params.ctx_tgt, prompt) : 0;
             const auto it  = dctl.sat_len.find(st.hash);
             const float sat = it != dctl.sat_len.end() ? it->second : -1.0f;
             st.depth = (hits >= 2 || sat >= dctl.sat_thresh) ? dctl.n_deep : dctl.n_shallow;
