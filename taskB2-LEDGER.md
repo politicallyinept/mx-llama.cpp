@@ -81,7 +81,7 @@ side), so the stock arm verifies against its own reference, not vs i8out.
 
 Medians (ms), 35 reps skip-5, same shapes as the i8narrow arm:
 
-| T  | i8 (5120x17408) | stock (5120x17408) | i8/stock | vs 95% bar | i8 (17408x5120) | stock (17408x5120) | i8/stock | vs 95% bar |
+| T  | i8 (5120x17408) | stock (5120x17408) | stock/i8 (smaller = i8 slower) | vs 95% bar | i8 (17408x5120) | stock (17408x5120) | stock/i8 (smaller = i8 slower) | vs 95% bar |
 |----|-----------------|--------------------|----------|------------|-----------------|--------------------|----------|------------|
 | 1  | 0.328           | 0.104              | 0.317    | FAIL       | 0.449           | 0.093              | 0.207    | FAIL       |
 | 2  | 0.358           | 0.137              | 0.383    | FAIL       | 0.489           | 0.134              | 0.275    | FAIL       |
@@ -101,6 +101,15 @@ touching the serving path.
 - i8narrow T=16 on K=5120 N=17408: 87040/278528 bad (NaN tail, maxrel
   1.7e9) -- reproduced IDENTICALLY with the pristine harness binary; owned
   by the sibling /root/wt-t16fix worktree.
+
+  SUPERSEDED (taskP, 2026-11-13): taskA2-LEDGER + commit b392f48d proved this
+  T=16 corruption was NOT a kernel bug. The mb harness hipMemcpy'd the f16
+  activation scale (d) plane with the ELEMENT count of a vector<uint16_t>
+  instead of its byte count, under-copying the plane so the kernel read
+  uninitialized device memory for token planes c>=8. That harness root-cause
+  supersedes the "real bug" framing in this section and in the sibling
+  /root/wt-t16fix record. The width-16 dispatch admission was subsequently
+  removed (taskP) pending a determinism re-proof on the fixed harness.
 - i8narrow K=17408 N=5120 widths >= 4: 1 element out of 20480/40960 at
   maxrel 0.021 (tolerance 1e-2) -- reproduced with the pristine binary;
   borderline fp32-contraction class.
