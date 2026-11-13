@@ -2512,6 +2512,102 @@ static __global__ void mul_mat_vec_repacked_nc(
         GGML_GLU_OP_REGLU, 0);
 }
 
+// taskJ2 (port of ruquant 82c73b5 rq_q8_nc): the Q8_0 narrow-batch mat-vec at widths
+// 4..8 with each step's activation blocks staged in LDS once per workgroup.
+// mul_mat_vec_repacked_nc<2, 1, T, 2, 64, Q8_0> loads every token's activation block
+// per lane and step from L2 (Qwen3.8-27B ssm_out at 8 tokens: ~140 MB per call for
+// 33 MB of weights, 90 us). This kernel keeps the same lanes, block order, products,
+// sums and reduction (bit-identical to that shape) and stages each step's blocks in
+// LDS once per W-wave workgroup: the 2W rows of a workgroup share the staged copy,
+// 70 us upstream. Env gate at the dispatch site: GGML_CUDA_RP_Q8_NC_LDS (default 0,
+// OFF) in q8_repack/mul-mat.cu.
+template <int T, int W>
+static __global__ void __launch_bounds__(64 * W) rp_q8_nc_lds(
+        const uint8_t * __restrict__ wbase, const block_q8_1 * __restrict__ xq, float * __restrict__ y,
+        const uint32_t ne0, const uint32_t ne1, const uint32_t xs, const uint32_t ys) {
+#if defined(GGML_USE_HIP) && defined(__gfx906__)
+    // two rows per lane: 63 VGPRs, 4 waves per SIMD. One row (46 VGPRs) was slower
+    // upstream: 2 workgroups per CU either way.
+    constexpr int RPL = 2;
+    __shared__ int4  sq[T][64][2]; // a step's activation codes: token, block, 32 values
+    __shared__ float sd[T][64];    // and scales
+    const int lane = threadIdx.x % 64;
+    const int row  = (blockIdx.x * W + threadIdx.x / 64) * RPL;
+    const typename rp_traits<GGML_TYPE_Q8_0>::geom wg(ne0, ne1);
+    const uint32_t n_blocks = ne0 >> 5;
+    uint32_t wrows[RPL];
+    bool     rvalid[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+        wrows[r]  = min((uint32_t) (row + r), ne1 - 1);
+        rvalid[r] = row + r < (int) ne1;
+    }
+    float acc[RPL][T] = {};
+    for (uint32_t s0 = 0; s0 < n_blocks; s0 += 64) {
+        const uint32_t sb     = s0 + lane;
+        const bool     active = sb < n_blocks;
+        // This step's weights first, in flight while the activations are staged.
+        // Holding the next step's weights and activation blocks in registers instead
+        // (a software pipeline) takes 96 VGPRs, 2 waves per SIMD: slower (upstream).
+        uint4 wv0[RPL], wv1[RPL];
+        float dw[RPL];
+        if (active) {
+#pragma unroll
+            for (int r = 0; r < RPL; ++r) {
+                uint16_t db;
+                rp_traits<GGML_TYPE_Q8_0>::load_w(wbase, wg, wrows[r], sb, wv0[r], wv1[r], db);
+                dw[r] = rp_traits<GGML_TYPE_Q8_0>::scale(rp_slot_keep(db, rvalid[r]));
+            }
+        }
+        __syncthreads(); // the previous step's reads are done
+        for (int i = threadIdx.x; i < T * 64; i += 64 * W) {
+            const int t = i / 64, j = i % 64;
+            if (s0 + j < n_blocks) {
+                const block_q8_1 * xb = xq + (size_t) t * xs + s0 + j;
+                const int * q = reinterpret_cast<const int *>(xb->qs);
+                sq[t][j][0] = make_int4(q[0], q[1], q[2], q[3]);
+                sq[t][j][1] = make_int4(q[4], q[5], q[6], q[7]);
+                sd[t][j]    = __low2float(xb->ds);
+            }
+        }
+        __syncthreads();
+        if (active) {
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const int4  x0 = sq[t][lane][0], x1 = sq[t][lane][1];
+                const float dx = sd[t][lane];
+#pragma unroll
+                for (int r = 0; r < RPL; ++r) {
+                    int ilo = 0, ihi = 0;
+                    ilo = ggml_cuda_dp4a((int) wv0[r].x, x0.x, ilo);
+                    ilo = ggml_cuda_dp4a((int) wv0[r].y, x0.y, ilo);
+                    ilo = ggml_cuda_dp4a((int) wv0[r].z, x0.z, ilo);
+                    ilo = ggml_cuda_dp4a((int) wv0[r].w, x0.w, ilo);
+                    ihi = ggml_cuda_dp4a((int) wv1[r].x, x1.x, ihi);
+                    ihi = ggml_cuda_dp4a((int) wv1[r].y, x1.y, ihi);
+                    ihi = ggml_cuda_dp4a((int) wv1[r].z, x1.z, ihi);
+                    ihi = ggml_cuda_dp4a((int) wv1[r].w, x1.w, ihi);
+                    acc[r][t] += dw[r] * dx * (float) (ilo + ihi);
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < RPL; ++r) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const float a = rp_warp_reduce_sum<64>(acc[r][t]);
+            if (lane == 0 && rvalid[r]) {
+                y[(size_t) t * ys + row + r] = a;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(wbase, xq, y, ne0, ne1, xs, ys);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // MoE narrow batch: one assignment per block, one launch for all of them.
 // Expert token counts are per expert, so at verify widths nearly every active
 // expert holds a single assignment and the 32-wide tile computes 32 columns to
