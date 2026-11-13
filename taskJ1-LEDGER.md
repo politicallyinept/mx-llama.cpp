@@ -161,3 +161,39 @@ kld() unbound-$NAME fix; env-prefix must use `env VAR=..` (expanded VAR=x words 
 assignments in bash); load-avg gate removed (starved under sibling 16-thread servers - flock +
 GPU-free picker suffice); lock now held once per phase, not per leg (sibling legs >900s caused
 per-leg LOCKFAIL churn); gate failures exit the phase for the retry loop.
+
+### 3.4 Plain llama-bench long-KV probe (pp16384/tg256, q4_0 KV, TP2)
+
+| arm | pp16384 | tg256 (kv~16.6k) |
+|---|---|---|
+| kernel OFF | 522.80 | 44.94 +/- 1.55 |
+| DOT8=1     | 519.81 | 46.99 +/- 0.17 (+4.6%) |
+
+Short-KV plain bench (pp512/tg256): kernel OFF 38.98 -> DOT8=1 43.43 (+11%) -> DOT8=1+KROT
+46.84 (+20%, above f16-KV 44.17). r2 reps: on-q40-r2 53.80/0.4463, on-f16-r2 37.61/0.3482 -
+reproduce r1 to the digit on acceptance, 0.2-0.7% on t/s.
+
+## 4. Verdict
+
+1. Port: complete and correct. GGML_CUDA_FA_DOT8 (0=off default, 1=int4 Q, 2=int8 Q) gates the
+   v_dot8 q4_0-KV kernel on gfx906; 359/359 test-backend-ops PASS; KLD gate PASS with exact
+   taskI1 reproduction; all 64-token greedy probes byte-identical to the f16-KV baseline.
+   KROT composition is coherent (rotation arm strictly better numerics, 0.0098 vs 0.0112 KLD).
+2. Microbench: the kernel is 1.8-4.9x faster than the stock dequant FA path on isolated
+   attention calls at decode and verify shapes (bigger win at long KV).
+3. End-to-end 27B: the isolated win does NOT translate at <=16k KV on this model/TP2. Verify
+   step time is unchanged (41.6 vs 41.8 ms at w=5; 61.2 vs 61.5 ms at w=8); plain decode gains
+   +4.6% at 16k KV and +11% at short KV - far less than the microbench implies: attention is a
+   much smaller slice of the real TP2 step, and tensor-split halves per-GPU attention work.
+4. The DFlash2 t/s deltas between kernel on/off are systematic numerics effects, not speed:
+   int4-Q attention shifts verify logits and reproducibly moves acceptance (n4: 0.446 -> 0.366
+   raw, 0.416 with KROT).
+5. Task question - does the port move DFlash2-on toward/above plain decode (47)? The identified
+   lever was real but it is q4_0 KV itself, not the kernel: DFlash2-on + q4_0 KV = 53.7-53.8
+   (accept 0.446), +42% over DFlash2-on f16-KV (37.9) and +14% OVER plain decode (47.1) -
+   DFlash2 is net-positive with zero kernel work. The kernel as ported is t/s-neutral to
+   negative vs the dequant path at suite KV (42.7 raw, 46.6 with KROT, vs 53.7 dequant): it
+   trades acceptance for an attention speedup the 27B step cannot spend at this context.
+   Recommendation: ship q4_0 KV + DFlash2 (net positive today); keep GGML_CUDA_FA_DOT8 default
+   OFF; revisit the kernel for >=32k-KV deployments where its bandwidth win grows, or pair it
+   with a draft retrained under int4-Q numerics if it is ever enabled.
