@@ -42,6 +42,13 @@ restores the sync capture path.
   Ported kernels are marked in the source comments (`CV (castagna-veloce) port`, pinned
   to CV commit `3483d46`); the Provenance column of the gate table below notes which
   gates are CV ports.
+- **ruquant fork (external source):** the `rq-fattn` int4-KV decode/verify attention
+  kernel (`GGML_CUDA_FA_DOT8`; 587 lines, MIT) and the LDS-staged narrow matvec design
+  ported in this tree come from the ruquant work:
+  [skyne98/mx-llama.cpp](https://github.com/skyne98/mx-llama.cpp) branch `ruquant` and
+  [skyne98/ruquant](https://github.com/skyne98/ruquant). Port sources: commits
+  `047d127`, `b9bf750` and `82c73b5` (marked in the source comments, e.g.
+  `ruquant 82c73b5 port`).
 - **CV-port / in-house additions:** on top of that lineage this branch carries GPU kernel
   work for gfx906-class (MI50) accelerators, ported from the CV fork and developed
   in-house. Headline items:
