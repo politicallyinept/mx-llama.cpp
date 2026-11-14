@@ -110,6 +110,14 @@ touching the serving path.
   supersedes the "real bug" framing in this section and in the sibling
   /root/wt-t16fix record. The width-16 dispatch admission was subsequently
   removed (taskP) pending a determinism re-proof on the fixed harness.
+
+  CLOSED (taskX, 2026-11-14): the determinism re-proof on the fixed
+  harness PASSED -- standalone TheRock build of mb_i8narrow_test.cu, 3 runs,
+  both shapes, T=1..16 all verify ok (NaN-safe bad count 0, d-plane uploaded
+  in BYTES with device readback mismatches=0, det-bitmatch ok, verify lines
+  identical across runs; T=16 shape1 maxrel 0.00647 / 0.508 ms matching
+  taskA2). Width 16 RESTORED to the admitted set {1,2,4,8,16} on branch
+  int4-x-verify. See taskX-LEDGER.md.
 - i8narrow K=17408 N=5120 widths >= 4: 1 element out of 20480/40960 at
   maxrel 0.021 (tolerance 1e-2) -- reproduced with the pristine binary;
   borderline fp32-contraction class.
