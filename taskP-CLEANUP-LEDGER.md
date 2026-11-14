@@ -53,6 +53,10 @@ Review item: T=16 admitted despite the unresolved determinism question.
 - The kernel-side width-16 instantiation (w4a4-i8narrow.cu) and the mb
   harness width list (mb_i8narrow_test.cu) are left in place: the harness is
   the tool the future re-proof lane needs.
+- TRAIL (taskX, 2026-11-14): the pending GPU determinism re-proof LANDED
+  and PASSED on the fixed harness (3 runs, both shapes, T=1..16 verify ok,
+  readback mismatches=0, cross-run identical verify lines -- taskX-LEDGER.md).
+  Width 16 restored to the admitted set {1,2,4,8,16} on branch int4-x-verify.
 
 ### 5. 0.0499 KLD label sweep -- commit f9bbb6d077
 Review item: 0.0499 mislabeled as fork-sealed. Per
