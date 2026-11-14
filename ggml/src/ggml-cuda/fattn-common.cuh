@@ -999,6 +999,105 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_denominator > 0.0f ? VKQ_numerator / VKQ_denominator : 0.0f;
 }
 
+// taskV2 R7: block/wave-split chunk combine for the stock chunked path - port of the
+// rq_fa_combine design (taskJ1, rq-fattn.cu). The stock flash_attn_combine_results above
+// walks every chunk serially in one thread per channel, a dependent load and an expf
+// each: at TP4 64k (114 chunks) that took ~50 us per 8-token verify call next to 244 us
+// of attention. Here 4 waves split the chunks, the chunk weights exp(m_l - m) are
+// computed once per block in LDS, and each channel's sum is a 4-way tree reduction.
+// Format-independent: it only ever sees the fp32 parts/meta the chunked kernel wrote.
+// Env gate GGML_CUDA_FA_COMBINE_SPLIT=1, DEFAULT OFF (stock kernel above runs unchanged
+// when off). The wave64 geometry is gfx906-class only (cf. rq-fattn which hardcodes 64
+// lanes); the gate is inert on every other device. The combine reorders fp32 adds
+// (per-wave strided partials + tree instead of the serial walk), so output is NOT
+// bit-identical to stock: sealed by KLD vs gate-off at 64k context.
+#ifdef GGML_USE_HIP
+#define FA_COMBINE_WAVE 64
+#else
+#define FA_COMBINE_WAVE 32
+#endif
+
+static inline bool ggml_cuda_fa_combine_split_enabled(const int device) {
+#ifdef GGML_USE_HIP
+    static const bool enabled = [] () {
+        const char * e = getenv("GGML_CUDA_FA_COMBINE_SPLIT");
+        return e && atoi(e) != 0;
+    } ();
+    return enabled && ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VEGA20;
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
+}
+
+template<int D> // D == head size
+__launch_bounds__(4 * FA_COMBINE_WAVE, 1)
+static __global__ void flash_attn_combine_results_split(
+        const float  * VKQ_parts_ptr,
+        const float2 * VKQ_meta_ptr,
+        float * dst_ptr,
+        const int parallel_blocks) {
+    // Same parts/meta layout as flash_attn_combine_results: blockIdx.x enumerates the
+    // linear (sequence, col, head) index, blockIdx.y a wave-sized group of channels.
+    extern __shared__ float chunk_w[];     // [parallel_blocks] chunk weights, once per block
+    __shared__ float red[4][FA_COMBINE_WAVE], ml[2][4];
+
+    const int j    = blockIdx.x;
+    const int lane = threadIdx.x % FA_COMBINE_WAVE;
+    const int w    = threadIdx.x / FA_COMBINE_WAVE;
+    const int c    = blockIdx.y * FA_COMBINE_WAVE + lane;   // channel
+
+    const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr + (size_t) j * parallel_blocks * D;
+    const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr  + (size_t) j * parallel_blocks;
+    float        * GGML_CUDA_RESTRICT dst       = dst_ptr       + (size_t) j * D;
+
+    float kqmax = -INFINITY;
+    for (int i = threadIdx.x; i < parallel_blocks; i += 4 * FA_COMBINE_WAVE) {
+        kqmax = fmaxf(kqmax, VKQ_meta[i].x);
+    }
+#pragma unroll
+    for (int o = FA_COMBINE_WAVE / 2; o > 0; o >>= 1) {
+        kqmax = fmaxf(kqmax, __shfl_xor(kqmax, o, FA_COMBINE_WAVE));
+    }
+    if (lane == 0) {
+        ml[0][w] = kqmax;
+    }
+    __syncthreads();
+    kqmax = fmaxf(fmaxf(ml[0][0], ml[0][1]), fmaxf(ml[0][2], ml[0][3]));
+
+    float l = 0.0f;
+    for (int i = threadIdx.x; i < parallel_blocks; i += 4 * FA_COMBINE_WAVE) {
+        const float2 mi = VKQ_meta[i];
+        const float wi = mi.x == -INFINITY ? 0.0f : expf(mi.x - kqmax);
+        chunk_w[i] = wi;
+        l += wi * mi.y;
+    }
+#pragma unroll
+    for (int o = FA_COMBINE_WAVE / 2; o > 0; o >>= 1) {
+        l += __shfl_xor(l, o, FA_COMBINE_WAVE);
+    }
+    if (lane == 0) {
+        ml[1][w] = l;
+    }
+    __syncthreads();
+    l = ml[1][0] + ml[1][1] + ml[1][2] + ml[1][3];
+
+    float acc = 0.0f;
+    if (c < D) {
+#pragma unroll 4
+        for (int i = w; i < parallel_blocks; i += 4) {
+            acc += chunk_w[i] * VKQ_parts[(size_t) i * D + c];
+        }
+    }
+    red[w][lane] = acc;
+    __syncthreads();
+    if (w == 0 && c < D) {
+        // a fully-masked row has l = 0 in every chunk: emit 0 like the stock combine
+        const float sum = red[0][lane] + red[1][lane] + red[2][lane] + red[3][lane];
+        dst[c] = l > 0.0f ? sum / l : 0.0f;
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1362,13 +1461,33 @@ void launch_fattn(
                  fd_k_j_z_ne12, fd_k_j_z, fd_k_j, fd_k);
         }
     } else if (parallel_blocks > 1) {
-        const dim3 block_dim_combine(DV, 1, 1);
-        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
-        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+        if (ggml_cuda_fa_combine_split_enabled(id)) {
+            // GGML_CUDA_FA_COMBINE_SPLIT=1: wave-split combine (see flash_attn_combine_results_split).
+            // grid.x enumerates the same (sequence, col, head) rows linearly, grid.y the channel groups.
+            const dim3 block_dim_combine(4 * FA_COMBINE_WAVE, 1, 1);
+            const dim3 blocks_num_combine(Q->ne[1] * Q->ne[2] * Q->ne[3],
+                                          (DV + FA_COMBINE_WAVE - 1) / FA_COMBINE_WAVE, 1);
+            const size_t nbytes_shared_combine = parallel_blocks * sizeof(float);
 
-        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
-            dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_combine_results_split<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+
+            static bool combine_split_witnessed = false;   // engagement banner from the real call site
+            if (!combine_split_witnessed) {
+                combine_split_witnessed = true;
+                fprintf(stderr, "[FA-COMBINE-SPLIT] wave-split chunk combine engaged: D=%d parallel_blocks=%d rows=%u\n",
+                        DV, parallel_blocks, blocks_num_combine.x);
+            }
+        } else {
+            const dim3 block_dim_combine(DV, 1, 1);
+            const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+            const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+            ggml_cuda_kernel_launch(flash_attn_combine_results<DV>, launch_params,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
