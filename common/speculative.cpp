@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <list>
 #include <map>
 #include <unordered_map>
 #include <cinttypes>
@@ -1053,8 +1054,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // is (a) a prompt-class heuristic over the prompt text (code/tech markers) and
     // (b) a chain-saturation memory: the mean accept len the same prompt (hashed)
     // achieved at the shallow depth in an earlier request.
+    //
+    // taskT v2 (LLAMA_DFLASH_ADAPTIVE=2): explore-then-stick controller. The v1
+    // saturation memory is keyed on the FULL-prompt hash, so in multi-turn chat
+    // (prompt grows every request) the key never repeats and sat never fires. v2
+    // keys on a STABLE prompt identity - the hash of the first N tokens (system +
+    // first user turn prefix) - and learns per key: request 1 runs shallow (baseline),
+    // request 2 runs deep (probe), then the depth is frozen for that key by the H1
+    // ratio rule: deep iff deep_mean_len >= ratio * shallow_mean_len (ratio ~1.35
+    // cleanly separated deep winners on both H1 toolchains; toolchain-adaptive by
+    // construction, unlike the fixed sat threshold / keyword classifier). No mid-
+    // request switches: same sticky-at-begin() contract as v1. v1 behavior is
+    // preserved unchanged under LLAMA_DFLASH_ADAPTIVE=1.
     struct depth_ctl {
         bool    on = false;
+        int     mode = 1;          // 1 = taskH1 v1 (class+sat), 2 = taskT explore-then-stick
         bool    use_class = true;
         int32_t n_shallow = 0;
         int32_t n_deep    = 0;
@@ -1069,19 +1083,44 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<seq_state> seq;
 
         std::unordered_map<uint64_t, float> sat_len; // prompt hash -> mean accept len at shallow depth
+
+        // taskT v2 state: LRU of stable-prompt-identity -> exploration record
+        struct v2_entry {
+            float   sum_shallow = 0.0f; // sum of mean accept len at shallow depth
+            float   sum_deep    = 0.0f; // sum of mean accept len at deep depth
+            int     n_shallow   = 0;
+            int     n_deep      = 0;
+            int     phase       = 0;    // 0: need shallow obs, 1: need deep obs, 2: decided
+            int32_t depth       = 0;    // frozen depth once phase == 2
+        };
+        float  v2_ratio  = 1.35f;  // deep iff deep_len >= ratio * shallow_len
+        int    v2_keytok = 64;     // stable identity = hash of first N prompt tokens
+        size_t v2_cap    = 4096;   // LRU capacity
+        std::list<uint64_t> v2_lru;
+        std::unordered_map<uint64_t, std::pair<v2_entry, std::list<uint64_t>::iterator>> v2_mem;
     };
     depth_ctl dctl;
 
-    static uint64_t depth_prompt_hash(const llama_tokens & prompt) {
-        uint64_t h = 1469598103934665603ull; // FNV-1a 64
-        for (const auto id : prompt) {
-            const uint64_t v = (uint64_t) (int64_t) id;
+    static uint64_t depth_fnv_mix(uint64_t h, const llama_tokens & prompt, size_t n_max) {
+        for (size_t i = 0; i < prompt.size() && i < n_max; ++i) {
+            const uint64_t v = (uint64_t) (int64_t) prompt[i];
             for (int b = 0; b < 8; ++b) {
                 h ^= (v >> (8*b)) & 0xff;
                 h *= 1099511628211ull;
             }
         }
         return h;
+    }
+
+    static uint64_t depth_prompt_hash(const llama_tokens & prompt) {
+        return depth_fnv_mix(1469598103934665603ull, prompt, SIZE_MAX); // FNV-1a 64
+    }
+
+    // taskT v2: stable prompt identity - hash of the first N tokens only, so a
+    // growing multi-turn prompt (same system + first user turn) maps to one key.
+    static uint64_t depth_stable_hash(const llama_tokens & prompt, int key_tokens) {
+        return depth_fnv_mix(1469598103934665603ull, prompt,
+                             key_tokens > 0 ? (size_t) key_tokens : SIZE_MAX);
     }
 
     // count distinct code/tech markers in the prompt text; >=2 hits => "deep" class
@@ -1216,7 +1255,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (!is_dflash2) {
                     LOG_WRN("%s: LLAMA_DFLASH_ADAPTIVE set but the drafter is not DFlash2 - adaptive depth disabled\n", __func__);
                 } else {
-                    dctl.on = true;
+                    dctl.on   = true;
+                    dctl.mode = atoi(s) >= 2 ? 2 : 1;
                     dctl.n_deep    = this->params.n_max;
                     dctl.n_shallow = 4;
                     if (const char * t = getenv("LLAMA_DFLASH_SHALLOW")) {
@@ -1228,10 +1268,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     if (const char * t = getenv("LLAMA_DFLASH_CLASS")) {
                         dctl.use_class = atoi(t) != 0;
                     }
+                    if (dctl.mode == 2) {
+                        if (const char * t = getenv("LLAMA_DFLASH_RATIO")) {
+                            dctl.v2_ratio = (float) atof(t);
+                        }
+                        if (const char * t = getenv("LLAMA_DFLASH_KEYTOK")) {
+                            dctl.v2_keytok = atoi(t);
+                        }
+                        if (const char * t = getenv("LLAMA_DFLASH_V2CAP")) {
+                            dctl.v2_cap = (size_t) atoi(t);
+                        }
+                    }
                     if (dctl.n_shallow < 1 || dctl.n_shallow >= dctl.n_deep) {
                         dctl.on = false;
                         LOG_WRN("%s: adaptive depth needs 1 <= shallow (%d) < deep (%d) - disabled\n",
                                 __func__, dctl.n_shallow, dctl.n_deep);
+                    } else if (dctl.mode == 2) {
+                        dctl.seq.resize(n_seq);
+                        LOG_INF("%s: adaptive depth v2 ON shallow=%d deep=%d ratio=%.2f key_tokens=%d cap=%zu\n",
+                                __func__, dctl.n_shallow, dctl.n_deep, dctl.v2_ratio, dctl.v2_keytok, dctl.v2_cap);
                     } else {
                         dctl.seq.resize(n_seq);
                         LOG_INF("%s: adaptive depth ON shallow=%d deep=%d sat_thresh=%.2f\n",
@@ -1350,27 +1405,82 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // taskP: bounds guard mirroring accept() - never index dctl.seq without
         // the same seq_id < dctl.seq.size() check accept() uses. Only evaluated
         // when the gate is on, so the gate-off path stays byte-identical.
+        // taskT: mode == 2 selects the explore-then-stick controller; mode == 1
+        // keeps the v1 path below byte-for-byte unchanged.
         if (dctl.on && seq_id >= 0 && seq_id < (llama_seq_id) dctl.seq.size()) {
             auto & st = dctl.seq[seq_id];
-            if (st.drafts > 0) {
-                const float mean_len = 1.0f + (float) st.accepted / (float) st.drafts;
-                if (st.depth == dctl.n_shallow && dctl.sat_len.size() < 4096) {
-                    dctl.sat_len[st.hash] = mean_len; // saturation signal only from shallow runs
+            if (dctl.mode == 2) {
+                // taskT v2: explore-then-stick keyed on the STABLE prompt identity
+                // (first N tokens), so a growing multi-turn prompt maps to one key.
+                // Phase 0: shallow baseline. Phase 1: deep probe. Phase 2: frozen.
+                if (st.drafts > 0) {
+                    const float mean_len = 1.0f + (float) st.accepted / (float) st.drafts;
+                    auto it = dctl.v2_mem.find(st.hash);
+                    if (it != dctl.v2_mem.end()) {
+                        auto & e = it->second.first;
+                        if (st.depth == dctl.n_shallow) { e.sum_shallow += mean_len; e.n_shallow++; }
+                        else                            { e.sum_deep    += mean_len; e.n_deep++; }
+                        if (e.phase == 0 && e.n_shallow >= 1) {
+                            e.phase = 1; // shallow baseline observed: next request probes deep
+                        }
+                        if (e.phase == 1 && e.n_shallow >= 1 && e.n_deep >= 1) {
+                            const float sl = e.sum_shallow / e.n_shallow;
+                            const float dl = e.sum_deep / e.n_deep;
+                            e.phase = 2;
+                            e.depth = (sl > 0.0f && dl >= dctl.v2_ratio * sl) ? dctl.n_deep : dctl.n_shallow;
+                            LOG_INF("%s: dflash-depth-v2: hash=%016" PRIx64 " DECIDE shallow_len=%.3f(n=%d) deep_len=%.3f(n=%d) ratio=%.3f -> depth=%d\n",
+                                    __func__, st.hash, sl, e.n_shallow, dl, e.n_deep,
+                                    sl > 0.0f ? dl / sl : 0.0f, (int) e.depth);
+                        }
+                    }
+                    LOG_INF("%s: dflash-depth-v2: seq=%d prev_mean_len=%.3f prev_depth=%d\n",
+                            __func__, (int) seq_id, mean_len, (int) st.depth);
                 }
-                LOG_INF("%s: dflash-depth: seq=%d prev_mean_len=%.3f prev_depth=%d\n",
-                        __func__, (int) seq_id, mean_len, (int) st.depth);
+
+                st.hash     = depth_stable_hash(prompt, dctl.v2_keytok);
+                st.drafts   = 0;
+                st.accepted = 0;
+
+                auto it = dctl.v2_mem.find(st.hash);
+                if (it == dctl.v2_mem.end()) {
+                    while (dctl.v2_mem.size() >= dctl.v2_cap && !dctl.v2_lru.empty()) {
+                        dctl.v2_mem.erase(dctl.v2_lru.front());
+                        dctl.v2_lru.pop_front();
+                    }
+                    it = dctl.v2_mem.emplace(st.hash,
+                            std::make_pair(depth_ctl::v2_entry{},
+                                           dctl.v2_lru.insert(dctl.v2_lru.end(), st.hash))).first;
+                } else {
+                    dctl.v2_lru.splice(dctl.v2_lru.end(), dctl.v2_lru, it->second.second);
+                    it->second.second = std::prev(dctl.v2_lru.end());
+                }
+                auto & e = it->second.first;
+                st.depth = e.phase == 0 ? dctl.n_shallow
+                         : e.phase == 1 ? dctl.n_deep
+                                        : e.depth;
+                LOG_INF("%s: dflash-depth-v2: seq=%d hash=%016" PRIx64 " phase=%d depth=%d (n_shallow=%d n_deep=%d)\n",
+                        __func__, (int) seq_id, st.hash, e.phase, (int) st.depth, e.n_shallow, e.n_deep);
+            } else {
+                if (st.drafts > 0) {
+                    const float mean_len = 1.0f + (float) st.accepted / (float) st.drafts;
+                    if (st.depth == dctl.n_shallow && dctl.sat_len.size() < 4096) {
+                        dctl.sat_len[st.hash] = mean_len; // saturation signal only from shallow runs
+                    }
+                    LOG_INF("%s: dflash-depth: seq=%d prev_mean_len=%.3f prev_depth=%d\n",
+                            __func__, (int) seq_id, mean_len, (int) st.depth);
+                }
+
+                st.hash     = depth_prompt_hash(prompt);
+                st.drafts   = 0;
+                st.accepted = 0;
+
+                const int hits = dctl.use_class ? depth_class_hits(params.ctx_tgt, prompt) : 0;
+                const auto it  = dctl.sat_len.find(st.hash);
+                const float sat = it != dctl.sat_len.end() ? it->second : -1.0f;
+                st.depth = (hits >= 2 || sat >= dctl.sat_thresh) ? dctl.n_deep : dctl.n_shallow;
+                LOG_INF("%s: dflash-depth: seq=%d depth=%d class_hits=%d sat=%.3f\n",
+                        __func__, (int) seq_id, (int) st.depth, hits, sat);
             }
-
-            st.hash     = depth_prompt_hash(prompt);
-            st.drafts   = 0;
-            st.accepted = 0;
-
-            const int hits = dctl.use_class ? depth_class_hits(params.ctx_tgt, prompt) : 0;
-            const auto it  = dctl.sat_len.find(st.hash);
-            const float sat = it != dctl.sat_len.end() ? it->second : -1.0f;
-            st.depth = (hits >= 2 || sat >= dctl.sat_thresh) ? dctl.n_deep : dctl.n_shallow;
-            LOG_INF("%s: dflash-depth: seq=%d depth=%d class_hits=%d sat=%.3f\n",
-                    __func__, (int) seq_id, (int) st.depth, hits, sat);
         }
 
         // replay any chunks still deferred (matches what the eager path would have
