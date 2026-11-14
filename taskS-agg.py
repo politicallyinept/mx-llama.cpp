@@ -4,6 +4,7 @@ import glob, hashlib, json, os, re, statistics
 
 B = "/root/taskS"
 
+<<<<<<< HEAD
 print("== width-8 KLD gate (taskJ2 -b 8 protocol, 27B Q4_0, wiki-sub 64KB) ==")
 for name in ("q40off", "q40kld", "d1", "d2", "d1vsoff", "d2vsoff"):
     f = f"{B}/kld8-{name}.log"
@@ -19,6 +20,27 @@ for name in ("q40off", "q40kld", "d1", "d2", "d1vsoff", "d2vsoff"):
     print(f"{name:9s} meanKLD={mk.group(1) if mk else '-':>10s} maxKLD={xk.group(1) if xk else '-':>10s} "
           f"PPL(Q)={mq.group(1) if mq else '-':>8s} PPL={mp.group(1) if mp else '-':>8s} "
           f"FA-DOT8-banner-hits={hits} rc={rc.group(1) if rc else '?'}")
+=======
+for prefix, label in (("kld8-", "width-8 KLD gate (taskJ2 -b 8 protocol, 27B Q4_0, wiki-sub 64KB)"),
+                      ("kld8q8-", "width-8 KLD gate (taskJ2 -b 8 protocol, 27B Q8_0 stack, wiki-sub 64KB)")):
+    print(f"== {label} ==")
+    names = ("q40off", "q40kld", "d1", "d2", "d1vsoff", "d2vsoff") if prefix == "kld8-" else \
+            ("q40off", "q40kld", "d1", "d2", "d1vsbase", "d2vsbase")
+    for name in names:
+        f = f"{B}/{prefix}{name}.log"
+        if not os.path.exists(f):
+            continue
+        txt = open(f, errors="ignore").read()
+        mk = re.search(r"Mean    KLD:\s+(\S+)", txt)
+        xk = re.search(r"Maximum KLD:\s+(\S+)", txt)
+        mq = re.search(r"Mean PPL\(Q\):\s+(\S+)", txt)
+        mp = re.search(r"Mean    PPL:\s+(\S+)", txt)
+        hits = open(f + ".dot8-hits").read().strip() if os.path.exists(f + ".dot8-hits") else "?"
+        rc = re.search(r"rc=(\d+)", txt)
+        print(f"{name:9s} meanKLD={mk.group(1) if mk else '-':>10s} maxKLD={xk.group(1) if xk else '-':>10s} "
+              f"PPL(Q)={mq.group(1) if mq else '-':>8s} PPL={mp.group(1) if mp else '-':>8s} "
+              f"FA-DOT8-banner-hits={hits} rc={rc.group(1) if rc else '?'}")
+>>>>>>> int4-s-fadot8
 
 print("\n== short d7 legs (verify width 8, natural suite, acceptance + tg) ==")
 for f in sorted(glob.glob(f"{B}/s-*.reps.jsonl")):

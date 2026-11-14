@@ -38,7 +38,11 @@ gates() { # sets DEVS, holds fd 9
     sleep 30
   done
   exec 9>/root/gpu.lock
+<<<<<<< HEAD
   flock -w 3600 9 || { echo "LOCKFAIL"; return 1; }   # taskS: longer polite wait (fleet contention)
+=======
+  flock -w 1800 9 || { echo "LOCKFAIL"; return 1; }
+>>>>>>> int4-s-fadot8
   awk '/MemAvailable/{exit !($2>=12582912)}' /proc/meminfo || { echo "GATE-RAM-FAIL"; flock -u 9; return 99; }
   for i in $(seq 1 20); do
     DEVS=$(python3 -c '

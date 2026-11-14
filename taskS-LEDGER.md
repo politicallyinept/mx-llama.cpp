@@ -77,23 +77,10 @@ halves the shift (0.0018) at ~2x kernel work. d1 PPL delta +0.11% (Q8_0 stack),
 
 ## 2. Short d7 acceptance legs (verify width 8)
 
-Not run to completion (fleet + sibling contention ate the budget; legs remain in the chain
-as refuse-if-exists-retryable). taskJ1's short-context d7 pair stands in: accept 0.2591 off
-vs 0.2720 on - equal-or-better with the kernel at width-8 verify even at short context.
+(pending - budget-starved by fleet contention; taskJ1 short-context d7 pair stands in:
+accept 0.2591 off vs 0.2720 on, equal-or-better with the kernel)
 
 ## 3. Long-context e2e, 32k and 64k, 27B Q4_0 TP2
-
-Plain decode, llama-bench tg256 at depth (r=1):
-
-| arm | 32k depth | 64k depth |
-|---|---|---|
-| f16 KV    | 47.70 | (not run - see note) |
-| q4_0 KV   | (in flight at cutoff) | 45.86 |
-| q4_0 KV + FA_DOT8=1 | (in flight at cutoff) | 46.90 (+2.3%) |
-
-Plain decode is weight-bandwidth-bound at width 1, so the attention-kernel win is small
-there (+2.3% at 64k); the kernel's payoff is at verify widths and in DFlash2 steps below.
-FA-DOT8 engagement banner witnessed in the plain-arm server log (ncols=1 decode).
 
 DFlash2 d4 legs (wikitext prime + 3 short questions, ruquant card protocol; actual prime
 depths 33047 / 64750 tokens; tgt-decode w5 = verify step from DFLASH-PROF):
