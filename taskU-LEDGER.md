@@ -108,13 +108,15 @@ taskQ d7 f128lds 30.08/0.2105/2.4737, f0lds 34.04/0.2374/2.6615, f0q4 44.30, f12
     J1 0.011223 envelope precedent on this window. PPL impact is negligible and the greedy
     probe is byte-identical, but the distribution shift is real - flag the d7 champion
     (f0ldsq4kv) as numerics-aggressive (floor-0 KL class + q4KV envelope + interaction).
-  - f0q4kv      vs q-f0lds:   NOT RUN at ledger time - supplementary leg starved by sibling
-    lane taskV2-r7 load-gate contention (chain2 retry loop pending; the mandatory taskI1
-    envelope gate above covers all q4KV arms on this binary).
+  - f0q4kv      vs q-f0lds:   NOT RUN - supplementary leg starved by sibling lane
+    taskV2-r7 (66k-context logits dump held load AND RAM gates past the retry budget;
+    chain2 terminated at task budget). The MANDATORY taskI1-protocol envelope gate above
+    covers all q4_0-KV arms on this binary; the f0ldsq4kv leg (same floor-0 base logits)
+    is the stack-side readout for the floor-0 x q4KV interaction.
 * Acceptance digit-match: deterministic within-arm (greedy verify); controls match taskQ to
   the digit (sec 4). q4KV acceptance shifts are systematic numerics readouts: d7 f128 pair
   0.2105 -> 0.2552 (+21% rel), f0 pair 0.2374 -> 0.3301 (+39% rel); d4 mixed (-2.6% f0,
-  +1.1% f128). r2 reproduction legs queued in chain2 (pending at commit time).
+  +1.1% f128). r2 reproduction legs starved by sibling contention (see f0q4kv note).
 * Gate witnesses: every leg carries proc.witness (cmdline incl. -ctk/-ctv where applicable,
   /proc/PID/environ, lib maps - TheRock only) + gate.witness (REPACK_Q8_0/RP_Q8_NC_LDS/
   MIN_TOKENS banners). This fork logs no KV-type banner at load (same as taskK); the KLD
@@ -145,12 +147,12 @@ RECOMMENDATIONS:
    the Q4_0 stack it is worth +42% d4 / +25..+52% d7 depending on floor/LDS; it substitutes
    for the LDS pair at floor-ON and multiplies with it at floor-0/width-8.
 
-Honest limits: single rep per cell (bench.py internal 3 reps; r2 spot-checks queued in
-chain2, pending at commit); d7 f16-KV LDS-off cells not measured (out of scope); 27B KLD
+Honest limits: single rep per cell (bench.py internal 3 reps; r2 spot-check legs starved by
+sibling contention, not run); d7 f16-KV LDS-off cells not measured (out of scope); 27B KLD
 window is a 64KB wikitext subset at -b 8 (narrow-window protocol, taskJ2/taskQ class);
 sibling lanes (U2 + taskV2-r7) shared the box - tg cells carry a few % contention noise,
-acceptance deterministic; f0ldsq4kv-d7 51.69 is a single-rep champion number on the
-strength of its deterministic acceptance (0.3301/3.3105) - r2 leg will confirm.
+acceptance deterministic; f0ldsq4kv-d7 51.69 is a single-rep champion number resting on its
+deterministic acceptance (0.3301/3.3105) - an r2 leg is the obvious confirmation leg.
 
 ## 6. Artifacts
 
