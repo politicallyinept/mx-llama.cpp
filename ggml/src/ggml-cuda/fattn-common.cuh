@@ -1006,6 +1006,9 @@ static __global__ void flash_attn_combine_results(
 // of attention. Here 4 waves split the chunks, the chunk weights exp(m_l - m) are
 // computed once per block in LDS, and each channel's sum is a 4-way tree reduction.
 // Format-independent: it only ever sees the fp32 parts/meta the chunked kernel wrote.
+// A/B-ONLY (taskV2-r7 verdict): NEGATIVE at TP2 64k - the combine is a few us of a
+// ~590 us verify step at pb~20; the ruquant-class win needs TP4 (~100+ chunks/GPU) or a
+// pb>=64 engagement threshold. Do NOT enable in serving configs.
 // Env gate GGML_CUDA_FA_COMBINE_SPLIT=1, DEFAULT OFF (stock kernel above runs unchanged
 // when off). The wave64 geometry is gfx906-class only (cf. rq-fattn which hardcodes 64
 // lanes); the gate is inert on every other device. The combine reorders fp32 adds

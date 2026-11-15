@@ -20,6 +20,7 @@
 #include <hip/hip_runtime.h>
 #include "ggml.h"
 #include "ggml-cuda/common.cuh"
+#define GGML_I8NARROW_KEEP_KSPLIT 1 /* taskP2: harness keeps the KSPLIT sweep; serving builds strip it */
 #include "w4a4-i8narrow.cu"
 #include "repack-kernels.cuh"   // task B2: stock narrow nc family (head-to-head arm)
 

@@ -185,6 +185,12 @@ static __global__ void __launch_bounds__(NWAVES * 64) mul_mat_i8narrow_q40(
 #endif
 }
 
+#ifndef GGML_I8NARROW_KEEP_KSPLIT
+/* KSPLIT>1 reducer stripped from serving builds (harness-only, taskP2):
+   the K-split kernel loses to stock at every swept cell (0.424 vs 0.299 ms
+   at shape2/T8/KSPLIT=8) and no serving caller exists. mb_i8narrow_test.cu
+   defines GGML_I8NARROW_KEEP_KSPLIT to keep the sweep. */
+#else
 // ---------------------------------------------------------------------------
 // Second-pass reducer (KSPLIT > 1). Pass 1 wrote per-workgroup fp32 partials to
 // ksplit_ws[z][row*T + c]; this kernel sums them over z = 0..KSPLIT-1 in FIXED
@@ -206,6 +212,8 @@ static __global__ void mul_mat_i8narrow_reduce_q40(
         s += ksplit_ws[(size_t) z * ne1 * T + i];   // fixed z order
     y[(size_t) c * ys + row] = s;
 }
+
+#endif
 
 // Non-template dispatch (standard llama.cpp pattern): T at runtime, switch over
 // the kernel instantiations. ksplit=1 keeps the original single-pass path
@@ -243,6 +251,9 @@ void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, cons
         return;
     }
 
+#ifndef GGML_I8NARROW_KEEP_KSPLIT
+    GGML_ABORT("i8narrow: KSPLIT>1 stripped from serving builds (harness-only; define GGML_I8NARROW_KEEP_KSPLIT)");
+#else
     GGML_ASSERT(ksplit_ws != nullptr && "i8narrow KSPLIT>1 needs a caller-allocated [ksplit][ne1][T] float workspace");
     const dim3 grid((ne1 + 64 - 1) / 64, 1, ksplit);
     const dim3 blk(NWAVES * 64);
@@ -271,6 +282,7 @@ void mul_mat_i8narrow_launch(int T, const uint8_t * wbase, const void * hi, cons
     const uint32_t total = ne1 * (uint32_t) T;
     mul_mat_i8narrow_reduce_q40<<<(total + 255) / 256, 256, 0, stream>>>(
             ksplit_ws, y, ne1, (uint32_t) T, ys, (uint32_t) ksplit);
+#endif
 }
 
 // ---------------------------------------------------------------------------
