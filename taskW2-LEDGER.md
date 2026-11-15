@@ -125,9 +125,23 @@ Q8_0 nc <2,5> arm (E2-shipped, bit-matched) - sealed end-to-end by sec 2. Verify
 width 8 (d7) -> repacked Q8_0 nc <1,8> arm (the E2 1-warp fix, previously
 microbench-only on the MoE) - spot-checked by the d7 greedy pair in sec 6.
 
-## 6. d7 width-8 spot-check + pinned-drafter d4 pair
+## 6. d7 width-8 spot-check + pinned-drafter d4 pair (bonus coverage)
 
-[PENDING - legs re-queued behind taskW1 GPU2 hold via retry-d7.sh]
+d7 pair (verify width 8 -> repacked Q8_0 nc <1,8> 1-warp arm, the E2 fix previously
+microbench-only on the MoE): greedy suite stock-d7-r1 vs repack-d7-r1 = 10/10 BITID
+(text EQ, lp EQ, tokdiff 0, max_logprob_delta 0.000e+00 on every probe). Repack banners
+witnessed (gate ACTIVE mode 1, repacking on device 0 AND 1, n_max=7 block_size=8).
+E2 nc 6-8 end-to-end gap CLOSED on the MoE at the width the DFlash2 d7 config verifies.
+
+pinned-drafter d4 pair (taskH3 serving-rule variant: own-head grafted drafter
+DFlash2-Q8_0-ownhead.gguf + -devd ROCm0, witnessed in both legs' cmdlines):
+* greedy stock-d4pin-r1 vs repack-d4pin-r1: 10/10 BITID.
+* Cross-check stock-d4-r1 (replicated) vs stock-d4pin-r1 (pinned): 10/10 BITID -
+  placement is numerics-invariant, reproducing taskH3's bit-equal acceptance claim
+  across the full probe suite.
+* bench: stock-pin tg 78.21, repack-pin tg 77.69 (taskH3 pin-d4 class ~79.6, same
+  session drift); acceptance 0.373 / 2.4919 BIT-EQUAL on both pin legs and equal to
+  the replicated arms - the grafted head + pinning + repack pair move nothing.
 
 ## 7. Verdicts
 
@@ -148,7 +162,14 @@ microbench-only on the MoE) - spot-checked by the d7 greedy pair in sec 6.
    the =2 subset is covered. =1 also remains bit-identical on this config, but =2 stays
    the shipping posture (taskV2-moe caveat 1: =1 forces admission for every model in
    the process).
-4. [PENDING d7/pinned verdicts]
+4. d7 config (width-8 verify): SEAL PASS (greedy 10/10 BITID) - the E2 nc 6-8 1-warp
+   arm is now sealed end-to-end on the MoE, no longer microbench-only.
+5. Pinned-drafter d4 (taskH3 serving-rule variant): SEAL PASS (greedy 10/10 BITID,
+   acceptance bit-equal, placement numerics-invariant). The pair is safe on the pinned
+   entry too, including the own-head grafted drafter's repacked tensors.
+6. No config change required anywhere: the pair may stay ON for spec entries as-is
+   (=1 per-entry or =2 fleet-wide); restricting to =2 for spec entries is NOT required
+   for correctness on this model - =1 is already bit-identical here.
 
 ## 8. Ops notes
 
@@ -157,7 +178,9 @@ microbench-only on the MoE) - spot-checked by the d7 greedy pair in sec 6.
   held gpu.lock - its server started 13 s AFTER my lock acquisition, i.e. that lane
   ran without the lock (worth flagging to the fleet owner). My drain gate correctly
   refused co-scheduling (a 24 GB d7 leg + 10.7 GB sibling > 32 GB card = OOM risk);
-  the d7 legs were re-queued via retry-d7.sh rather than run dirty.
+  the d7 + pinned legs were re-queued via retry-d7.sh and completed OK at 13:47-13:58
+  once the sibling released GPU2 (stock-d7-r1 carries one FAILED ram/drain line from
+  the first attempt - superseded by the OK rerun).
 * GPU0 never used (quarantined); pair B GPU2+3 per dispatch.
 
 ## 9. Artifacts
