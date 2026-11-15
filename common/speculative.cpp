@@ -1856,6 +1856,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        // taskW1: host-phase timers for the draft orchestration window (deferred
+        // prompt flush / batch build / forward launch / lattice read+sync / selector
+        // walk). Same gate as the existing DFLASH-PROF counters; env unset = inert.
+        static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+        const int64_t hp_t0 = dprof ? ggml_time_us() : 0;
+        int64_t hp_flush = 0, hp_batch = 0, hp_fwd = 0, hp_readnx = 0, hp_walk = 0;
+
         // the draft KV must hold the whole prompt before the noise block decodes
         if (!pending.empty() && !flush_pending()) {
             LOG_ERR("%s: deferred prompt encode replay failed - skipping drafts\n", __func__);
@@ -1864,6 +1871,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             return;
         }
+        hp_flush = dprof ? ggml_time_us() - hp_t0 : 0;
+        const int64_t hp_tb = dprof ? ggml_time_us() : 0;
 
         batch.clear();
 
@@ -1912,11 +1921,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         int ret;
         {
             // GGML_DFLASH_PROF=1: per-call drafter forward timing + block width.
-            // The getenv is read once per process (function-local static); with the
-            // env unset nothing is timed and nothing is printed.
-            static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+            hp_batch = dprof ? ggml_time_us() - hp_tb : 0;
             const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
+            if (dprof) {
+                // log-order marker: every [DFLASH-PROF] cuda-graph line between this
+                // and the draft-fwd line belongs to the draft-phase launch window
+                fprintf(stderr, "[DFLASH-PROF] draft-fwd-begin n_tokens=%d\n", (int) batch.size());
+            }
             ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            hp_fwd = dprof ? ggml_time_us() - dprof_t0 : 0;
             if (dprof) {
                 static std::atomic<unsigned long long> dprof_n_fwd = 0;
                 fprintf(stderr, "[DFLASH-PROF] draft-fwd call=%llu n_tokens=%d us=%lld rc=%d\n",
@@ -1943,7 +1956,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dflash2) {
+                const int64_t hp_tr = dprof ? ggml_time_us() : 0;
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
+                hp_readnx += dprof ? ggml_time_us() - hp_tr : 0;
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
                 // GGML_DFLASH_LATTICE=1: dump the per-position selector walk (chosen token,
@@ -1951,6 +1966,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // width-8 runs on identical prompts can be diffed position by position.
                 static const bool dlatt = [] () { const char * e = getenv("GGML_DFLASH_LATTICE"); return e != nullptr && atoi(e) != 0; }();
 
+                const int64_t hp_tw = dprof ? ggml_time_us() : 0;
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
@@ -1982,6 +1998,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     result.push_back((llama_token) row[predecessor]);
                 }
+                hp_walk += dprof ? ggml_time_us() - hp_tw : 0;
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
@@ -2046,6 +2063,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (result.size() < (size_t) params.n_min) {
                 result.clear();
             }
+        }
+
+        if (dprof) {
+            static std::atomic<unsigned long long> dprof_n_host = 0;
+            fprintf(stderr, "[DFLASH-PROF] draft-host call=%llu total_us=%lld flush_us=%lld batch_us=%lld fwd_us=%lld readnx_us=%lld walk_us=%lld\n",
+                    ++dprof_n_host,
+                    (long long) (ggml_time_us() - hp_t0),
+                    (long long) hp_flush, (long long) hp_batch, (long long) hp_fwd,
+                    (long long) hp_readnx, (long long) hp_walk);
         }
     }
 
