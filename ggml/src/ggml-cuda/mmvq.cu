@@ -2,7 +2,8 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
-#include "mmvq-head-lds.cuh"
+#include "mmvq-head-lds.cuh" // taskK2: drafter-head kernel, widths 2-5, REFUTED, default OFF
+#include "q6k-lds.cuh"     // taskK3: Q6_K LDS twin, widths 5-8, REFUTED, default OFF
 
 #include <cstdint>
 #include <type_traits>
@@ -1345,6 +1346,14 @@ static void mul_mat_vec_q_switch_type(
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const int ids_stride, cudaStream_t stream) {
+    // taskK3: Q6_K LDS twin gate (GGML_CUDA_RP_Q6K_LDS, default OFF). With the env
+    // unset rp_q6k_lds_try_launch returns false without side effects and the
+    // generic dispatch below is byte-identical to the pre-K3 code path.
+    if (rp_q6k_lds_try_launch(type_x, vx, vy, dst, ncols_x, nrows_x, ncols_dst,
+            stride_row_x, stride_col_y, stride_col_dst, nchannels_dst, nsamples_dst,
+            ids, fusion, stream)) {
+        return;
+    }
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>

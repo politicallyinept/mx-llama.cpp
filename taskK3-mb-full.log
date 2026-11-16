@@ -1,0 +1,126 @@
+# taskK3 Q6_K LDS microbench, device 0
+T=1 attn_q 5120x6144             generic      67.7 us    381.3 GB/s (37.2% of 1024) det=1
+T=2 attn_q 5120x6144             generic      86.1 us    299.8 GB/s (29.3% of 1024) det=1
+T=4 attn_q 5120x6144             generic     118.4 us    217.9 GB/s (21.3% of 1024) det=1
+T=5 attn_q 5120x6144             generic     121.0 us    213.3 GB/s (20.8% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act        240.0 us    107.5 GB/s  vs generic  -49.6%  bit=1 det=1
+   lds W4 S2 act         95.2 us    271.1 GB/s  vs generic  +27.1%  bit=1 det=1
+   lds W8 S2 act        113.6 us    227.2 GB/s  vs generic   +6.5%  bit=1 det=1
+   lds W4 S4 act        170.1 us    151.7 GB/s  vs generic  -28.9%  bit=1 det=1
+   lds W2 S2 full       245.4 us    105.1 GB/s  vs generic  -50.7%  bit=1 det=1
+   lds W4 S2 full       181.0 us    142.6 GB/s  vs generic  -33.2%  bit=1 det=1
+   lds W8 S2 full       181.9 us    141.8 GB/s  vs generic  -33.5%  bit=1 det=1
+   lds W4 S4 full       204.8 us    126.0 GB/s  vs generic  -40.9%  bit=1 det=1
+T=6 attn_q 5120x6144             generic     174.7 us    147.7 GB/s (14.4% of 1024) det=1
+   lds W2 S2 act        226.9 us    113.7 GB/s  vs generic  -23.0%  bit=1 det=1
+   lds W4 S2 act        131.4 us    196.4 GB/s  vs generic  +33.0%  bit=1 det=1
+   lds W8 S2 act        145.8 us    177.0 GB/s  vs generic  +19.9%  bit=1 det=1
+   lds W4 S4 act        183.2 us    140.9 GB/s  vs generic   -4.6%  bit=1 det=1
+   lds W2 S2 full       279.4 us     92.4 GB/s  vs generic  -37.5%  bit=1 det=1
+   lds W4 S2 full       186.4 us    138.4 GB/s  vs generic   -6.3%  bit=1 det=1
+   lds W8 S2 full       211.5 us    122.0 GB/s  vs generic  -17.4%  bit=1 det=1
+   lds W4 S4 full       232.8 us    110.8 GB/s  vs generic  -24.9%  bit=1 det=1
+T=7 attn_q 5120x6144             generic     199.2 us    129.5 GB/s (12.7% of 1024) det=1
+   lds W2 S2 act        268.5 us     96.1 GB/s  vs generic  -25.8%  bit=1 det=1
+   lds W4 S2 act        142.4 us    181.2 GB/s  vs generic  +39.9%  bit=1 det=1
+   lds W8 S2 act        169.0 us    152.7 GB/s  vs generic  +17.9%  bit=1 det=1
+   lds W4 S4 act        282.9 us     91.2 GB/s  vs generic  -29.6%  bit=1 det=1
+   lds W2 S2 full       388.6 us     66.4 GB/s  vs generic  -48.7%  bit=1 det=1
+   lds W4 S2 full       230.2 us    112.1 GB/s  vs generic  -13.5%  bit=1 det=1
+   lds W8 S2 full       253.8 us    101.7 GB/s  vs generic  -21.5%  bit=1 det=1
+   lds W4 S4 full       301.4 us     85.6 GB/s  vs generic  -33.9%  bit=1 det=1
+T=8 attn_q 5120x6144             generic     249.8 us    103.3 GB/s (10.1% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act        401.6 us     64.3 GB/s  vs generic  -37.8%  bit=1 det=1
+   lds W4 S2 act        146.4 us    176.3 GB/s  vs generic  +70.6%  bit=1 det=1
+   lds W8 S2 act        218.9 us    117.9 GB/s  vs generic  +14.1%  bit=1 det=1
+   lds W4 S4 act        289.1 us     89.3 GB/s  vs generic  -13.6%  bit=1 det=1
+   lds W2 S2 full       440.5 us     58.6 GB/s  vs generic  -43.3%  bit=1 det=1
+   lds W4 S2 full       204.8 us    126.0 GB/s  vs generic  +22.0%  bit=1 det=1
+   lds W8 S2 full       237.0 us    108.9 GB/s  vs generic   +5.4%  bit=1 det=1
+   lds W4 S4 full       323.0 us     79.9 GB/s  vs generic  -22.7%  bit=1 det=1
+T=1 head/card 5120x124160 (TP2)  generic    1144.6 us    455.6 GB/s (44.5% of 1024) det=1
+T=2 head/card 5120x124160 (TP2)  generic    1456.3 us    358.1 GB/s (35.0% of 1024) det=1
+T=4 head/card 5120x124160 (TP2)  generic    2158.2 us    241.6 GB/s (23.6% of 1024) det=1
+T=5 head/card 5120x124160 (TP2)  generic    2250.9 us    231.7 GB/s (22.6% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act       3283.8 us    158.8 GB/s  vs generic  -31.5%  bit=1 det=1
+   lds W4 S2 act       2159.5 us    241.5 GB/s  vs generic   +4.2%  bit=1 det=1
+   lds W8 S2 act       2332.6 us    223.6 GB/s  vs generic   -3.5%  bit=1 det=1
+   lds W4 S4 act       3113.0 us    167.5 GB/s  vs generic  -27.7%  bit=1 det=1
+   lds W2 S2 full      4340.5 us    120.1 GB/s  vs generic  -48.1%  bit=1 det=1
+   lds W4 S2 full      3227.0 us    161.6 GB/s  vs generic  -30.2%  bit=1 det=1
+   lds W8 S2 full      3433.1 us    151.9 GB/s  vs generic  -34.4%  bit=1 det=1
+   lds W4 S4 full      3598.4 us    144.9 GB/s  vs generic  -37.4%  bit=1 det=1
+T=6 head/card 5120x124160 (TP2)  generic    2908.6 us    179.3 GB/s (17.5% of 1024) det=1
+   lds W2 S2 act       3749.9 us    139.1 GB/s  vs generic  -22.4%  bit=1 det=1
+   lds W4 S2 act       2594.9 us    201.0 GB/s  vs generic  +12.1%  bit=1 det=1
+   lds W8 S2 act       2856.0 us    182.6 GB/s  vs generic   +1.8%  bit=1 det=1
+   lds W4 S4 act       3356.8 us    155.3 GB/s  vs generic  -13.4%  bit=1 det=1
+   lds W2 S2 full      4889.1 us    106.7 GB/s  vs generic  -40.5%  bit=1 det=1
+   lds W4 S2 full      3319.2 us    157.1 GB/s  vs generic  -12.4%  bit=1 det=1
+   lds W8 S2 full      3547.0 us    147.0 GB/s  vs generic  -18.0%  bit=1 det=1
+   lds W4 S4 full      3974.2 us    131.2 GB/s  vs generic  -26.8%  bit=1 det=1
+T=7 head/card 5120x124160 (TP2)  generic    3347.8 us    155.8 GB/s (15.2% of 1024) det=1
+   lds W2 S2 act       4280.0 us    121.8 GB/s  vs generic  -21.8%  bit=1 det=1
+   lds W4 S2 act       2906.4 us    179.4 GB/s  vs generic  +15.2%  bit=1 det=1
+   lds W8 S2 act       3150.4 us    165.5 GB/s  vs generic   +6.3%  bit=1 det=1
+   lds W4 S4 act       5474.1 us     95.3 GB/s  vs generic  -38.8%  bit=1 det=1
+   lds W2 S2 full      7054.4 us     73.9 GB/s  vs generic  -52.5%  bit=1 det=1
+   lds W4 S2 full      4032.2 us    129.3 GB/s  vs generic  -17.0%  bit=1 det=1
+   lds W8 S2 full      4417.1 us    118.1 GB/s  vs generic  -24.2%  bit=1 det=1
+   lds W4 S4 full      5148.0 us    101.3 GB/s  vs generic  -35.0%  bit=1 det=1
+T=8 head/card 5120x124160 (TP2)  generic    4099.4 us    127.2 GB/s (12.4% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act       6814.6 us     76.5 GB/s  vs generic  -39.8%  bit=1 det=1
+   lds W4 S2 act       3227.2 us    161.6 GB/s  vs generic  +27.0%  bit=1 det=1
+   lds W8 S2 act       4346.2 us    120.0 GB/s  vs generic   -5.7%  bit=1 det=1
+   lds W4 S4 act       4965.8 us    105.0 GB/s  vs generic  -17.4%  bit=1 det=1
+   lds W2 S2 full      8009.9 us     65.1 GB/s  vs generic  -48.8%  bit=1 det=1
+   lds W4 S2 full      3770.1 us    138.3 GB/s  vs generic   +8.7%  bit=1 det=1
+   lds W8 S2 full      4030.7 us    129.4 GB/s  vs generic   +1.7%  bit=1 det=1
+   lds W4 S4 full      5602.2 us     93.1 GB/s  vs generic  -26.8%  bit=1 det=1
+T=1 head 5120x248320 (full)      generic    2466.1 us    422.9 GB/s (41.3% of 1024) det=1
+T=2 head 5120x248320 (full)      generic    3113.3 us    335.0 GB/s (32.7% of 1024) det=1
+T=4 head 5120x248320 (full)      generic    4352.2 us    239.6 GB/s (23.4% of 1024) det=1
+T=5 head 5120x248320 (full)      generic    4544.6 us    229.5 GB/s (22.4% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act       6509.3 us    160.2 GB/s  vs generic  -30.2%  bit=1 det=1
+   lds W4 S2 act       4249.0 us    245.5 GB/s  vs generic   +7.0%  bit=1 det=1
+   lds W8 S2 act       4630.4 us    225.2 GB/s  vs generic   -1.9%  bit=1 det=1
+   lds W4 S4 act       6214.7 us    167.8 GB/s  vs generic  -26.9%  bit=1 det=1
+   lds W2 S2 full      8723.5 us    119.6 GB/s  vs generic  -47.9%  bit=1 det=1
+   lds W4 S2 full      6374.1 us    163.6 GB/s  vs generic  -28.7%  bit=1 det=1
+   lds W8 S2 full      6717.1 us    155.3 GB/s  vs generic  -32.3%  bit=1 det=1
+   lds W4 S4 full      7173.4 us    145.4 GB/s  vs generic  -36.6%  bit=1 det=1
+T=6 head 5120x248320 (full)      generic    5843.8 us    178.5 GB/s (17.4% of 1024) det=1
+   lds W2 S2 act       7429.9 us    140.4 GB/s  vs generic  -21.3%  bit=1 det=1
+   lds W4 S2 act       5170.4 us    201.7 GB/s  vs generic  +13.0%  bit=1 det=1
+   lds W8 S2 act       5683.0 us    183.5 GB/s  vs generic   +2.8%  bit=1 det=1
+   lds W4 S4 act       6701.6 us    155.6 GB/s  vs generic  -12.8%  bit=1 det=1
+   lds W2 S2 full      9764.5 us    106.8 GB/s  vs generic  -40.2%  bit=1 det=1
+   lds W4 S2 full      6639.4 us    157.1 GB/s  vs generic  -12.0%  bit=1 det=1
+   lds W8 S2 full      7066.9 us    147.6 GB/s  vs generic  -17.3%  bit=1 det=1
+   lds W4 S4 full      7920.1 us    131.7 GB/s  vs generic  -26.2%  bit=1 det=1
+T=7 head 5120x248320 (full)      generic    6672.2 us    156.3 GB/s (15.3% of 1024) det=1
+   lds W2 S2 act       8422.4 us    123.8 GB/s  vs generic  -20.8%  bit=1 det=1
+   lds W4 S2 act       5797.8 us    179.9 GB/s  vs generic  +15.1%  bit=1 det=1
+   lds W8 S2 act       6255.2 us    166.7 GB/s  vs generic   +6.7%  bit=1 det=1
+   lds W4 S4 act      10817.4 us     96.4 GB/s  vs generic  -38.3%  bit=1 det=1
+   lds W2 S2 full     14110.1 us     73.9 GB/s  vs generic  -52.7%  bit=1 det=1
+   lds W4 S2 full      7978.9 us    130.7 GB/s  vs generic  -16.4%  bit=1 det=1
+   lds W8 S2 full      8796.8 us    118.6 GB/s  vs generic  -24.2%  bit=1 det=1
+   lds W4 S4 full     10220.8 us    102.0 GB/s  vs generic  -34.7%  bit=1 det=1
+T=8 head 5120x248320 (full)      generic    8166.9 us    127.7 GB/s (12.5% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   lds W2 S2 act      13586.7 us     76.8 GB/s  vs generic  -39.9%  bit=1 det=1
+   lds W4 S2 act       6414.4 us    162.6 GB/s  vs generic  +27.3%  bit=1 det=1
+   lds W8 S2 act       8654.7 us    120.5 GB/s  vs generic   -5.6%  bit=1 det=1
+   lds W4 S4 act       9894.9 us    105.4 GB/s  vs generic  -17.5%  bit=1 det=1
+   lds W2 S2 full     15895.8 us     65.6 GB/s  vs generic  -48.6%  bit=1 det=1
+   lds W4 S2 full      7492.5 us    139.2 GB/s  vs generic   +9.0%  bit=1 det=1
+   lds W8 S2 full      8095.2 us    128.8 GB/s  vs generic   +0.9%  bit=1 det=1
+   lds W4 S4 full     11165.9 us     93.4 GB/s  vs generic  -26.9%  bit=1 det=1
+MB-DONE
+mb DONE rc=0 2026-11-16T06:59:25-08:00
