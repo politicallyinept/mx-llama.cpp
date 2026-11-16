@@ -233,7 +233,7 @@ int main(int argc, char ** argv) {
 
             auto gen = [&](float * y) {
                 switch (T) {
-                    case 1: launch_generic<1, 2>(w, xq, y, K, N, srx, xs, N, 0); break;
+                    case 1: launch_generic<1>(w, xq, y, K, N, srx, xs, N, 0); break;  // serving default rpb=1 (GGML_CUDA_MMVQ_GCN_RPB1 unset)
                     case 2: launch_generic<2>(w, xq, y, K, N, srx, xs, N, 0); break;
                     case 4: launch_generic<4>(w, xq, y, K, N, srx, xs, N, 0); break;
                     case 5: launch_generic<5>(w, xq, y, K, N, srx, xs, N, 0); break;
