@@ -2420,6 +2420,57 @@ static void ggml_backend_sched_stamp_split_uids(ggml_backend_sched_t sched) {
         }
     }
 
+    // GGML_GRAPH_DIAG=1 (debug): attribute whole-graph hash changes to an input class,
+    // so a per-request uid churn is traceable to the pointer/shape/param class that moved.
+    // Diag-only second pass; the hash itself is untouched. Default off.
+    static const bool s_uid_diag = [] { const char * e = getenv("GGML_GRAPH_DIAG"); return e != NULL && atoi(e) != 0; }();
+    if (s_uid_diag) {
+        uint64_t hc[6] = { ggml_scratch_gen(), 1469598103934665603ULL, 1469598103934665603ULL,
+                           1469598103934665603ULL, 1469598103934665603ULL, 1469598103934665603ULL };
+        auto mixc = [&hc](int k, uint64_t v) { hc[k] ^= v; hc[k] *= 1099511628211ULL; };
+        mixc(1, (uint64_t) g->n_nodes); mixc(1, (uint64_t) g->n_leafs);
+        mixc(1, (uint64_t) ggml_cgraph_get_flags(g));
+        for (int pass = 0; pass < 2; pass++) {
+            const int n = pass == 0 ? g->n_leafs : g->n_nodes;
+            ggml_tensor * const * ts = pass == 0 ? g->leafs : g->nodes;
+            for (int i = 0; i < n; i++) {
+                mixc(1, (uint64_t) (uintptr_t) ts[i]); mixc(1, (uint64_t) ts[i]->op);
+                mixc(2, (uint64_t) (uintptr_t) ts[i]->data); mixc(2, (uint64_t) (uintptr_t) ts[i]->buffer);
+                for (int d = 0; d < GGML_MAX_DIMS; d++) { mixc(3, (uint64_t) ts[i]->ne[d]); mixc(3, (uint64_t) ts[i]->nb[d]); }
+                for (int o = 0; o < GGML_MAX_OP_PARAMS / (int) sizeof(uint64_t); o++) {
+                    uint64_t op; memcpy(&op, ts[i]->op_params + o * sizeof(uint64_t), sizeof(op)); mixc(4, op);
+                }
+                for (int s = 0; s < GGML_MAX_SRC; s++) { mixc(5, (uint64_t) (uintptr_t) ts[i]->src[s]); }
+            }
+        }
+        struct uid_diag_slot { int nn; int nl; uint64_t wh; uint64_t c[6]; };
+        static uid_diag_slot slots[64];
+        static int slots_n = 0;
+        static const char * cls[6] = { "scratch-gen", "counts/flags", "struct-ptrs", "data-ptrs", "shape", "params+src" };
+        uid_diag_slot * slot = nullptr;
+        for (int k = 0; k < slots_n; k++) {
+            if (slots[k].nn == g->n_nodes && slots[k].nl == g->n_leafs) { slot = &slots[k]; break; }
+        }
+        if (slot == nullptr && slots_n < 64) {
+            slot = &slots[slots_n++];
+            slot->nn = g->n_nodes; slot->nl = g->n_leafs; slot->wh = 0;
+            memset(slot->c, 0xFF, sizeof(slot->c));
+        }
+        if (slot != nullptr && slot->wh != wh) {
+            char changed[160]; size_t pos = 0; changed[0] = '\0';
+            for (int k = 0; k < 6; k++) {
+                if (slot->c[k] != hc[k]) {
+                    const int w = snprintf(changed + pos, sizeof(changed) - pos, "%s%s", pos ? "+" : "", cls[k]);
+                    if (w > 0) { pos += (size_t) w; }
+                }
+            }
+            fprintf(stderr, "[GRAPH-DIAG] uidstamp nn=%d nl=%d wh=%llx changed=%s\n",
+                    g->n_nodes, g->n_leafs, (unsigned long long) wh, changed[0] ? changed : "none");
+            slot->wh = wh;
+            memcpy(slot->c, hc, sizeof(hc));
+        }
+    }
+
     for (int i = 0; i < sched->n_splits; ++i) {
         struct ggml_cgraph * sg = &sched->splits[i].graph;
         if (sg->uid != 0) {

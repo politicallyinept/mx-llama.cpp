@@ -7099,6 +7099,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
     const int64_t dprof_t0 = dprof ? ggml_time_us() : 0;
 
+    // GGML_GRAPH_DIAG=1 (debug): one line per graph_compute call with the decision
+    // and the reason it was taken (owner-off / outer / incompat / warmup-first /
+    // warmup-change / reset / unstable-disable / capture / replay / mem-fit / gpu-arch).
+    // Default off: one cached bool and a branch, no behavior change.
+    static const bool g_graph_diag = [] () { const char * e = getenv("GGML_GRAPH_DIAG"); return e != nullptr && atoi(e) != 0; }();
+    const char * diag_reason = nullptr;
+    int diag_resets = -1, diag_checks = -1;
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
@@ -7109,10 +7116,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         if (g_cuda_outer_capture) { g_graph_stats.outer[cuda_ctx->device]++; }
         else if (cuda_ctx->graphs_owner_disabled) { g_graph_stats.owner_off[cuda_ctx->device]++; }
     }
+    if (g_graph_diag) {
+        diag_resets = graph->n_prop_resets;
+        diag_checks = graph->n_prop_checks;
+        if (g_cuda_outer_capture) { diag_reason = "outer"; }
+        else if (cuda_ctx->graphs_owner_disabled) { diag_reason = "owner-off"; }
+        else if (!graph->is_enabled()) {
+            diag_reason = graph->unstable_disabled ? "unstable" :
+                (graph->disable_due_to_memory ? "mem-fit" : "gpu-arch");
+        }
+    }
     if (graph->is_enabled() && !g_cuda_outer_capture && !cuda_ctx->graphs_owner_disabled) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
-        if (!graph_compatible && g_graph_stats.on) {
-            g_graph_stats.incompat[cuda_ctx->device]++;
+        if (!graph_compatible) {
+            if (g_graph_stats.on) { g_graph_stats.incompat[cuda_ctx->device]++; }
+            if (g_graph_diag) { diag_reason = "incompat"; }
         }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -7127,6 +7145,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     if (dprof) { fprintf(stderr, "[DFLASH-PROF] cuda-graph-unstable dev=%d key=%p resets=%d checks=%d\n", cuda_ctx->device, (void *) graph_key, graph->n_prop_resets, graph->n_prop_checks); }
                     GGML_LOG_DEBUG("%s: disabling CUDA graph for unstable entry (%d resets / %d checks)\n",
                         __func__, graph->n_prop_resets, graph->n_prop_checks);
+                }
+                if (g_graph_diag) {
+                    diag_reason = graph->unstable_disabled ? "unstable-disable" :
+                        (graph->warmup_complete ? "reset" :
+                         (graph->n_prop_checks == 1 ? "warmup-first" : "warmup-change"));
                 }
             }
 
@@ -7154,6 +7177,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (g_graph_diag) {
+        int64_t diag_ne11 = -1;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->src[1]) {
+                diag_ne11 = cgraph->nodes[i]->src[1]->ne[1];
+                break;
+            }
+        }
+        if (!diag_reason) {
+            diag_reason = use_cuda_graph ? (cuda_graph_update_required ? "capture" : "replay") : "direct-other";
+        }
+        fprintf(stderr, "[GRAPH-DIAG] dev=%d uid=%llu ne11=%lld nodes=%d mode=%s reason=%s resets=%d checks=%d\n",
+            cuda_ctx->device, (unsigned long long) cgraph->uid, (long long) diag_ne11, cgraph->n_nodes,
+            use_cuda_graph ? (cuda_graph_update_required ? "capture" : "replay") : "direct",
+            diag_reason, diag_resets, diag_checks);
+    }
     if (g_graph_stats.on) {
         (use_cuda_graph ? (cuda_graph_update_required ? g_graph_stats.capture : g_graph_stats.replay)
                         : g_graph_stats.direct)[cuda_ctx->device]++;

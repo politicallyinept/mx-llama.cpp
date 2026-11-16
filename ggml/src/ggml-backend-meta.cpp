@@ -2797,13 +2797,16 @@ struct ggml_backend_meta_context {
                 return &e;
             }
         }
+        static const bool tg_diag = [] () { const char * e = getenv("GGML_GRAPH_DIAG"); return e != nullptr && atoi(e) != 0; }();
         if (tg_cache.size() >= tg_cache_max) {
             // Evict the oldest entry, releasing its graphs.
+            if (tg_diag) { fprintf(stderr, "[GRAPH-DIAG] tg-evict uid=%zu cache=%zu\n", tg_cache.front().uid, tg_cache.size()); }
             tg_free_entry(tg_cache.front());
             tg_cache.erase(tg_cache.begin());
         }
         tg_cache.push_back(tg_entry{});
         tg_cache.back().uid = uid;
+        if (tg_diag) { fprintf(stderr, "[GRAPH-DIAG] tg-new uid=%zu cache=%zu\n", uid, tg_cache.size()); }
         return &tg_cache.back();
     }
 
@@ -5426,6 +5429,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // permanent disables, scratch-gen invalidations). Default off: nothing is timed or
     // printed when the env is unset.
     static const bool dprof = [] () { const char * e = getenv("GGML_DFLASH_PROF"); return e != nullptr && atoi(e) != 0; }();
+    static const bool gdiag = [] () { const char * e = getenv("GGML_GRAPH_DIAG"); return e != nullptr && atoi(e) != 0; }();
 
     const bool inner_on_fail = [] {
         const char * e = getenv("GGML_META_TG_INNER_ON_FAIL");
@@ -5504,6 +5508,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (!ready) { break; }
             }
             if (ready) {
+                if (gdiag) { fprintf(stderr, "[GRAPH-DIAG] tg-replay uid=%zu\n", (size_t) cgraph->uid); }
                 if (dprof) {
                     static unsigned long long dprof_tg_replay = 0;
                     const unsigned long long dprof_n = ++dprof_tg_replay;
@@ -5550,6 +5555,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         tge->warm++;
+        if (gdiag && (tge->failed || tge->warm <= tg_warm_needed)) {
+            fprintf(stderr, "[GRAPH-DIAG] tg-warm uid=%zu warm=%d failed=%d\n", (size_t) cgraph->uid, tge->warm, (int) tge->failed);
+        }
 
         // Record, once this shape has run enough times for the scratch pool to
         // stop growing. A run ends at a TRANSFER closure, which stays on the host.
