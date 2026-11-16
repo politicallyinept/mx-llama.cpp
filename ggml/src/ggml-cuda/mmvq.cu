@@ -2,6 +2,7 @@
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "mmvq-head-lds.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -599,6 +600,26 @@ static int mmvq_gcn_rpb1() {
             GGML_LOG_WARN("[MMVQ-GCN-RPB1] GCN ncols_dst=1 rows_per_block=2 geometry engaged\n");
         }
         return (r == 2) ? 2 : 1;
+    }();
+    return v;
+}
+
+// taskK2: GGML_DFLASH_HEAD_KERNEL=1 routes the DFlash2 drafter's Q6_K vocab head
+// (5120x248320) at draft widths 2..5 to the LDS-staged kernel in mmvq-head-lds.cuh.
+// Bit-identical to the generic mul_mat_vec_q<Q6_K, T> GCN geometry by construction
+// (same lane split, vec_dot, accumulation order, reduce tree); default OFF and the
+// gate-off path never reaches the new kernel. GGML_DFLASH_HEAD_W selects waves per
+// workgroup (4 or 8, default 8) for microbench sweeps.
+static int mmvq_dflash_head_w() {
+    static const int v = [] {
+        const char * e = getenv("GGML_DFLASH_HEAD_KERNEL");
+        if (!e || atoi(e) == 0) {
+            return 0;
+        }
+        const char * w = getenv("GGML_DFLASH_HEAD_W");
+        const int r = (w && atoi(w) == 4) ? 4 : 8;
+        GGML_LOG_WARN("[DFLASH-HEAD-KERNEL] drafter Q6_K head widths 2-5 routed to the LDS-staged kernel (W=%d)\n", r);
+        return r;
     }();
     return v;
 }
@@ -1608,6 +1629,16 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // taskK2: LDS-staged drafter-head mat-vec (env-gated, default OFF; see
+    // mmvq-head-lds.cuh for the bit-identity argument). Plain 2-D MUL_MAT only.
+    if (const int k2_w = mmvq_dflash_head_w(); k2_w != 0 && !ids && fusion == nullptr &&
+            src0->type == GGML_TYPE_Q6_K && ne12 == 1 && ne13 == 1 &&
+            ncols_dst >= 2 && ncols_dst <= 5 && ne00 == 5120 && ne01 == 248320) {
+        mmvq_head_q6k_lds_launch(src0->data, src1_q8_1_ptr, dst_d, ne00, ne01, ncols_dst, k2_w,
+                                 s11, s1, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
