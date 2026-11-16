@@ -50,6 +50,20 @@ generic-only reference rows, T=1 at serving default rpb=1).
 
 ## Results
 
+### CPU LDS-staging seal (no GPU required) — PASS
+
+`q8_repack/k3-stagecheck.cpp` (g++ -O2 -ffp-contract=off): simulates the kernel's
+LDS copy loops, kbx_loc indexing, per-lane accumulation order and reduction tree
+in plain host arrays and compares bit-exactly against the generic-path CPU oracle.
+**768/768 comparisons PASS** (T=8, K=5120, 64 rows, both rows of each staged pair).
+This seals the staging layout/indexing (the class of bug the pre-measurement
+`d`-half drop was) independent of the GPU. Commit 6405f6a097.
+Note: the sim initially disagreed due to a wrong `QI8_1` in the standalone file
+(16 vs the real 8 = QK8_1/(4*QR8_1)); the kernel and mb harness use the real
+header and were never affected.
+
+### GPU legs
+
 PENDING — GPU wedge prevented every measurement leg. Planned table:
 
 | shape | T | generic us | GB/s (% peak) | best LDS arm | us | GB/s | delta | bit |
@@ -71,7 +85,8 @@ gate-on arms scored vs ctrl).
   SMC-wedge family; recovery is out-of-container (host reboot; container restart may
   not clear a host-driver-level wedge). Health poller: /root/k3-gpu-health.log.
 - Disk: / at 98% (16G free) — mi50-build.sh gate needs >=20G; build dir moved to
-  /mnt/old/build-k3-q6lds (149G free). Full-tree build of tip+K3 launched 00:22,
+  /mnt/old/build-k3-q6lds (149G free). Full-tree build of tip+K3: BUILD-RC=0,
+  gate strings verified present in bin/libggml-hip.so.0.26.0 (md5 00e8ca428608027a70bc0d08d9067b52),
   log /root/build-k3-q6lds.log.
 
 ## Files
