@@ -1,0 +1,223 @@
+# taskD1 vec_dot rewrite microbench, device 0
+T=1 Q6_K attn_q 5120x6144      generic      66.2 us    389.6 GB/s (38.0% of 1024) det=1
+   roofline-read       40.2 us    642.5 GB/s  (generic is 60.6% of read-roof)
+   d1-hoist            61.9 us    416.7 GB/s  vs generic   +7.0%  bit=1 det=1
+   d1-hoist-u2         55.5 us    464.8 GB/s  vs generic  +19.3%  bit=1 det=1
+   d1-hoist-u4         54.6 us    473.0 GB/s  vs generic  +21.4%  bit=1 det=1
+   d1-raw              46.1 us    560.0 GB/s  vs generic  +43.7%  bit=1 det=1
+   d1-raw-u2           45.1 us    571.9 GB/s  vs generic  +46.8%  bit=1 det=1
+   d1-raw-u4           51.7 us    499.3 GB/s  vs generic  +28.2%  bit=1 det=1
+T=2 Q6_K attn_q 5120x6144      generic      85.8 us    300.9 GB/s (29.4% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       77.3 us    333.9 GB/s  (generic is 90.1% of read-roof)
+   d1-hoist            73.4 us    351.4 GB/s  vs generic  +16.8%  bit=1 det=1
+   d1-hoist-u2         73.1 us    352.9 GB/s  vs generic  +17.3%  bit=1 det=1
+   d1-hoist-u4         77.0 us    335.3 GB/s  vs generic  +11.4%  bit=1 det=1
+   d1-raw              54.7 us    471.6 GB/s  vs generic  +56.7%  bit=1 det=1
+   d1-raw-u2           61.4 us    420.0 GB/s  vs generic  +39.6%  bit=1 det=1
+   d1-raw-u4           73.1 us    352.9 GB/s  vs generic  +17.3%  bit=1 det=1
+T=3 Q6_K attn_q 5120x6144      generic     101.1 us    255.2 GB/s (24.9% of 1024) det=1
+   roofline-read       42.7 us    604.0 GB/s  (generic is 42.2% of read-roof)
+   d1-hoist            91.2 us    282.9 GB/s  vs generic  +10.9%  bit=1 det=1
+   d1-hoist-u2         90.9 us    283.9 GB/s  vs generic  +11.3%  bit=1 det=1
+   d1-hoist-u4        108.3 us    238.2 GB/s  vs generic   -6.6%  bit=1 det=1
+   d1-raw              81.0 us    318.7 GB/s  vs generic  +24.9%  bit=1 det=1
+   d1-raw-u2           98.9 us    261.0 GB/s  vs generic   +2.3%  bit=1 det=1
+   d1-raw-u4          119.0 us    216.8 GB/s  vs generic  -15.1%  bit=1 det=1
+T=4 Q6_K attn_q 5120x6144      generic     118.4 us    217.9 GB/s (21.3% of 1024) det=1
+   roofline-read       42.7 us    604.0 GB/s  (generic is 36.1% of read-roof)
+   d1-hoist            99.2 us    260.1 GB/s  vs generic  +19.4%  bit=1 det=1
+   d1-hoist-u2        127.5 us    202.4 GB/s  vs generic   -7.2%  bit=1 det=1
+   d1-hoist-u4        127.5 us    202.4 GB/s  vs generic   -7.2%  bit=1 det=1
+   d1-raw              96.0 us    268.8 GB/s  vs generic  +23.3%  bit=1 det=1
+   d1-raw-u2          101.8 us    253.6 GB/s  vs generic  +16.4%  bit=1 det=1
+   d1-raw-u4          140.8 us    183.3 GB/s  vs generic  -15.9%  bit=1 det=1
+T=5 Q6_K attn_q 5120x6144      generic     120.6 us    213.9 GB/s (20.9% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       98.1 us    263.1 GB/s  (generic is 81.3% of read-roof)
+   d1-hoist           115.0 us    224.3 GB/s  vs generic   +4.9%  bit=1 det=1
+   d1-hoist-u2        162.7 us    158.6 GB/s  vs generic  -25.9%  bit=1 det=1
+   d1-hoist-u4        143.2 us    180.2 GB/s  vs generic  -15.8%  bit=1 det=1
+   d1-raw             107.8 us    239.3 GB/s  vs generic  +11.9%  bit=1 det=1
+   d1-raw-u2          166.6 us    154.9 GB/s  vs generic  -27.6%  bit=1 det=1
+   d1-raw-u4          157.6 us    163.7 GB/s  vs generic  -23.5%  bit=1 det=1
+T=6 Q6_K attn_q 5120x6144      generic     173.9 us    148.4 GB/s (14.5% of 1024) det=1
+   roofline-read       71.7 us    360.0 GB/s  (generic is 41.2% of read-roof)
+   d1-hoist           148.6 us    173.6 GB/s  vs generic  +17.0%  bit=1 det=1
+   d1-hoist-u2        114.6 us    225.3 GB/s  vs generic  +51.8%  bit=1 det=1
+   d1-hoist-u4        209.6 us    123.1 GB/s  vs generic  -17.0%  bit=1 det=1
+   d1-raw             166.4 us    155.1 GB/s  vs generic   +4.5%  bit=1 det=1
+   d1-raw-u2          149.0 us    173.2 GB/s  vs generic  +16.8%  bit=1 det=1
+   d1-raw-u4          221.1 us    116.7 GB/s  vs generic  -21.3%  bit=1 det=1
+T=7 Q6_K attn_q 5120x6144      generic     198.1 us    130.3 GB/s (12.7% of 1024) det=1
+   roofline-read       65.8 us    392.4 GB/s  (generic is 33.2% of read-roof)
+   d1-hoist           177.1 us    145.7 GB/s  vs generic  +11.8%  bit=1 det=1
+   d1-hoist-u2        152.5 us    169.2 GB/s  vs generic  +29.9%  bit=1 det=1
+   d1-hoist-u4        232.0 us    111.2 GB/s  vs generic  -14.6%  bit=1 det=1
+   d1-raw             195.8 us    131.8 GB/s  vs generic   +1.1%  bit=1 det=1
+   d1-raw-u2          284.8 us     90.6 GB/s  vs generic  -30.4%  bit=1 det=1
+   d1-raw-u4          250.1 us    103.2 GB/s  vs generic  -20.8%  bit=1 det=1
+T=8 Q6_K attn_q 5120x6144      generic     248.6 us    103.8 GB/s (10.1% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       80.8 us    319.4 GB/s  (generic is 32.5% of read-roof)
+   d1-hoist           227.8 us    113.3 GB/s  vs generic   +9.1%  bit=1 det=1
+   d1-hoist-u2        310.2 us     83.2 GB/s  vs generic  -19.9%  bit=1 det=1
+   d1-hoist-u4        258.7 us     99.7 GB/s  vs generic   -3.9%  bit=1 det=1
+   d1-raw             216.6 us    119.1 GB/s  vs generic  +14.8%  bit=1 det=1
+   d1-raw-u2          306.6 us     84.2 GB/s  vs generic  -18.9%  bit=1 det=1
+   d1-raw-u4          275.8 us     93.6 GB/s  vs generic   -9.9%  bit=1 det=1
+T=1 Q6_K head 5120x248320      generic    2469.0 us    422.4 GB/s (41.3% of 1024) det=1
+   roofline-read     1567.0 us    665.6 GB/s  (generic is 63.5% of read-roof)
+   d1-hoist          2442.4 us    427.0 GB/s  vs generic   +1.1%  bit=1 det=1
+   d1-hoist-u2       2376.2 us    438.9 GB/s  vs generic   +3.9%  bit=1 det=1
+   d1-hoist-u4       2551.0 us    408.8 GB/s  vs generic   -3.2%  bit=1 det=1
+   d1-raw            2127.0 us    490.3 GB/s  vs generic  +16.1%  bit=1 det=1
+   d1-raw-u2         2085.3 us    500.1 GB/s  vs generic  +18.4%  bit=1 det=1
+   d1-raw-u4         2327.4 us    448.1 GB/s  vs generic   +6.1%  bit=1 det=1
+T=2 Q6_K head 5120x248320      generic    3111.8 us    335.2 GB/s (32.7% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read     1579.0 us    660.5 GB/s  (generic is 50.7% of read-roof)
+   d1-hoist          2798.4 us    372.7 GB/s  vs generic  +11.2%  bit=1 det=1
+   d1-hoist-u2       2786.6 us    374.3 GB/s  vs generic  +11.7%  bit=1 det=1
+   d1-hoist-u4       3290.2 us    317.0 GB/s  vs generic   -5.4%  bit=1 det=1
+   d1-raw            2560.2 us    407.4 GB/s  vs generic  +21.5%  bit=1 det=1
+   d1-raw-u2         2569.4 us    405.9 GB/s  vs generic  +21.1%  bit=1 det=1
+   d1-raw-u4         3113.4 us    335.0 GB/s  vs generic   -0.1%  bit=1 det=1
+T=3 Q6_K head 5120x248320      generic    3697.8 us    282.0 GB/s (27.5% of 1024) det=1
+   roofline-read     1611.4 us    647.2 GB/s  (generic is 43.6% of read-roof)
+   d1-hoist          3521.9 us    296.1 GB/s  vs generic   +5.0%  bit=1 det=1
+   d1-hoist-u2       3966.6 us    262.9 GB/s  vs generic   -6.8%  bit=1 det=1
+   d1-hoist-u4       4647.7 us    224.4 GB/s  vs generic  -20.4%  bit=1 det=1
+   d1-raw            3379.8 us    308.6 GB/s  vs generic   +9.4%  bit=1 det=1
+   d1-raw-u2         3894.7 us    267.8 GB/s  vs generic   -5.1%  bit=1 det=1
+   d1-raw-u4         4589.0 us    227.3 GB/s  vs generic  -19.4%  bit=1 det=1
+T=4 Q6_K head 5120x248320      generic    4368.5 us    238.7 GB/s (23.3% of 1024) det=1
+   roofline-read     1587.7 us    656.9 GB/s  (generic is 36.3% of read-roof)
+   d1-hoist          4098.6 us    254.5 GB/s  vs generic   +6.6%  bit=1 det=1
+   d1-hoist-u2       5474.7 us    190.5 GB/s  vs generic  -20.2%  bit=1 det=1
+   d1-hoist-u4       5482.9 us    190.2 GB/s  vs generic  -20.3%  bit=1 det=1
+   d1-raw            4001.3 us    260.7 GB/s  vs generic   +9.2%  bit=1 det=1
+   d1-raw-u2         4213.0 us    247.6 GB/s  vs generic   +3.7%  bit=1 det=1
+   d1-raw-u4         5459.5 us    191.0 GB/s  vs generic  -20.0%  bit=1 det=1
+T=5 Q6_K head 5120x248320      generic    4542.9 us    229.6 GB/s (22.4% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read     1625.8 us    641.5 GB/s  (generic is 35.8% of read-roof)
+   d1-hoist          4422.2 us    235.8 GB/s  vs generic   +2.7%  bit=1 det=1
+   d1-hoist-u2       6108.8 us    170.7 GB/s  vs generic  -25.6%  bit=1 det=1
+   d1-hoist-u4       5713.3 us    182.5 GB/s  vs generic  -20.5%  bit=1 det=1
+   d1-raw            4507.0 us    231.4 GB/s  vs generic   +0.8%  bit=1 det=1
+   d1-raw-u2         6171.2 us    169.0 GB/s  vs generic  -26.4%  bit=1 det=1
+   d1-raw-u4         5698.4 us    183.0 GB/s  vs generic  -20.3%  bit=1 det=1
+T=6 Q6_K head 5120x248320      generic    5821.9 us    179.1 GB/s (17.5% of 1024) det=1
+   roofline-read     1656.2 us    629.7 GB/s  (generic is 28.4% of read-roof)
+   d1-hoist          6126.1 us    170.2 GB/s  vs generic   -5.0%  bit=1 det=1
+   d1-hoist-u2       5388.8 us    193.5 GB/s  vs generic   +8.0%  bit=1 det=1
+   d1-hoist-u4       7883.7 us    132.3 GB/s  vs generic  -26.2%  bit=1 det=1
+   d1-raw            6250.1 us    166.9 GB/s  vs generic   -6.9%  bit=1 det=1
+   d1-raw-u2         5999.4 us    173.8 GB/s  vs generic   -3.0%  bit=1 det=1
+   d1-raw-u4         7978.9 us    130.7 GB/s  vs generic  -27.0%  bit=1 det=1
+T=7 Q6_K head 5120x248320      generic    6656.5 us    156.7 GB/s (15.3% of 1024) det=1
+   roofline-read     1643.7 us    634.5 GB/s  (generic is 24.7% of read-roof)
+   d1-hoist          6970.7 us    149.6 GB/s  vs generic   -4.5%  bit=1 det=1
+   d1-hoist-u2       6263.5 us    166.5 GB/s  vs generic   +6.3%  bit=1 det=1
+   d1-hoist-u4       8828.5 us    118.1 GB/s  vs generic  -24.6%  bit=1 det=1
+   d1-raw            7202.4 us    144.8 GB/s  vs generic   -7.6%  bit=1 det=1
+   d1-raw-u2        10879.4 us     95.9 GB/s  vs generic  -38.8%  bit=1 det=1
+   d1-raw-u4         8786.9 us    118.7 GB/s  vs generic  -24.2%  bit=1 det=1
+T=8 Q6_K head 5120x248320      generic    8152.5 us    127.9 GB/s (12.5% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read     1632.6 us    638.8 GB/s  (generic is 20.0% of read-roof)
+   d1-hoist          7673.3 us    135.9 GB/s  vs generic   +6.2%  bit=1 det=1
+   d1-hoist-u2      11857.9 us     88.0 GB/s  vs generic  -31.2%  bit=1 det=1
+   d1-hoist-u4       9818.7 us    106.2 GB/s  vs generic  -17.0%  bit=1 det=1
+   d1-raw            7969.3 us    130.9 GB/s  vs generic   +2.3%  bit=1 det=1
+   d1-raw-u2        11314.7 us     92.2 GB/s  vs generic  -27.9%  bit=1 det=1
+   d1-raw-u4         9905.8 us    105.3 GB/s  vs generic  -17.7%  bit=1 det=1
+T=1 Q4_0 attn_q 5120x6144      generic      50.9 us    347.8 GB/s (34.0% of 1024) det=1
+   roofline-read       37.9 us    466.6 GB/s  (generic is 74.5% of read-roof)
+   d1-hoist            45.8 us    386.7 GB/s  vs generic  +11.2%  bit=1 det=1
+   d1-hoist-u2         46.6 us    380.0 GB/s  vs generic   +9.3%  bit=1 det=1
+   d1-hoist-u4         43.5 us    406.6 GB/s  vs generic  +16.9%  bit=1 det=1
+T=2 Q4_0 attn_q 5120x6144      generic      52.8 us    335.1 GB/s (32.7% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       38.9 us    455.1 GB/s  (generic is 73.6% of read-roof)
+   d1-hoist            50.9 us    347.8 GB/s  vs generic   +3.8%  bit=1 det=1
+   d1-hoist-u2         48.8 us    362.6 GB/s  vs generic   +8.2%  bit=1 det=1
+   d1-hoist-u4         49.6 us    356.7 GB/s  vs generic   +6.5%  bit=1 det=1
+T=3 Q4_0 attn_q 5120x6144      generic      66.2 us    267.1 GB/s (26.1% of 1024) det=1
+   roofline-read       38.6 us    458.9 GB/s  (generic is 58.2% of read-roof)
+   d1-hoist            61.0 us    290.3 GB/s  vs generic   +8.7%  bit=1 det=1
+   d1-hoist-u2         62.7 us    282.1 GB/s  vs generic   +5.6%  bit=1 det=1
+   d1-hoist-u4         54.1 us    327.2 GB/s  vs generic  +22.5%  bit=1 det=1
+T=4 Q4_0 attn_q 5120x6144      generic      82.2 us    215.2 GB/s (21.0% of 1024) det=1
+   roofline-read       32.6 us    542.1 GB/s  (generic is 39.7% of read-roof)
+   d1-hoist            72.3 us    244.7 GB/s  vs generic  +13.7%  bit=1 det=1
+   d1-hoist-u2         91.8 us    192.7 GB/s  vs generic  -10.5%  bit=1 det=1
+   d1-hoist-u4         65.1 us    271.7 GB/s  vs generic  +26.3%  bit=1 det=1
+T=5 Q4_0 attn_q 5120x6144      generic      85.4 us    207.1 GB/s (20.2% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       72.5 us    244.1 GB/s  (generic is 84.8% of read-roof)
+   d1-hoist            80.6 us    219.4 GB/s  vs generic   +6.0%  bit=1 det=1
+   d1-hoist-u2         88.5 us    200.0 GB/s  vs generic   -3.4%  bit=1 det=1
+   d1-hoist-u4         84.0 us    210.7 GB/s  vs generic   +1.7%  bit=1 det=1
+T=6 Q4_0 attn_q 5120x6144      generic      96.5 us    183.4 GB/s (17.9% of 1024) det=1
+   roofline-read       38.6 us    458.9 GB/s  (generic is 40.0% of read-roof)
+   d1-hoist            96.3 us    183.7 GB/s  vs generic   +0.2%  bit=1 det=1
+   d1-hoist-u2        121.4 us    145.7 GB/s  vs generic  -20.6%  bit=1 det=1
+   d1-hoist-u4         95.0 us    186.2 GB/s  vs generic   +1.5%  bit=1 det=1
+T=7 Q4_0 attn_q 5120x6144      generic     109.1 us    162.2 GB/s (15.8% of 1024) det=1
+   roofline-read       70.1 us    252.5 GB/s  (generic is 64.2% of read-roof)
+   d1-hoist           105.4 us    167.8 GB/s  vs generic   +3.5%  bit=1 det=1
+   d1-hoist-u2        105.0 us    168.6 GB/s  vs generic   +4.0%  bit=1 det=1
+   d1-hoist-u4        106.4 us    166.3 GB/s  vs generic   +2.6%  bit=1 det=1
+T=8 Q4_0 attn_q 5120x6144      generic     124.0 us    142.7 GB/s (13.9% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       73.3 us    241.5 GB/s  (generic is 59.1% of read-roof)
+   d1-hoist           121.9 us    145.1 GB/s  vs generic   +1.7%  bit=1 det=1
+   d1-hoist-u2        117.1 us    151.1 GB/s  vs generic   +5.9%  bit=1 det=1
+   d1-hoist-u4        146.7 us    120.6 GB/s  vs generic  -15.5%  bit=1 det=1
+T=1 Q4_0 ffn 5120x9216         generic      69.6 us    381.4 GB/s (37.2% of 1024) det=1
+   roofline-read       42.4 us    626.0 GB/s  (generic is 60.9% of read-roof)
+   d1-hoist            63.4 us    418.9 GB/s  vs generic   +9.8%  bit=1 det=1
+   d1-hoist-u2         61.3 us    433.1 GB/s  vs generic  +13.6%  bit=1 det=1
+   d1-hoist-u4         55.5 us    478.1 GB/s  vs generic  +25.4%  bit=1 det=1
+T=2 Q4_0 ffn 5120x9216         generic      72.5 us    366.2 GB/s (35.8% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       52.6 us    504.2 GB/s  (generic is 72.6% of read-roof)
+   d1-hoist            70.1 us    378.7 GB/s  vs generic   +3.4%  bit=1 det=1
+   d1-hoist-u2         67.0 us    395.9 GB/s  vs generic   +8.1%  bit=1 det=1
+   d1-hoist-u4         64.8 us    409.6 GB/s  vs generic  +11.9%  bit=1 det=1
+T=3 Q4_0 ffn 5120x9216         generic      92.2 us    288.0 GB/s (28.1% of 1024) det=1
+   roofline-read       44.5 us    596.7 GB/s  (generic is 48.3% of read-roof)
+   d1-hoist            83.7 us    317.2 GB/s  vs generic  +10.1%  bit=1 det=1
+   d1-hoist-u2         74.4 us    356.7 GB/s  vs generic  +23.9%  bit=1 det=1
+   d1-hoist-u4         75.8 us    350.0 GB/s  vs generic  +21.5%  bit=1 det=1
+T=4 Q4_0 ffn 5120x9216         generic     116.3 us    228.2 GB/s (22.3% of 1024) det=1
+   roofline-read       45.0 us    590.3 GB/s  (generic is 38.7% of read-roof)
+   d1-hoist            94.2 us    281.6 GB/s  vs generic  +23.4%  bit=1 det=1
+   d1-hoist-u2        116.2 us    228.5 GB/s  vs generic   +0.1%  bit=1 det=1
+   d1-hoist-u4         91.8 us    289.0 GB/s  vs generic  +26.7%  bit=1 det=1
+T=5 Q4_0 ffn 5120x9216         generic     121.8 us    218.0 GB/s (21.3% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       50.9 us    521.7 GB/s  (generic is 41.8% of read-roof)
+   d1-hoist           113.4 us    234.0 GB/s  vs generic   +7.3%  bit=1 det=1
+   d1-hoist-u2        100.5 us    264.2 GB/s  vs generic  +21.2%  bit=1 det=1
+   d1-hoist-u4        117.0 us    226.9 GB/s  vs generic   +4.1%  bit=1 det=1
+T=6 Q4_0 ffn 5120x9216         generic     138.2 us    192.0 GB/s (18.8% of 1024) det=1
+   roofline-read       45.1 us    588.3 GB/s  (generic is 32.6% of read-roof)
+   d1-hoist           123.2 us    215.4 GB/s  vs generic  +12.2%  bit=1 det=1
+   d1-hoist-u2        169.6 us    156.5 GB/s  vs generic  -18.5%  bit=1 det=1
+   d1-hoist-u4        133.3 us    199.1 GB/s  vs generic   +3.7%  bit=1 det=1
+T=7 Q4_0 ffn 5120x9216         generic     161.1 us    164.7 GB/s (16.1% of 1024) det=1
+   roofline-read       45.0 us    590.3 GB/s  (generic is 27.9% of read-roof)
+   d1-hoist           123.7 us    214.6 GB/s  vs generic  +30.3%  bit=1 det=1
+   d1-hoist-u2        146.9 us    180.7 GB/s  vs generic   +9.7%  bit=1 det=1
+   d1-hoist-u4        149.9 us    177.0 GB/s  vs generic   +7.5%  bit=1 det=1
+T=8 Q4_0 ffn 5120x9216         generic     173.3 us    153.2 GB/s (15.0% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   roofline-read       80.6 us    329.1 GB/s  (generic is 46.5% of read-roof)
+   d1-hoist           171.4 us    154.9 GB/s  vs generic   +1.1%  bit=1 det=1
+   d1-hoist-u2        164.0 us    161.8 GB/s  vs generic   +5.7%  bit=1 det=1
+   d1-hoist-u4        208.0 us    127.6 GB/s  vs generic  -16.7%  bit=1 det=1
+MB-DONE
+EXIT=0
