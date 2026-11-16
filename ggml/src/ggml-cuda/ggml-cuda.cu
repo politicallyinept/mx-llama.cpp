@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/allreduce.cuh"
+#include "ggml-cuda/ar-quant.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
@@ -1396,6 +1397,125 @@ static void ggml_backend_cuda_comm_allreduce_launch_rank(void * comm_ctx_v, int 
 }
 
 #ifdef GGML_USE_NCCL
+// GGML_TP_AR_QWIRE=1 (opt-in, default off): quantized all-reduce (GGML_NCCL_AR_WIRE=q4_K, the default, or
+// q4_0 / q4_1 / q5_0 / q5_K / q8_0): a reduce-scatter and an all-gather that both move quantized blocks with
+// their own scales. Rank i quantizes its partial sum and sends chunk j to rank j; rank j adds the others'
+// dequantized chunks to its own exact chunk, quantizes the sum (as GGML_NCCL_AR_WIRE_AG, default the same type)
+// and all-gathers it. Every rank, rank j too, dequantizes the gathered bytes, so all ranks hold the same
+// values. Per rank that moves (N-1)/N of each quantized size (4.5 bits per value for q4_0) where the f16 ring
+// moves 2 (N-1)/N x 16 bits.
+static bool ggml_backend_cuda_comm_allreduce_nccl_quant(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, ggml_type wire, ggml_type wire_ag) {
+    const int     n        = (int) comm_ctx->backends.size();
+    const int64_t ne       = ggml_nelements(tensors[0]);
+    const int64_t chunk_ne = ne/n;
+    const size_t  rs_size  = ggml_row_size(wire,    chunk_ne);
+    const size_t  ag_size  = ggml_row_size(wire_ag, chunk_ne);
+
+    ggml_cuda_pool_alloc<char> qbuf[GGML_CUDA_MAX_DEVICES]; // this rank's quantized partial
+    ggml_cuda_pool_alloc<char> rbuf[GGML_CUDA_MAX_DEVICES]; // slot r: rank r's quantized copy of this rank's chunk
+    ggml_cuda_pool_alloc<char> gbuf[GGML_CUDA_MAX_DEVICES]; // the gathered, quantized sum
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        qbuf[i].pool = &cuda_ctx->pool();
+        qbuf[i].alloc(n*rs_size);
+        rbuf[i].pool = &cuda_ctx->pool();
+        rbuf[i].alloc(n*rs_size);
+        gbuf[i].pool = &cuda_ctx->pool();
+        gbuf[i].alloc(n*ag_size);
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+        ggml_cuda_ar_quantize(wire, (const float *) tensors[i]->data, qbuf[i].get(), ne, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    NCCL_CHECK(ncclGroupStart());
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        for (int r = 0; r < n; ++r) {
+            if (r == i) {
+                continue;
+            }
+            NCCL_CHECK(ncclSend(qbuf[i].get() + r*rs_size, rs_size, ncclUint8, r, comm_ctx->comms[i], cuda_ctx->stream()));
+            NCCL_CHECK(ncclRecv(rbuf[i].get() + r*rs_size, rs_size, ncclUint8, r, comm_ctx->comms[i], cuda_ctx->stream()));
+        }
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        float * own = (float *) tensors[i]->data + i*chunk_ne;
+        ggml_cuda_ar_reduce(wire, own, rbuf[i].get(), rs_size, n, i, chunk_ne, cuda_ctx->stream());
+        ggml_cuda_ar_quantize(wire_ag, own, gbuf[i].get() + i*ag_size, chunk_ne, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    NCCL_CHECK(ncclGroupStart());
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        NCCL_CHECK(ncclAllGather(gbuf[i].get() + i*ag_size, gbuf[i].get(), ag_size, ncclUint8, comm_ctx->comms[i],
+                                 cuda_ctx->stream()));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(wire_ag);
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        to_fp32(gbuf[i].get(), (float *) tensors[i]->data, ne, cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
+// GGML_NCCL_AR_ALGO=ag (the default at N = 2) / agq: one all-gather of every rank's whole quantized partial,
+// summed on every rank. With ag a rank adds the others' dequantized partials to its own exact one (least error,
+// but the ranks' copies differ slightly); with agq it sums all dequantized partials in rank order, so the ranks
+// stay identical. At N = 2 this moves the bytes of the reduce-scatter + all-gather path in one collective; at
+// N = 4 twice as many.
+static bool ggml_backend_cuda_comm_allreduce_nccl_quant_ag(
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors, ggml_type wire, bool own_exact) {
+    const int     n    = (int) comm_ctx->backends.size();
+    const int64_t ne   = ggml_nelements(tensors[0]);
+    const size_t  size = ggml_row_size(wire, ne);
+
+    ggml_cuda_pool_alloc<char> qbuf[GGML_CUDA_MAX_DEVICES]; // slot r: rank r's quantized partial
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        qbuf[i].pool = &cuda_ctx->pool();
+        qbuf[i].alloc(n*size);
+        if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+        ggml_cuda_ar_quantize(wire, (const float *) tensors[i]->data, qbuf[i].get() + i*size, ne, cuda_ctx->stream());
+        if (!own_exact) {
+            CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    NCCL_CHECK(ncclGroupStart());
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        NCCL_CHECK(ncclAllGather(qbuf[i].get() + i*size, qbuf[i].get(), size, ncclUint8, comm_ctx->comms[i],
+                                 cuda_ctx->stream()));
+    }
+    NCCL_CHECK(ncclGroupEnd());
+
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        ggml_cuda_ar_reduce(wire, (float *) tensors[i]->data, qbuf[i].get(), size, n, own_exact ? i : -1, ne,
+                            cuda_ctx->stream());
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
 // AllReduce via NCCL. Reduces as FP32 for small tensors and BF16 for large
 // tensors (bandwidth-bound), then converts back to FP32.
 static bool ggml_backend_cuda_comm_allreduce_nccl(
@@ -1434,11 +1554,74 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
         return true;
     }
 
-    // For large tensors it's faster to compress them to BF16 for the reduction:
-    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
-    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+    // GGML_TP_AR_QWIRE=1 (opt-in, default off, byte-identical when unset): prefill-sized all-reduce payloads go
+    // on a quantized wire. Tensors of at least GGML_NCCL_AR_QMIN elements (default 262144, ~51 tokens of a 5120
+    // hidden, so decode and verify batches keep 16 bits) are quantized to GGML_NCCL_AR_WIRE blocks (q4_K, the
+    // default, or q4_0 / q4_1 / q5_0 / q5_K / q8_0) before the AR and dequantized after; GGML_NCCL_AR_WIRE =
+    // f16 / bf16 / f32 keeps them on the 16- or 32-bit path below.
+    auto wire_type = [](const char * e, ggml_type def) {
+        return e == nullptr ? def : strcmp(e, "q4_0") == 0 ? GGML_TYPE_Q4_0 : strcmp(e, "q4_1") == 0 ? GGML_TYPE_Q4_1 :
+            strcmp(e, "q5_0") == 0 ? GGML_TYPE_Q5_0 : strcmp(e, "q8_0") == 0 ? GGML_TYPE_Q8_0 :
+            strcmp(e, "q4_K") == 0 ? GGML_TYPE_Q4_K : strcmp(e, "q5_K") == 0 ? GGML_TYPE_Q5_K : def;
+    };
+    static const bool s_qwire_on = []{
+        const char * e = getenv("GGML_TP_AR_QWIRE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    static const ggml_type s_qwire    = getenv("GGML_NCCL_AR_WIRE") == nullptr ? GGML_TYPE_Q4_K :
+                                        wire_type(getenv("GGML_NCCL_AR_WIRE"), GGML_TYPE_COUNT);
+    static const ggml_type s_qwire_ag = wire_type(getenv("GGML_NCCL_AR_WIRE_AG"), s_qwire);
+    static const int64_t s_qmin = []{
+        const char * e = getenv("GGML_NCCL_AR_QMIN");
+        return e == nullptr ? (int64_t) 262144 : (int64_t) atoll(e);
+    }();
+    if (s_qwire_on && s_qwire != GGML_TYPE_COUNT && ne >= s_qmin &&
+            ne % ((int64_t) n_backends*ggml_blck_size(s_qwire)) == 0 &&
+            ne % ((int64_t) n_backends*ggml_blck_size(s_qwire_ag)) == 0) {
+        // GGML_NCCL_AR_ALGO = rs (reduce-scatter + all-gather), ag or agq; by default ag at N = 2 (the same bytes
+        // as rs with half the error), rs above (ag moves twice the bytes at N = 4)
+        static const int s_qalgo = []{
+            const char * e = getenv("GGML_NCCL_AR_ALGO");
+            return e == nullptr ? -1 : strcmp(e, "ag") == 0 ? 1 : strcmp(e, "agq") == 0 ? 2 : 0;
+        }();
+        const int algo = s_qalgo >= 0 ? s_qalgo : n_backends == 2 ? 1 : 0;
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            fprintf(stderr, "ggml_cuda: quantized AR wire ACTIVE (wire=%s algo=%s ne=%" PRId64 "\n",
+                    ggml_type_name(s_qwire), algo == 1 ? "ag" : algo == 2 ? "agq" : "rs", ne);
+        }
+        if (algo != 0) {
+            return ggml_backend_cuda_comm_allreduce_nccl_quant_ag(comm_ctx, tensors, s_qwire, algo == 1);
+        }
+        return ggml_backend_cuda_comm_allreduce_nccl_quant(comm_ctx, tensors, s_qwire, s_qwire_ag);
+    }
 
-    ggml_cuda_pool_alloc<nv_bfloat16> tmp[GGML_CUDA_MAX_DEVICES];
+    // For large tensors it's faster to compress them to 16 bits for the reduction. GGML_NCCL_AR_WIRE = f16,
+    // bf16 (the default, upstream's choice) or f32: W4A4 models lost 4% KLD to bf16 layer outputs at TP = 4,
+    // f16 nothing measurable (as on the custom all-reduce, GGML_TP_AR_WIRE).
+    static const int s_wire = []{ // 0 f32, 1 bf16, 2 f16
+        const char * e = getenv("GGML_NCCL_AR_WIRE");
+        return e == nullptr ? 1 : strcmp(e, "f32") == 0 ? 0 : strcmp(e, "f16") == 0 ? 2 : 1;
+    }();
+    if (s_wire == 0) {
+        NCCL_CHECK(ncclGroupStart());
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+            if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+            }
+            NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+        }
+        NCCL_CHECK(ncclGroupEnd());
+        return true;
+    }
+    const bool f16 = s_wire == 2;
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(f16 ? GGML_TYPE_F16 : GGML_TYPE_BF16);
+
+    ggml_cuda_pool_alloc<uint16_t> tmp[GGML_CUDA_MAX_DEVICES];
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
         tmp[i].pool = &cuda_ctx->pool();
@@ -1446,9 +1629,13 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
 
         ggml_cuda_set_device(cuda_ctx->device);
         if (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) {
-            to_bf16(tensors[i]->data, tmp[i].get(), ne, cuda_ctx->stream());
+            if (f16) {
+                to_fp16(tensors[i]->data, (half *) tmp[i].get(), ne, cuda_ctx->stream());
+            } else {
+                to_bf16(tensors[i]->data, (nv_bfloat16 *) tmp[i].get(), ne, cuda_ctx->stream());
+            }
         } else {
-            CUDA_CHECK(cudaMemsetAsync(tmp[i].get(), 0, ne * sizeof(nv_bfloat16), cuda_ctx->stream()));
+            CUDA_CHECK(cudaMemsetAsync(tmp[i].get(), 0, ne * sizeof(uint16_t), cuda_ctx->stream()));
         }
         CUDA_CHECK(cudaGetLastError());
     }
@@ -1456,7 +1643,8 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     NCCL_CHECK(ncclGroupStart());
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-        NCCL_CHECK(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, ncclBfloat16, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+        NCCL_CHECK(ncclAllReduce(tmp[i].get(), tmp[i].get(), ne, f16 ? ncclFloat16 : ncclBfloat16, ncclSum, comm_ctx->comms[i],
+                                 cuda_ctx->stream()));
     }
     NCCL_CHECK(ncclGroupEnd());
 
