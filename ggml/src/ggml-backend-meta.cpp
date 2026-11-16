@@ -2752,6 +2752,14 @@ struct ggml_backend_meta_context {
     // (used when the token graph cannot own a shape - see inner_graphs_reenable)
     void (*graph_cache_enable)(ggml_backend_t) = nullptr;
     bool inner_graphs_reenabled = false;
+    // GGML_META_TG_INNER_PER_UID=1: the per-subgraph cache state tracks the CURRENT
+    // shape's token-graph outcome instead of latching on the first failure anywhere.
+    // A warm-window dispatch for a shape the owner has not given up on must NOT
+    // capture per-subgraph graphs: the owner takes the shape over on its 3rd run and
+    // those captures never replay (~280 us each of pure churn), and their warmup
+    // resets burn the unstable-disable budget within a few requests.
+    bool inner_per_uid = false;
+    int  inner_want = -1;  // 0 = owner-off (cache disabled), 1 = cache enabled, -1 unknown
     bool (*tg_capture_begin)(ggml_backend_t)        = nullptr;
     void * (*tg_capture_end)(ggml_backend_t)        = nullptr;
     void (*tg_graph_launch)(ggml_backend_t, void *) = nullptr;
@@ -3255,6 +3263,7 @@ struct ggml_backend_meta_context {
             prof_lane = true;
         }
         dbg_tg = env_flag("GGML_META_TG_DEBUG");
+        inner_per_uid = env_flag("GGML_META_TG_INNER_PER_UID");
         if (prof) {
             prof_ns_wall0 = ggml_meta_prof_now();
             std::lock_guard<std::mutex> lk(prof_registry_mtx());
@@ -5447,6 +5456,33 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         GGML_LOG_DEBUG("%s: token graph cannot own this shape, per-subgraph graph caches re-enabled\n", __func__);
     };
 
+    // GGML_META_TG_INNER_PER_UID=1: drive the lanes' per-subgraph cache from the shape
+    // being dispatched right now: off while the owner may still take the shape (warm
+    // window), on once the owner proved it cannot (this shape failed). Gate off: the
+    // true direction collapses to the old latching reenable and the false direction
+    // never fires - no behavior change.
+    const auto inner_cache_set = [&](bool want) {
+        if (!backend_ctx->inner_per_uid) {
+            if (want) { inner_graphs_reenable(); }
+            return;
+        }
+        const int w = want ? 1 : 0;
+        if (backend_ctx->inner_want == w) {
+            return;
+        }
+        if (want && backend_ctx->graph_cache_enable != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->graph_cache_enable(backend_ctx->backend_configs[j].backend);
+            }
+            backend_ctx->inner_want = w;
+        } else if (!want && backend_ctx->graph_cache_disable != nullptr) {
+            for (size_t j = 0; j < n_backends; j++) {
+                backend_ctx->graph_cache_disable(backend_ctx->backend_configs[j].backend);
+            }
+            backend_ctx->inner_want = w;
+        }
+    };
+
     // GGML_TP_AR_CHUNKED=1: the chunked peer-write AR kernels carry a
     // host-baked arrival token that would go stale on graph replay (the
     // volatile flag compare passes immediately, racing the peer's writes).
@@ -5549,6 +5585,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 // Debug-limited capture: the tail past the captured prefix runs
                 // through the ordinary per-subgraph loop below.
+                if (backend_ctx->inner_per_uid) { inner_cache_set(false); }
                 i_dispatch_first = tge->covered;
                 goto per_subgraph_dispatch;
             }
@@ -5750,6 +5787,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     if (tge->covered >= backend_ctx->n_subgraphs) {
                         return GGML_STATUS_SUCCESS;
                     }
+                    if (backend_ctx->inner_per_uid) { inner_cache_set(false); }
                     i_dispatch_first = tge->covered;
                     goto per_subgraph_dispatch;
                 }
@@ -5770,6 +5808,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_LOG_DEBUG("%s: uid %zu capture failed, using per-subgraph dispatch\n",
                                __func__, (size_t) cgraph->uid);
             }
+        }
+        if (backend_ctx->inner_per_uid) {
+            inner_cache_set(!tge->failed);
         }
     }
     // ------------------------------------------------------------------------
