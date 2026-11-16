@@ -66,7 +66,10 @@ static __global__ void __launch_bounds__(64 * W) rp_q6k_nc_lds(
         if constexpr (STAGE_W) {
             // Stage this warp's RPL row chunks: nb_step*210 B per row. Row byte
             // stride srx*210 and even s0 keep every source word 4-byte aligned.
-            const uint32_t nw = nb_step * (BS / 4);
+            // nb_step is always even here (n_blocks even via the ne0%512 gate and
+            // STEP even), so nb_step*210 is an exact word count -- BS/4 would
+            // drop the trailing 2 bytes (the d half) of every block.
+            const uint32_t nw = (nb_step * BS) / 4;
             for (int r = 0; r < RPL; ++r) {
                 const uint32_t rr  = min((uint32_t) row + r, ne1 - 1);
                 const uint * g     = reinterpret_cast<const uint *>(wbase + ((size_t) rr * srx + s0) * BS);
@@ -144,6 +147,10 @@ static bool rp_q6k_lds_try_launch(
         return false;
     }
     if (nchannels_dst != 1 || nsamples_dst != 1 || (ncols_x % 512) != 0) {
+        return false;
+    }
+    if ((stride_row_x % 2) != 0) {
+        // odd row stride in blocks => staged source words not 4-byte aligned
         return false;
     }
     if (fusion.gate || fusion.x_bias || fusion.gate_bias ||
