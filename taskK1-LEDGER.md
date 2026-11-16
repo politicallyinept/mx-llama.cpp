@@ -7,6 +7,33 @@ libllama md5 in k1-*.witness). Canonical greedy probe sha16: 77841cb6a251235d.
 Pair: GPUs 1,2 (rocm0 quarantined). NOTE: /root/build-uwave provenance is e9b3e3197f,
 NOT the tip — tip adds taskP2 i8narrow + W1 instrumentation code; all K1 legs use build-k1.
 
+## CORRECTIONS (2026-11-16, taskD0/E1) -- head arithmetic was measured on the wrong tensor
+
+The head facts in sec 1/sec 3 (and the ceiling arithmetic derived from them in sec 3/sec 7) are WRONG:
+the microbench benched a Q8_0 [2048, 248320] stand-in, but the shipped ownhead graft
+drafter's head is **Q6_K [5120, 248320]**. Corrected facts (all re-verified live by taskD0):
+
+- `output.weight` in `/root/taskR/draft/DFlash2-Q4_0-ownhead-q4.gguf` is **Q6_K (GGUF type
+  14), shape [5120, 248320], 1,042,944,000 B = 0.971 GiB** -- verified via GGUFReader on the
+  shipped file (hidden dim is 5120, not 2048; quant is Q6_K, not Q8_0). sec 1's
+  "Q8_0 [2048, 248320] (0.50 GiB)" and `src1 = hs f32 [2048, 5]` (actually [5120, width])
+  and sec 3's head_bench arm (Q8_0 K=2048) all describe the stand-in, not the shipped head.
+- Real head kernel time: taskW1 `rocprof-draft` trace, `mul_mat_vec_q<(ggml_type)14, 5>` at
+  grid_x=7946240 (= 248320 rows at rpb=2/64-thr geometry): n=46 launches, **min 3.488 ms,
+  median 3.601 ms** -- i.e. **~3.5 ms of the 9.26 ms draft slice (~38%)**, not 1.43 ms (~15%).
+  The W1 census estimate (~4.5 ms, 37%) was directionally right; K1's "correction" of it
+  (the 1.43 ms figure) was the error, because it measured the wrong quant at the wrong K.
+- Corrected ceiling: half-head ~1.75-1.80 ms + ~0.08 ms sync/launch delta -> sharded
+  ~1.83-1.88 ms vs ~3.5 ms full -> ceiling ~ **-1.6 to -1.7 ms/step (~3.6-3.8% of the
+  44.8 ms step)** -- ABOVE the 2.9% tg256 noise floor. sec 3's "ceiling below the noise floor"
+  argument does NOT survive the correction.
+- **The sec 7 REJECT verdict STANDS on its own e2e evidence**, which measured the real model
+  (real Q6_K head): gate-ON legs showed draft-phase total +2.4 ms/step and tg256 -5.1% --
+  the meta 2-lane machinery forfeits the single-graph draft replay, and that cost is
+  head-size-independent. With corrected numbers the measured split still loses: actual
+  delta +2.4 ms vs corrected best-case gain ~1.7 ms (meta overhead ~4.1 ms ~ 2.4x the
+  corrected ceiling). Only the arithmetic/ceiling narrative changes; the verdict does not.
+
 ## 0. Goal
 
 Row-shard the DFlash2 drafter's output head matvec across the draft device AND the
@@ -19,7 +46,7 @@ fp32 reduction).
 ## 1. Head execution path (step 1)
 
 - Head = `build_lora_mm(output, cur, output_s)` at src/models/dflash.cpp:815 —
-  MUL_MAT, src0 = output.weight Q8_0 [2048, 248320] (ownhead drafter; 0.50 GiB),
+  MUL_MAT, src0 = output.weight Q8_0 [2048, 248320] (ownhead drafter; 0.50 GiB) [WRONG -- shipped head is Q6_K [5120, 248320], 0.971 GiB; see CORRECTIONS],
   src1 = result_norm hs f32 [2048, 5]. Runs on the draft device (pinned -devd),
   INSIDE the single 690-node whole-draft HIP graph (taskW1: replay 3291/3421 = 96%,
   host launch 8-84 us). The DFlash2 selector (top_k -> get_rows -> score matmuls)
@@ -71,7 +98,8 @@ Head matvec alone (Q8_0 [2048,248320] x f32 [2048,5], fake data, 20 iters):
 | sharded GPU1+GPU2 concur. | 0.789   |
 
 - **The head matvec is ~1.43 ms/step, NOT the ~4.5 ms the W1 tensor-census estimate
-  implied.** The census counted token_embd+output.weight (0.97 GiB) at the drafter's
+  implied.** [SUPERSEDED -- 1.43 ms is the Q8_0 [2048,248320] stand-in; the real Q6_K head is
+  ~3.5 ms (W1 trace min 3.488 / med 3.601 ms); see CORRECTIONS.] The census counted token_embd+output.weight (0.97 GiB) at the drafter's
   226 GB/s average; token_embd is gather-only and the Q8_0 head actually streams at
   ~378 GB/s (0.50 GiB / 1.43 ms). Head share of the 9.26 ms draft slice = ~15%, not 37%.
 - Sharding physics: 1.43 -> 0.79 ms (-44%), sync/launch delta ~0.08 ms over the
@@ -176,5 +204,7 @@ net +2.4 ms/step and tg256 -5.1%. Even a perfect head split caps at -0.64 ms (be
 noise floor); the actual implementation is net-negative because the meta 2-lane machinery
 forfeits the single-graph draft replay that was the W1 win. The X3 survivor (monetizing
 GPU2 idle draft-slice time via head split) is CLOSED: the offload target (1.43 ms head
-matvec) is smaller than the cost of splitting it across devices. Gate
+matvec [CORRECTED: real target ~3.5 ms Q6_K head; the verdict still holds -- measured split cost
++2.4 ms/step exceeds the corrected ~1.7 ms ceiling gain; see CORRECTIONS]) is smaller than the
+cost of splitting it across devices. Gate
 GGML_DFLASH_HEAD_SPLIT stays default OFF; branch NOT merged.
