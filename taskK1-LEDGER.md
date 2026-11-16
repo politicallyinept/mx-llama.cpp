@@ -102,14 +102,14 @@ tensor copies in a standalone mi50 process; measure staged get/set instead.
 
 - [x] gate implemented + committed (362542247a), build-k1 ready (provenance clean)
 - [x] microbench: physics supports the split (-0.64 ms/step ceiling)
-- [ ] gate-OFF byte-identity to 77841cb6a251235d on build-k1 (k1-off-r1)
-- [ ] gate-ON: probe byte-identity MUST hold + acceptance bit-equal 0.4377/2.7508
+- [x] gate-OFF byte-identity to 77841cb6a251235d on build-k1 (k1e-off-r1/r2: PASS, sec 7)
+- [x] gate-ON: probe byte-identity PASS 4/4; acceptance bit-equal PASS r1 / MISS r2 (sec 7)
       + tg256 vs 58.20 + draft-phase before/after (readnx bucket, DFLASH-PROF)
       + cuda-graph mode histogram (no per-step re-capture) + GPU2 VRAM witness
 - Re-run: `/root/taskK1/k1-leg.sh <tag> off 8461` then `<tag> ROCm1 8462` (paired
   x2 recommended; refuse-if-exists .done markers already set up; legs flock -w 2700,
   TERM-only teardown, production-env via mi50-run.sh, gate witnessed via proc environ).
-- Verdict: PENDING e2e. If readnx drops ~0.5-0.6 ms and probe/acceptance hold ->
+- Verdict: REJECT (sec 7). Was: PENDING e2e. If readnx drops ~0.5-0.6 ms and probe/acceptance hold ->
   adopt (win is real but sub-noise on tg256; value = draft-phase reduction + free
   GPU2 utilization). If meta-path overhead (hs broadcast + logits gather + extra
   subgraph sync) eats the 0.64 ms -> reject with the decomposition.
@@ -124,3 +124,57 @@ tensor copies in a standalone mi50 process; measure staged get/set instead.
 - Branch int4-k1-headsplit: 362542247a (gate) + this ledger. NOT pushed.
 - ECC health: amd_gpu_ecc_errors_total all-zero at 23:19 (exporter re-zeroed state;
   GPU0 quarantine stands). GPU2 SMC loop is a NEW fault class from the wedge, not ECC.
+
+## 7. e2e RESULTS (2026-11-16, post-reboot) — VERDICT: REJECT
+
+Device enumeration re-verified post-reboot: rocm-smi GPU2 = PCI 0000:1a:00.0 = KFD node 3;
+HIP enumeration follows PCI order, so with HIP_VISIBLE_DEVICES=1,2 the internal ROCm1 IS
+physical GPU2. Gate value ROCm1 correct; GPU0 never in any leg's visible set.
+Legs k1e-{off,on}-r{1,2}, all rc=0, flock+TERM teardown clean, GPU0 untouched.
+
+| leg        | gate  | probe sha16         | accept agg        | tg256 t/s | readnx med us | fwd med us | draft total med us |
+|------------|-------|---------------------|-------------------|-----------|---------------|------------|--------------------|
+| k1e-off-r1 | OFF   | 77841cb6a251235d OK | 0.4377 / 2.7508   | 54.31     | 9269          | 533        | 9822               |
+| k1e-off-r2 | OFF   | 77841cb6a251235d OK | 0.4377 / 2.7508   | 54.31     | 9285          | 539        | 9844               |
+| k1e-on-r1  | ROCm1 | 77841cb6a251235d OK | 0.4377 / 2.7508   | 51.54     | 116           | 12132      | 12259              |
+| k1e-on-r2  | ROCm1 | 77841cb6a251235d OK | 0.4364 / 2.7456 MISS | 51.50  | 114           | 12061      | 12187              |
+
+- Gate-OFF control: probe byte-identity + acceptance bit-identity both hold, both reps;
+  OFF legs bit-reproducible against each other (all 32 bench records equal).
+- Gate-ON numerics: probe byte-identity 4/4 (target output neutral, as designed).
+  Acceptance bit-identity: r1 PASS; r2 MISS on 1 of 48 tg256 reps (dialogue rep3:
+  draft_n 285->302, accepted 183->179; agg 0.4364/2.7456). Target text unchanged
+  (predicted_n identical); only the drafter PROPOSAL stream diverged. Repro probe
+  (fresh ON server, dialogue tg256 x5): 5/5 bit-equal canonical (dn 285/da 183, text
+  sha16 fb93e4602dc33444) -> rare one-off, not systematic; root cause not identified
+  (candidate: 2-lane meta sync race). Logged as latent hazard; moot given perf verdict.
+- readnx timer: 9269 -> 116 us is a SYNC-POINT ARTIFACT, not a win. Gate-ON moves the
+  blocking wait from llama_get_embeddings_nextn (readnx) into the draft-fwd call
+  (fwd_us 533 -> 12132): the 2-lane meta graph synchronizes inside fwd. Honest draft-phase
+  total_us: 9822/9844 -> 12259/12187 = +2.4 ms/step. Meta overhead (hs broadcast +
+  in-graph logits gather + 2-lane dispatch) eats the 0.64 ms ceiling ~4x over.
+- cuda-graph histogram: OFF draft graph = single 690-node HIP graph, capture 66 / replay
+  3067 (~2% shape-change re-captures, matches taskW1 96% replay; no per-step re-capture).
+  ON: the 690-node graph is GONE - draft shapes dispatch via meta whole-graph capture
+  (tg-capture lanes=2 ok=1 x121) plus tg-not-eligible shapes permanently on per-subgraph
+  dispatch; draft subgraph replay collapses (nodes=58 dev0: replay 3237 -> 4). Overall
+  replay 10130 -> 5120, direct 46620 -> 64654. The 2-lane split forfeits the
+  single-graph draft replay that was the W1 win.
+- tg256: 54.31 -> 51.52 (-5.1%), consistent with +2.4 ms/step; moves the WRONG way past
+  the 2.9% noise floor. (OFF legs read 54.31 not canonical 58.20 - post-reboot
+  environment; paired OFF legs are the control, not the pre-wedge champion number.)
+- GPU2 witness: VRAM 10.47 GB (OFF) -> 13.43-13.50 GB (ON) = +2.97 GB (mirrored drafter
+  ~2.65 + half head ~0.25 + meta scratch); ECC correctable/uncorrectable 0/0 across all
+  legs and the repro probe; mem temp peak 61 C, hotspot 82 C - light load as predicted,
+  no anomaly. GPU2 stays healthy and usable for light loads.
+- draft-gather (host side): identical OFF/ON (med 37 vs 33 us) - the overhead is inside
+  fwd (meta graph dispatch), not the host gather.
+
+VERDICT: REJECT. The decision criterion (readnx drops >=0.5 ms with meta overhead not
+eating it) FAILS: the apparent readnx drop is a sync-point artifact; the draft phase is
+net +2.4 ms/step and tg256 -5.1%. Even a perfect head split caps at -0.64 ms (below the
+noise floor); the actual implementation is net-negative because the meta 2-lane machinery
+forfeits the single-graph draft replay that was the W1 win. The X3 survivor (monetizing
+GPU2 idle draft-slice time via head split) is CLOSED: the offload target (1.43 ms head
+matvec) is smaller than the cost of splitting it across devices. Gate
+GGML_DFLASH_HEAD_SPLIT stays default OFF; branch NOT merged.
