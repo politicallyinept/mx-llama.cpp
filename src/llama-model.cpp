@@ -724,7 +724,26 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // output matrix per device and makes the head's logits MIRRORED, which is what
         // the rest of the drafter already is. The projection itself is one GEMM over
         // n_tokens (the drafted block, single digits) so the lost parallelism is noise.
-        if (ud->model->tensor_mirror_output() &&
+        // taskK1: GGML_DFLASH_HEAD_SPLIT=<dev> row-shards ONLY the output head of a
+        // DFlash/DSpark drafter across the draft's TP lanes (vocab-parallel AXIS_1,
+        // the same routing the deepseek4 target head uses). Every other draft tensor
+        // is mirrored whole, so no per-layer allreduce appears - unlike
+        // LLAMA_DRAFT_SPLIT=1, which splits the whole drafter and pays an allreduce
+        // storm (taskR H3). Numerics-neutral: each logit row is computed by exactly
+        // one device with the same K-dim summation order; the selector's top_k gets
+        // the logits via the meta backend's full-rows gather. Paired with the device
+        // list + split-mode change in common_base_params_to_speculative. Unset/"0" =
+        // OFF, byte-identical.
+        static const bool k1_head_split = [] {
+            const char * s = getenv("GGML_DFLASH_HEAD_SPLIT");
+            return s != nullptr && strcmp(s, "0") != 0;
+        }();
+        const bool k1_is_head = tied_output ||
+            std::regex_match(tensor_name, pattern_output_weight) ||
+            std::regex_match(tensor_name, pattern_output_bias);
+        const bool k1_keep_head = k1_head_split && ud->model->arch == LLM_ARCH_DFLASH && k1_is_head;
+
+        if (ud->model->tensor_mirror_output() && !k1_keep_head &&
                 (std::regex_match(tensor_name, pattern_output_weight) ||
                  std::regex_match(tensor_name, pattern_output_bias))) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -741,13 +760,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //
         // LLAMA_DRAFT_SPLIT forces the choice either way and overrides both defaults.
         if (ud->model->arch == LLM_ARCH_DFLASH) {
-            static const int draft_split_env = [] {
-                const char * s = getenv("LLAMA_DRAFT_SPLIT");
-                return s == nullptr ? -1 : atoi(s);
-            }();
-            const bool split_draft = draft_split_env < 0 ? dflash_dsv4_split : draft_split_env != 0;
-            if (!split_draft) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (k1_head_split) {
+                // taskK1: everything but the head stays mirrored; the head falls
+                // through to the vocab-parallel AXIS_1 output rule below.
+                if (!k1_is_head) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+            } else {
+                static const int draft_split_env = [] {
+                    const char * s = getenv("LLAMA_DRAFT_SPLIT");
+                    return s == nullptr ? -1 : atoi(s);
+                }();
+                const bool split_draft = draft_split_env < 0 ? dflash_dsv4_split : draft_split_env != 0;
+                if (!split_draft) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
             }
         }
         if (head_split_attention) {
