@@ -3642,6 +3642,68 @@ common_params common_base_params_to_speculative(const common_params & params) {
             result.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
 
+        // taskK1: GGML_DFLASH_HEAD_SPLIT=<dev> row-shards the DFlash drafter's
+        // output head (vocab-parallel, AXIS_1 on output.weight) across the draft
+        // device plus one head device, while every other draft tensor stays
+        // mirrored (lane-local) - see the matching policy gate in
+        // llama-model.cpp get_tensor_config. Unlike LLAMA_DRAFT_SPLIT=1 (which
+        // splits the whole drafter and pays an allreduce storm on ~690 tiny
+        // kernels, taskR H3), this creates no per-layer reduction: the head is
+        // column-parallel, each logit row is computed by exactly one device with
+        // the same K-dim summation order, so the split is numerics-neutral and
+        // only the vocab-parallel logits need a gather before the selector's
+        // top_k (handled by the meta backend's full-rows gather).
+        // The value names the head device (e.g. "ROCm2", or a bare GPU index).
+        // Unset or "0" = OFF, byte-identical single-device pinned draft.
+        {
+            const char * hs = getenv("GGML_DFLASH_HEAD_SPLIT");
+            if (hs != nullptr && strcmp(hs, "0") != 0) {
+                ggml_backend_dev_t head_dev = ggml_backend_dev_by_name(hs);
+                if (head_dev == nullptr) {
+                    // bare index convenience: "2" matches ROCm2/CUDA2 by numeric suffix
+                    for (size_t i = 0; head_dev == nullptr && i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                            continue;
+                        }
+                        const char * dn = ggml_backend_dev_name(d);
+                        const char * end = dn + strlen(dn);
+                        const char * beg = end;
+                        while (beg > dn && beg[-1] >= '0' && beg[-1] <= '9') { --beg; }
+                        if (beg < end && strcmp(beg, hs) == 0) {
+                            head_dev = d;
+                        }
+                    }
+                }
+                const auto dflash_types = common_speculative_types_from_gguf(params_spec.mparams.path);
+                const bool is_dflash = std::any_of(dflash_types.begin(), dflash_types.end(),
+                        [](common_speculative_type t) {
+                            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                                || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                        });
+                if (head_dev == nullptr) {
+                    LOG_WRN("%s: GGML_DFLASH_HEAD_SPLIT='%s' names no GPU device - head split disabled\n",
+                            __func__, hs);
+                } else if (!is_dflash) {
+                    LOG_WRN("%s: GGML_DFLASH_HEAD_SPLIT set but the draft is not DFlash/DSpark - head split disabled\n",
+                            __func__);
+                } else if (n_devs != 1) {
+                    LOG_WRN("%s: GGML_DFLASH_HEAD_SPLIT set but the draft already has %zu devices - head split disabled\n",
+                            __func__, n_devs);
+                } else if (head_dev == result.devices[0]) {
+                    LOG_WRN("%s: GGML_DFLASH_HEAD_SPLIT names the draft device itself - head split disabled\n",
+                            __func__);
+                } else {
+                    // devices is null-terminated: insert the head device before the terminator
+                    result.devices.insert(result.devices.end() - 1, head_dev);
+                    result.split_mode           = LLAMA_SPLIT_MODE_TENSOR;
+                    result.tensor_parallel_size = 2;
+                    LOG_INF("%s: taskK1 head split ON: draft devices [%s, %s], output.weight vocab-parallel across the pair\n",
+                            __func__, ggml_backend_dev_name(result.devices[0]), ggml_backend_dev_name(head_dev));
+                }
+            }
+        }
+
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
             result.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
