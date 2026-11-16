@@ -1,0 +1,37 @@
+# taskD1 vec_dot rewrite microbench, device 0
+T=1 Q6_K attn_q 5120x6144      generic      66.2 us    389.6 GB/s (38.0% of 1024) det=1
+   d1-hoist            62.6 us    412.5 GB/s  vs generic   +5.9%  bit=1 det=1
+   d1-hoist+raw        54.6 us    473.0 GB/s  vs generic  +21.4%  bit=1 det=1
+T=4 Q6_K attn_q 5120x6144      generic     118.4 us    217.9 GB/s (21.3% of 1024) det=1
+   d1-hoist           107.4 us    240.4 GB/s  vs generic  +10.3%  bit=1 det=1
+   d1-hoist+raw       103.4 us    249.7 GB/s  vs generic  +14.6%  bit=1 det=1
+T=8 Q6_K attn_q 5120x6144      generic     249.0 us    103.7 GB/s (10.1% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   d1-hoist           240.8 us    107.2 GB/s  vs generic   +3.4%  bit=1 det=1
+   d1-hoist+raw       220.8 us    116.9 GB/s  vs generic  +12.8%  bit=1 det=1
+T=1 Q6_K head 5120x248320      generic    2291.4 us    455.2 GB/s (44.4% of 1024) det=1
+   d1-hoist          2397.9 us    434.9 GB/s  vs generic   -4.4%  bit=1 det=1
+   d1-hoist+raw      2125.1 us    490.8 GB/s  vs generic   +7.8%  bit=1 det=1
+T=4 Q6_K head 5120x248320      generic    4293.0 us    242.9 GB/s (23.7% of 1024) det=1
+   d1-hoist          4077.1 us    255.8 GB/s  vs generic   +5.3%  bit=1 det=1
+   d1-hoist+raw      3995.0 us    261.1 GB/s  vs generic   +7.5%  bit=1 det=1
+T=8 Q6_K head 5120x248320      generic    8132.0 us    128.3 GB/s (12.5% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   d1-hoist          7639.2 us    136.5 GB/s  vs generic   +6.5%  bit=1 det=1
+   d1-hoist+raw      7924.5 us    131.6 GB/s  vs generic   +2.6%  bit=1 det=1
+T=1 Q4_0 attn_q 5120x6144      generic      49.3 us    359.1 GB/s (35.1% of 1024) det=1
+   d1-hoist            47.8 us    369.9 GB/s  vs generic   +3.0%  bit=1 det=1
+T=4 Q4_0 attn_q 5120x6144      generic      82.2 us    215.2 GB/s (21.0% of 1024) det=1
+   d1-hoist            74.2 us    238.3 GB/s  vs generic  +10.8%  bit=1 det=1
+T=8 Q4_0 attn_q 5120x6144      generic     123.2 us    143.6 GB/s (14.0% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   d1-hoist           126.6 us    139.8 GB/s  vs generic   -2.7%  bit=1 det=1
+T=1 Q4_0 ffn 5120x9216         generic      68.5 us    387.6 GB/s (37.9% of 1024) det=1
+   d1-hoist            66.7 us    397.8 GB/s  vs generic   +2.6%  bit=1 det=1
+T=4 Q4_0 ffn 5120x9216         generic     116.6 us    227.6 GB/s (22.2% of 1024) det=1
+   d1-hoist           103.8 us    255.6 GB/s  vs generic  +12.3%  bit=1 det=1
+T=8 Q4_0 ffn 5120x9216         generic     173.8 us    152.8 GB/s (14.9% of 1024) det=1
+   oracle(512 rows): mismatches=0 PASS
+   d1-hoist           176.5 us    150.4 GB/s  vs generic   -1.5%  bit=1 det=1
+MB-DONE
+EXIT=0
