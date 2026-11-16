@@ -20,7 +20,7 @@
 //   * same reduction: warp_reduce_sum<64> (shfl_xor 32,16,8,4,2,1).
 // Rows are independent, so the rows-per-block / waves-per-block geometry is
 // free; the row -> result mapping is a bijection of the generic's.
-// Verified bit-exact in mb_k2_head_test at T=2..5, N=248320/124160, W=4/8.
+// Bit-exact ONLY at T=5 (GCN calc_nwarps(Q6_K)=2 at T=1-4, =1 at T=5, mmvq.cu:469-485; kernel replicates only nwarps=1 geometry — reduction tree differs at T=2-4). Lane REFUTED on perf at every routed width (taskK2); gate default OFF, do not enable at T=2-4., N=248320/124160, W=4/8.
 //
 // Dispatch gate: GGML_DFLASH_HEAD_KERNEL=1 (default OFF) at the
 // ggml_cuda_mul_mat_vec_q funnel in mmvq.cu; GGML_DFLASH_HEAD_W selects the

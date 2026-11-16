@@ -159,3 +159,13 @@ The W1 headroom read (302 GB/s vs ~1.02 TB/s peak) stands, but LDS activation st
 the wrong lever for it — corroborated by K3's independent refutation at widths 5-8.
 Gate default OFF; branch `int4-k2-headkernel` unmerged, kept for the kernel source and
 this negative result.
+
+## CORRECTION NOTE (2026-11-16, taskD0/E1)
+
+The false "Verified bit-exact at T=2..5" claim in the `mmvq-head-lds.cuh` source header was
+corrected on branch `int4-fix4` (commit 468f0bbd84) to "bit-exact ONLY at width 5", matching
+this ledger's own root-cause finding (GCN nwarps geometry varies with width; the kernel
+replicates only the nwarps=1 geometry). No measurement in this ledger changes -- the ledger
+analysis was already correct; only the stale source-header claim it flagged has now been
+fixed in-tree. See also taskD0-LEDGER.md for the E5 follow-up on the T=1 generic-path hash
+footnote (Notes 1).
