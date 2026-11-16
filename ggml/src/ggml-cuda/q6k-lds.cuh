@@ -163,7 +163,7 @@ static bool rp_q6k_lds_try_launch(
     const block_q8_1 * xq = (const block_q8_1 *) vy;
 #define RP_Q6K_GO(T_, W_) \
     if (ncols_dst == T_ && W == W_) { \
-        rp_q6k_nc_lds<T_, W_, 4, true, 2><<<grid, block, 0, stream>>>( \
+        rp_q6k_nc_lds<T_, W_, 2, false, 2><<<grid, block, 0, stream>>>( \
             w, xq, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); \
         return true; \
     }

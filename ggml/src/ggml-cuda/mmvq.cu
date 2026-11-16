@@ -607,7 +607,7 @@ static int mmvq_gcn_rpb1() {
 
 // taskK2: GGML_DFLASH_HEAD_KERNEL=1 routes the DFlash2 drafter's Q6_K vocab head
 // (5120x248320) at draft widths 2..5 to the LDS-staged kernel in mmvq-head-lds.cuh.
-// Bit-identical to the generic mul_mat_vec_q<Q6_K, T> GCN geometry by construction
+// Bit-identical ONLY at width 5 (see header note; T=2-4 unsealed — gate default OFF, REFUTED lane taskK2) to the generic mul_mat_vec_q<Q6_K, T> GCN geometry by construction
 // (same lane split, vec_dot, accumulation order, reduce tree); default OFF and the
 // gate-off path never reaches the new kernel. GGML_DFLASH_HEAD_W selects waves per
 // workgroup (4 or 8, default 8) for microbench sweeps.
