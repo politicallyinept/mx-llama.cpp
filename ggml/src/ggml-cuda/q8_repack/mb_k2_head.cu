@@ -90,6 +90,8 @@ int main(int argc, char ** argv) {
     ggml_tensor * src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, K, N);
     ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
     ggml_set_name(src0, "output.weight");
+    if (ggml_backend_alloc_ctx_tensors(ctx, be) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "device alloc failed\n"); return 1; }
 
     // deterministic fill: gaussian rows quantized to Q6_K, activations gaussian
     std::mt19937 rng(1234);
