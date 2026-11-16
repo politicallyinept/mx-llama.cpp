@@ -5592,7 +5592,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         tge->warm++;
-        if (gdiag && (tge->failed || tge->warm <= tg_warm_needed)) {
+        if (gdiag && (tge->failed || tge->warm <= backend_ctx->tg_warm_needed)) {
             fprintf(stderr, "[GRAPH-DIAG] tg-warm uid=%zu warm=%d failed=%d\n", (size_t) cgraph->uid, tge->warm, (int) tge->failed);
         }
 
