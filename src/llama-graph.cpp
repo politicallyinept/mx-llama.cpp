@@ -2551,7 +2551,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
+    // taskL2 ceiling probe (GGML_L2_SKIP_MOE_SUM, default OFF): numerically WRONG by
+    // design - skips the weighted-sum chain to measure its cost ceiling. Never ship ON.
+    static const bool l2_skip_moe_sum = [] { const char * e = getenv("GGML_L2_SKIP_MOE_SUM"); return e && atoi(e) != 0; }();
+    if (l2_skip_moe_sum) {
+        static bool s_l2_warned = false;
+        if (!s_l2_warned) { s_l2_warned = true; LLAMA_LOG_WARN("%s: GGML_L2_SKIP_MOE_SUM ACTIVE - MoE weighted-sum chain SKIPPED (ceiling probe, output is wrong)\n", __func__); }
+    } else if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
@@ -2576,10 +2582,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // aggregate experts
     ggml_tensor * moe_out = cur_experts[0];
 
-    for (uint32_t i = 1; i < n_expert_used_il; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+    if (l2_skip_moe_sum) {
+        moe_out = ggml_cont(ctx0, moe_out);
+    } else {
+        for (uint32_t i = 1; i < n_expert_used_il; ++i) {
+            moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
-        ggml_build_forward_expand(gf, moe_out);
+            ggml_build_forward_expand(gf, moe_out);
+        }
     }
 
     if (n_expert_used_il == 1) {
