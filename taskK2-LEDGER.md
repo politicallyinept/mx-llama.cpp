@@ -78,22 +78,84 @@ Timeline (kern.log, dmesg, exporter):
 - NOT attempted: driver reload / reboot — shared box, llama-swap production service,
   contract playbook says host reboot; that is a user/parent-level call, not a subagent's.
 
-## Next steps when the box recovers (reboot per contract, then)
-1. `rocm-smi --showtemp` — confirm GPU2 state; if still templess after reboot, quarantine it
-   alongside GPU0 and use cards 1/3 only (set CARD= in the driver).
-2. `/root/mb_k2_head bw` — practical read-bandwidth reference (expect ~800-950 GB/s).
-3. `CARD=1 /root/k2-mb-sweep.py /root/mb_k2_head "1 2 3 4 5"` — bit-exact + GB/s per arm.
-   Acceptance: hash identical gate-off vs on at every T; win bar = >=1.0 ms/step on the head
-   (generic head share ~3.5-4.5 ms/step at ~302 GB/s; LDS arm must show materially higher GB/s).
-4. If win: e2e at champion config, gate ON: probe sha 77841cb6a251235d MUST hold; acceptance
-   bit-equal; tg vs 58.20. Gate-off byte-identity leg. If microbench loses: deliver refutation
-   with GB/s numbers (step 1 already shows headroom, so a loss would mean the LDS design is
-   at fault, not saturation).
+## POST-REBOOT RUN 2026-11-16 — microbench sweep + VERDICT: REFUTED
 
-## Verdict (as of this run)
-Kernel implemented, committed, compiles clean on the pinned toolchain; microbench harness
-built. **No performance verdict is possible: mi50 lost KFD box-wide to an uncorrectable
-GPU2 hardware error at 23:08 PST; host reboot required per contract before any GPU leg.**
-The bandwidth-headroom question from W1 is answered from the existing trace: the head matvec
-achieves ~302 GB/s vs ~1.02 TB/s peak — NOT saturated, ~3x headroom, so the LDS kernel has
-room to win; the microbench must still prove it.
+Box recovered per contract. GPU0 ECC-failed (62311 correctable, stays quarantined); GPU1
+clean (used for the sweep, CARD=1); GPU2 recovered, treated as suspect. ECC re-checked
+via exporter (amd_gpu_ecc_errors_total) before and after the sweep: GPU1 0/0.
+
+Read-bandwidth reference (`mb_k2_head bw`, GPU1): **857.9 GB/s** practical (1 GiB read).
+Sweep: `CARD=1 python3 /root/k2-mb-sweep.py /root/mb_k2_head "1 2 3 4 5"` (IT=15,
+N=248320, K=5120, flock -w 2700 /root/gpu.lock). Raw TSV: taskK2-mb.tsv (this commit).
+
+### Sweep table (med_us / weight GB/s; win = generic med - best LDS arm med)
+| T | gate-off        | W4              | W8              | win (best vs off) | bit-exact vs off |
+|---|-----------------|-----------------|-----------------|-------------------|------------------|
+| 1 | 2147.1 / 490.4  | 2093.2 / 503.0* | 2143.3 / 491.2* | n/a (not routed)  | see note 1       |
+| 2 | 2884.8 / 365.0  | 3744.0 / 281.2  | 3927.8 / 268.1  | **-0.86 ms**      | NO               |
+| 3 | 3632.3 / 289.9  | 5300.0 / 198.7  | 5591.4 / 188.3  | **-1.67 ms**      | NO               |
+| 4 | 4137.4 / 254.5  | 6212.8 / 169.5  | 6371.2 / 165.3  | **-2.08 ms**      | NO               |
+| 5 | 4000.5 / 263.2  | 7439.1 / 141.5  | 7564.8 / 139.2  | **-3.44 ms**      | yes (W4 & W8)    |
+
+(*) T=1 is NOT routed: the gate requires ncols_dst>=2; the W4/W8 rows at T=1 are the
+generic path re-run (banner prints regardless of routing — env-gate init, not routing).
+
+**Verdict: REFUTED — no e2e legs run.** The LDS kernel loses at every routed width
+(-0.86 to -3.44 ms/step vs generic) and peaks at 281 GB/s vs the >=500 GB/s bar (and
+857.9 GB/s practical read reference). Neither go-condition (>=1.0 ms win OR >=500 GB/s)
+is met at any width. Gate stays default OFF; branch stays unmerged.
+
+### Root cause, bit-exactness failure (T=2..4)
+`calc_nwarps(Q6_K, ncols_dst)` on the GCN table returns **nwarps=2 for widths 1-4** and
+**nwarps=1 for width 5** (mmvq.cu:469-485). The kernel replicates only the nwarps=1
+geometry (64-thread wave, kbx split lane>>5), so it is bit-exact exactly at T=5
+(hash-verified: 3e91b02032d0a50a matches generic at W4 and W8) and produces a different
+(valid, differently-ordered) fp32 reduction tree at T=2..4. The header's "nwarps=1,
+rpb=2 on the GCN table" premise was true only for width 5; the "Verified bit-exact at
+T=2..5" line predates the wedge and had never actually been run. A fixed kernel would
+need a second geometry (nwarps=2 twin) for widths 2-4.
+
+### Root cause, perf loss (design-level, consistent with K3)
+Per-K-step `__syncthreads()` staging serializes the loop every 512 values and the block
+only covers 2 rows/wave, cutting weight-streaming concurrency; the generic path already
+serves the activation from L2 without staging. Losses grow with T (more LDS traffic per
+step). Independently corroborated by the K3 lane: their Q6_K LDS twin (widths 5-8,
+GGML_CUDA_RP_Q6K_LDS) was 27-41% slower in shipped config, best arm +0.09 ms at width 5
+— below their 0.8 ms bar. **Two independent LDS-staging designs both lose at this shape:
+the head matvec's ~260-365 GB/s at draft widths is NOT an LDS-staging problem.**
+
+### Coverage report for parent reconciliation (K2 vs K3)
+- K2 gate `GGML_DFLASH_HEAD_KERNEL` (+`GGML_DFLASH_HEAD_W` 4|8): widths **2-5**, Q6_K
+  5120x248320, no ids/fusion. Per-width wins vs generic: T2 -0.86, T3 -1.67, T4 -2.08,
+  T5 -3.44 ms — all negative. Bit-exact only at T=5.
+- K3 gate `GGML_CUDA_RP_Q6K_LDS`: widths **5-8**, REJECTED independently (+0.09 ms best
+  at width 5).
+- Overlap at width 5: both kernels lose. Champion draft n_max=4 reaches widths 2-5 only;
+  the head matvec stays on the generic path at every reachable width. No merge needed.
+
+### Notes
+1. Note 1 (T=1 hash instability, generic path): across the three captured gate-off-equivalent
+   T=1 runs the dst hash took two values (W0=W4=dd088cf64c417abe; W8=626c9fd66467559f; the
+   base run's hash was not captured by the driver but differed from W0, since W0 read
+   exact=NO). Within-run determinism
+   held everywhere (no NONDETERMINISTIC lines at T>=2). T>=2 base-vs-W0 re-runs were
+   deterministic at every width (bitexact_vs_off=yes on all W=0 rows). T=1 is outside the
+   gate scope; flagged for follow-up, not chased.
+2. The sweep driver compares each arm to the FIRST gate-off run; where that base run was
+   one of the flipped T=1 runs, the TSV bitexact_vs_off column reads NO even for matching
+   rows — the table above compares hashes directly.
+3. `/mnt/old/build-k2/bin/llama-server` md5 81367650445c3874a859291cbf317a27 matches
+   BUILD-PROVENANCE; gate string present in libggml-hip (e56c6617...). No fresh build was
+   needed. E2E leg script prepared at `/root/taskK2/k2-leg.sh` (GPUs 1,3, off/W4/W8 arms,
+   probe-sha + acceptance + GGML_DFLASH_PROF wired) but UNUSED — kept for any future
+   kernel that clears the mb bar.
+4. mb runs are fill-dominated (~7 min each: CPU Q6_K quantize of 1.27B floats); a fill
+   cache or smaller-N pre-screen would cut sweep wall time ~5x if this harness is reused.
+
+## Verdict (final)
+**REJECT the K2 LDS head kernel as-is.** It is slower than the generic mul_mat_vec_q at
+every routed width and bit-exact only at width 5 (GCN nwarps geometry varies with width).
+The W1 headroom read (302 GB/s vs ~1.02 TB/s peak) stands, but LDS activation staging is
+the wrong lever for it — corroborated by K3's independent refutation at widths 5-8.
+Gate default OFF; branch `int4-k2-headkernel` unmerged, kept for the kernel source and
+this negative result.
