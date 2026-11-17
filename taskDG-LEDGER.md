@@ -132,3 +132,16 @@ B3: allocator-perturbation isolation — LLAMA_GRAPH_RES_PER_SHAPE already bucke
 - /root/dg-{leg,watch,parse,agg,e2e}.py|sh; patchers /root/dg-patch.py, /root/dg-fixA.py.
 - All GPU legs: flock /root/gpu.lock -w 2700, production-env witnessed, TERM-only teardown,
   pair 1,3 pinned, GPU0 untouched.
+
+## §8 e2e verdict (parent, 2026-11-17): Fix A measured-NEUTRAL — gate stays available, NOT adopted
+- Legs: off1/on1/off2/on2 paired-interleaved on pair 1,3 (post-reboot clean cards), champion f128q4kv-p-d4.
+- tg256: OFF median 57.34 vs ON median 57.31 = -0.06% — SUB-NOISE (arm spreads 0.03/0.05%). The
+  ~0.5-1% mechanism-level ceiling did not translate to e2e; capture churn is real but its wall
+  share is smaller than modeled.
+- Probes: canonical 77841cb6a251235d all 4 legs (Fix A gate-off-identical confirmed e2e).
+- Acceptance: 3/4 legs bit-equal 0.4377/2.7508; off2 shows 0.4380/2.752 (3889/8879) — matches the
+  KNOWN pinned-arm one-off acceptance nondeterminism class (K1/V3 flagged, tech-exp prompt), and
+  it occurred in an OFF arm, so it is not attributable to Fix A. Logged, not new.
+- DISPOSITION: GGML_META_TG_INNER_PER_UID stays shipped default-OFF, available for entries with
+  long-lived sessions where churn dominates; not in the serving config. Fix B (exec-pointer
+  patching) remains the designed follow-on if the M1 per-request re-capture ever matters.
