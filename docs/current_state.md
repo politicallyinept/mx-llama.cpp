@@ -82,8 +82,8 @@ M2 CLI, and M3 validation commits on branch `perf/mxfp4-imatrix`):
 ### Merge A/B matrix (llama-bench -r 3, same session, prod vs merge)
 | Model | tg128 | pp2048 |
 |---|---|---|
-| Cydonia Q8_0 | 26.59 -> 26.59 (+0.00%) | 774.4 -> 773.1 (-0.16%) |
-| Precog Q4_0 | 9.14 -> 9.07 (-0.77%) | 134.9 -> 135.3 (+0.25%) |
+| Mistral-24B Q8_0 | 26.59 -> 26.59 (+0.00%) | 774.4 -> 773.1 (-0.16%) |
+| Mistral-Large Q4_0 fine-tune | 9.14 -> 9.07 (-0.77%) | 134.9 -> 135.3 (+0.25%) |
 | Mistral-class-prod W4A4 g=1 | 21.25 -> 21.29 (+0.19%) | 238.7 -> 240.8 (+0.88%) |
 | community-FT MoE (gate off) | - | 2696 -> 2702 (+0.21%) |
 GCN MMQ table (#27841) = wash on gfx906 (bandwidth-bound at these batch sizes). NOTE: same-harness deltas are much smaller than vs BENCH.md sec 35 absolute values (ggml lib generation changed 0.22->0.25.3); sec 35 numbers remain the historical record. W4A4 gate=1 is env-toggled per-model: GGML_CUDA_W4A4_DOT8=1 on production-123B-v2 + production-128B-X-v3 entries ONLY (flag is getenv-gated, default off). Verified: gate symbols in shipped libggml-hip.so; llama-swap journal shows env delivered at model load. Branch: perf/w4a4-dot8-gfx906 merged into the production branch lineage - prod branch now matches prod binary. Live-generation smoke test verified post-reboot 17:29: Mistral-class-prod via llama-swap returned the exact greedy response with gate=1 env active. production-128B not individually exercised (same binary, same env mechanism).
