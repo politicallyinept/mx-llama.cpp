@@ -24,10 +24,10 @@ No repo changes; ledger-only commit; NOT pushed.
 ## 2. Config audit (step 2)
 
 32 entries. DFlash2 spec entries: Qwen3.8-27B-Q4_0 (d4 champion class), Qwen3.8-27B
-(Q8_0 chat class). Embedded-MTP spec entries (adaptive N/A): RVN-Flash-Next-MTP,
-Ornith-Agents-A1-3.6-35B-A3B, Qwen3.6-27B-Fable-Fusion-711-MTP, Huihui-Qwen3.8-27B-
-abliterated, Ornith-1.5-MTPv2-trial, Ornith-1.5-35B-A3B-abliterated-Q4, Qwen3.8-27B-
-Halloween-Terror-source-Q4_0. 35B MoE plain: Ornith-1.5-35B-A3B-abliterated (owner
+(Q8_0 chat class). Embedded-MTP spec entries (adaptive N/A): Qwen3.6-Flash-Next fine-tune,
+Qwen3.5-35B-A3B fine-tune, Qwen3.6-27B fine-tune, Qwen3.8-27B fine-tune-
+abliterated, Qwen3.6-35B-A3B fine-tune trial, Qwen3.6-35B-A3B fine-tune Q4, Qwen3.8-27B-
+Qwen3.8-27B-Q4_0. 35B MoE plain: Qwen3.6-35B-A3B fine-tune (owner
 already had the E pair). Non-27B/35B entries untouched per dispatch.
 Backups: /llama-swap/config.yaml.bak-l4-1794888911 (pre-L4),
 config.yaml.bak-l4final-1794890426 (pre-final-edit).
@@ -52,22 +52,22 @@ Qwen3.8-27B (Q8_0 chat)  (class C attempted -> REVERTED to pre-L4 state - see 5.
   Reverted: entry fails to load on the new binary at fleet shape EVEN AT ORIGINAL CONFIG
   (see 4.3/4.5). Pre-L4 state restored exactly.
 
-Ornith-Agents-A1-3.6-35B-A3B  (class E, MoE spec)
+Qwen3.5-35B-A3B fine-tune  (class E, MoE spec)
   env: + GGML_CUDA_REPACK_Q8_0=1 + GGML_CUDA_REPACK_Q8_0_STOCK_ACC=0
   Justification: taskV2-moe +1.82% plain-decode sealed bit-identical; taskW2: MoE SPEC
   entries same pair sealed PASS (=1 superset of =2).
 
-Ornith-1.5-MTPv2-trial  (class E, MoE spec)
+Qwen3.6-35B-A3B fine-tune trial  (class E, MoE spec)
   env: [] -> + same pair. Same justification (taskW2).
 
-Ornith-1.5-35B-A3B-abliterated  (class E, MoE plain)
+Qwen3.6-35B-A3B fine-tune  (class E, MoE plain)
   NO CHANGE NEEDED: owner already had the pair. Smoke-validated on new binary (4.2).
 
 Class B (27B Q4_0 d7-class f0ldsq4kv + RP_Q6K_LDS): NO MATCHING FLEET ENTRY - the only
 27B Q4_0 DFlash2 entry is the d4 champion (class A). RP_Q6K_LDS therefore absent.
 Class F (R7 combine), G (QWIRE), H (PER_UID): OFF everywhere; verified absent from config.
 Owner's pre-existing GGML_CUDA_W4A4_DOT8=1 + W4A4_MIN_TOKENS=128 on the out-of-scope
-123B entries (Behemoth, Monstral) left untouched.
+123B entries (Behemoth, Mistral-Large fine-tune) left untouched.
 
 ## 4. Smoke results (step 5; all under flock /root/gpu.lock -w 2700)
 
@@ -84,7 +84,7 @@ bench.py protocol temp0/seed42/ignore_eos/cache_prompt-false).
   tg med 57.72 (ref 58.20/58.33/58.06, within run-to-run); sanity tg 53.89.
   Clean unload, VRAM drained to ~21 MB/card.
 
-4.2 Ornith-1.5-35B-A3B-abliterated (35B MoE plain, class E pair) - PASS
+4.2 Qwen3.6-35B-A3B fine-tune (35B MoE plain, class E pair) - PASS
   probe sha16 = 77841cb6a251235d both reps (bit-identical class E).
   Banner witness: "CUDA repack: GGML_CUDA_REPACK_Q8_0 gate ACTIVE", "REPACK = 1",
   "Meta(ROCm1_Repacked,ROCm0_Repacked) model buffer size = 1432.08 MiB".

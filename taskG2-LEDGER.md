@@ -46,7 +46,7 @@ Skipped (reasons):
     layer, 202K ctx); win not measured there. Flag for a dedicated A/B.
   - ft-26ba4b: gemma4, expert_count=128, Q8_0 MoE - not the
     measured class.
-  - Dense Q8_0 entries (Cydonia 24B, gemma-4 31B Q8s, Qwen3.8-27B Q8s,
+  - Dense Q8_0 entries (Mistral-24B fine-tune 24B, gemma-4 31B Q8s, Qwen3.8-27B Q8s,
     Qwen3.6-27B Fable, Muse-Glimmer 30B [no expert tensors], Smaug,
     nsfwvision, qwen3-vl-8b, ft-g31-o, ft-h-neo-q8s): dense - out of
     scope per tasking (neutrality unproven on current build).
@@ -69,14 +69,14 @@ not journalled).
 
 ## Results
 Pre baselines (stock): OA 124.23/124.38 (MTP 170/170 accept);
-O1.5 108.25/108.05; MTPv2-trial 138.67/138.88 (168/168 accept).
-Pre banners (O1.5, MTPv2): "gate inactive (env mode 0)" + "STOCK_ACC ACTIVE",
+MoE fine-tune 108.25/108.05; MoE fine-tune trial 138.67/138.88 (168/168 accept).
+Pre banners (MoE fine-tune, MTPv2): "gate inactive (env mode 0)" + "STOCK_ACC ACTIVE",
 both TP ranks. OA pre-banner not captured (journal-based capture failed
 before the logs/stream discovery); pre-state proven by live-process env
 witness (no REPACK_Q8_0 vars).
 
 Post (repack arm):
-  O1.5-35B-A3B-abliterated: banners "REPACK_Q8_0 gate ACTIVE (mode 1)" +
+  MoE fine-tune-35B-A3B-abliterated: banners "REPACK_Q8_0 gate ACTIVE (mode 1)" +
     "REPACK_Q8_0_YIELD gate ACTIVE" + q8_repack on devices 1+2; greedy
     BITID PASS 5/5; tg256 109.40/109.53 -> +1.22% vs pre median. ADOPTED.
   ft-q36moe-mtp: banner showed q8_repack on all 3 devices with shape hint
@@ -86,7 +86,7 @@ Post (repack arm):
     seq_id=0 (non-finite draft probability)" on every request; draft stats
     0 accepted; tg256 69.2/76.6 = -41.4%. REVERTED. Post-revert: greedy EQ
     to pre, tg 124.1 (rep2), banner gate OFF, no repack lines. HEALTHY.
-  MTPv2-trial: banners ACTIVE (gate+YIELD, both layouts witnessed); greedy
+  MoE fine-tune trial: banners ACTIVE (gate+YIELD, both layouts witnessed); greedy
     BITID PASS 5/5; tg256 131.17/132.33 -> -5.06% vs pre (within-arm spreads
     0.15%/0.88%, draft 168/168 identical both arms -> resolved, not noise).
     REVERTED. Post-revert: greedy EQ to pre, tg 137.6 (rep2). HEALTHY.

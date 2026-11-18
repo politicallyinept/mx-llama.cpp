@@ -11,7 +11,7 @@
 
 | Commit | What | Why it matters here |
 |---|---|---|
-| c8edceb06 (#27841) | GCN MMQ launch-config table (`mmq-config-gcn.cuh`, 281 lines) | **Governs MI50 decode**: upstream classifies gfx906 as GCN (cc < CDNA1). Affects MMQ models: Cydonia Q8_0, Precog Q4_0, all non-toggled entries, DFlash draft. NOT the two W4A4-toggled models (repack path bypasses MMQ). No upstream gfx906 numbers -> must A/B. |
+| c8edceb06 (#27841) | GCN MMQ launch-config table (`mmq-config-gcn.cuh`, 281 lines) | **Governs MI50 decode**: upstream classifies gfx906 as GCN (cc < CDNA1). Affects MMQ models: Mistral-24B Q8_0, Mistral-Large Q4_0 fine-tune, all non-toggled entries, DFlash draft. NOT the two W4A4-toggled models (repack path bypasses MMQ). No upstream gfx906 numbers -> must A/B. |
 | 2f3fd0252 (#28549) | CUDA graph for MTP draft | Spec-decode base improvement (perf only; correctness bug NOT fixed, see 1b) |
 | 5cdd3d1da (#28630) | MTP kv-cache allocation fix (deepseek2/glm4moe/...) | Draft-model correctness fix |
 | 415e909d8 (#28390) | Single-device drafter meta backend wrapper | Drafter robustness |
@@ -34,7 +34,7 @@
 | ggml/src/ggml-backend-meta.cpp | PLX meta sched copies | meta backend wrapper | manual, HIGH CARE (sched core) |
 | ggml/src/ggml-cuda/ggml-cuda.cu | custom AR dispatch + W4A4 dispatch | allreduce dispatcher + NVFP4 dispatch | keep BOTH gates; custom-AR gate must stay ahead of generic allreduce in dispatch order |
 | ggml/src/ggml-cuda/mmq.cu | repack interplay | GCN table selector + NVFP4 tiles | manual; repack short-circuit must precede MMQ config lookup |
-| src/llama-arch.cpp/.h | gemma4/wordsmith arch | prec-policy refactor (52 lines) | union |
+| src/llama-arch.cpp/.h | gemma4/Gemma4-31B fine-tune arch | prec-policy refactor (52 lines) | union |
 | src/llama-context.cpp/.h | set_sampler guard + MTP opt | prec plumbing + batch_ext | keep fork guard EXACTLY; do not "simplify" |
 | src/llama-graph.cpp/.h | W4A4 hints | prec policy +9 lines | union |
 | src/llama-model.cpp | fork deltas | prec policy +53 lines | union |
@@ -55,7 +55,7 @@
 
 ### Phase A - GCN MMQ table A/B (the new variable, isolated)
 - A = current prod binary (pre-merge), B = merged build
-- Models: **Cydonia-R1-24B-v4f** (Q8_0 pure MMQ) and **Precog** (Q4_0 repack-off path)
+- Models: **Mistral-24B fine-tune** (Q8_0 pure MMQ) and **Mistral-Large fine-tune** (Q4_0 repack-off path)
 - Matrix: tg128 + pp2048, 3 runs each, interleaved A/B/A/B
 - **Gate: any tg128 regression > 2% -> stop, bisect mmq-config-gcn table** (worst case: pin the old config as a local patch; the file is self-contained)
 

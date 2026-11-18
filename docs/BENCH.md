@@ -156,8 +156,8 @@ Backup: config.yaml.bak-20260908-listsync. Applied via text-preserving transform
 - REMOVED (9): model files gone from disk (community finetune quants, names withheld).
 - ADDED (8): a community-abliterated Qwen3.8-27B quant (27.1G), Qwen3.8-27B base Q8/Q4(27.1/15.0G),
  Muse-Glimmer-30B(27.6G, gemma preset), community-FT-1.5-35B Q8/Q4(34.4/19.7G),
- endless-frontier-BigBang-v1(35.2G), Mistral-7B-v0.3-abliterated(4.1G, spec-draft
- utility). my-stories-lora.gguf excluded (LoRA adapter, not servable).
+ community 35B fine-tune(35.2G), Mistral-7B-v0.3-abliterated(4.1G, spec-draft
+ utility). LoRA adapter file excluded (LoRA adapter, not servable).
 - DEVICE RULE applied per owner: <=35GB -> --device ROCm1,ROCm2 (low-latency pair);
  >35GB -> all three GPUs. 15 existing entries migrated.
 - LANDMINE SWEEP: 0 remaining -sm layer / --fit on / --fit-ctx; every entry has
