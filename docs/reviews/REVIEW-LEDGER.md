@@ -563,47 +563,57 @@ MECHANISM HYPOTHESIS - PER-WIDTH ADMISSION (HYPOTHESIS, UNTESTED)
   n-max 4, the width path is implicated.
 
 --------------------------------------------------------------------------------
-THE 58.20 DISCREPANCY - EXPLAINED (this was unexplained in the 22:20 compile)
+THE 58.20 DISCREPANCY - UNDECOMPOSED (title corrected 2026-11-24; this block
+previously read "EXPLAINED" and attributed the whole gap to the walk regression)
 --------------------------------------------------------------------------------
   The quiet sweep measured the champion at 48.72 (tg_ts) on its box and 53.5
-  (tg_incl_draft) on mine, vs the historically recorded 58.20 t/s. This is NOT
-  contention. It is the documented DRAFT/TARGET WALK REGRESSION.
+  (tg_incl_draft) on mine, vs the historically recorded 58.20 t/s. That is a
+  -16.3 pct throughput gap (48.72/58.20 - 1). The DRAFT/TARGET WALK REGRESSION
+  documented in the G4-PHASE2 ledger section 3 does NOT account for it: the
+  measured acceptance on those legs is 0.4255 (160/376, all 14 r9 legs), only
+  -2.79 pct below the pre-regression 0.4377 (0.4255/0.4377 - 1), against a
+  fully-regressed reference that carried 0.3480. A 2.8 pct acceptance delta
+  cannot produce a 16.3 pct throughput delta. Reading 0.4255 as "partially
+  regressed, therefore explained" was a qualitative placement, not a
+  decomposition. The gap is UNDECOMPOSED.
 
-  PRIMARY SOURCE: /root/wt-g4-phase2/taskG4-PHASE2-LEDGER.md section 3
-  ("BASELINE ANOMALY -- uwave->tip walk regression"), verified by direct read.
-  That section records, on this exact build lineage:
-    - d4-ctrl measured 40.14 t/s at acceptance 0.348, against the adopt
-      a-ctrl historical 57.41 t/s at acceptance 0.4377 with a byte-identical
-      env/args/files/pair (verified by witness diff in that ledger).
-    - Per-prompt acceptance shifts are NON-UNIFORM (dialogue 0.642 -> 0.265,
-      econ 0.661 -> 0.299, math 0.578 -> 0.709, code 0.888 -> 0.849), which is
-      the signature of a draft/target walk divergence, not a speed effect.
-    - The divergence was introduced somewhere in the uwave (e9b3e3197, Nov 14)
-      -> tip merge range: k1-headsplit, k2-headkernel, k3-q6lds, fix4,
-      d0-determ, dg-graphreplay, d1-vecdot.
-    - The 64-token greedy probe is canonical on both eras, so the divergence is
-      beyond the probe horizon - which is why the probe hash (77841cb6...) does
-      not flag it.
+  FOUR CONFOUNDS, ALL UNQUANTIFIED. None of them is measured on the record,
+  so none of them may be cited as the cause; they are the reasons the gap
+  cannot currently be attributed to anything.
+  (a) PAIR IDENTITY UNKNOWN. The 58.20 run used physical cards that, after a
+      card removal around 2026-11-21, no longer correspond to the same device
+      indices. No index-to-serial map exists in the record, so it is not
+      established that the historical pair is the pair used today. See
+      docs/reviews/hardware-events.md.
+  (b) HARNESS CHANGED. 58.20 was a bench.py 8-prompt suite median; 48.72 is a
+      single 112-token greedy prompt measured through raw /completion. The two
+      figures are not produced by the same procedure and are not known to be
+      comparable.
+  (c) BUILD CHANGED. 58.20 predates the uwave-era to tip merge range and was
+      taken on a build that no longer exists on this box. The gap therefore
+      spans two builds; how much of it is the walk, and how much is anything
+      else in that range, is unmeasured.
+  (d) THE PCIe FABRIC CHANGED. Link speed was later fixed from Gen3 to Gen4,
+      roughly doubling available device bandwidth. All pre-fix throughput
+      numbers, 58.20 included, were taken on the slower fabric. This is a HARDWARE
+      change, not a code change, and it is invisible in every build-level
+      comparison. See docs/reviews/hardware-events.md.
 
-  CORROBORATION BY ACCEPTANCE (acceptance is deterministic; timing is not):
-    pre-regression reference : 0.4377  (3888/8883, taskR6/taskW3 family)
-    fully-regressed reference : 0.3480  (taskG4-PHASE2-LEDGER.md section 3,
-                                         d4-ctrl / d4-cand)
-    OBSERVED on this build   : 0.4255  (160/376, all 14 r9 legs)
-  0.4255 sits BETWEEN 0.4377 and 0.3480, close to the pre-regression end -
-  exactly what a PARTIALLY regressed walk predicts. The build in the quiet
-  sweep is /root/build-g4p2b (src_sha 94d1dbaa38..., Nov 17), which lies INSIDE
-  the uwave->tip merge range named above.
-  CONCLUSION: the 58.20 reference is NOT reproducible on this binary BY
-  CONSTRUCTION of the build lineage - it predates the regression. Comparing
-  quiet-box absolutes to 58.20 compares across a known regression and will
-  always show a ~10-16% "loss" that is not contention and not the LDS gate.
-  CONSEQUENCE FOR THIS ITEM: the champion baseline is ~53.5 (tg_incl_draft) /
-  48.7 (tg_ts) on this build, NOT 58.20 and NOT the contended 52.19. All LDS
-  comparisons above are already made within-build, which is why the +5.70%
-  figure is the one to trust.
-  A dedicated bisect lane is still owed (taskG4-PHASE2-LEDGER.md section 3
-  RECOMMENDs it); until it lands, treat absolute t/s as build-specific.
+  WHAT SURVIVES FROM THE ORIGINAL BLOCK (unchanged):
+    - The +11.00 pct decode win (57.9284 vs 52.1895) is STRUCK. It was reachable
+      only by comparing a derived champion median with the LDS fast-mode cluster,
+      a selection artifact. See CORRECTIONS C-2.
+    - The champion baseline on this build is ~53.5 (tg_incl_draft) / 48.7
+      (tg_ts), NOT 58.20 and NOT the contended 52.19. The 52.19 reading was a
+      contended-box figure.
+    - ALL LDS COMPARISONS IN THIS LEDGER ARE WITHIN-BUILD. That is why the
+      +5.70 pct median figure (Welch t = 1.065, n.s.) is the one to trust. A
+      within-build comparison is immune to confounds (a), (c) and (d) above,
+      which is exactly why it is the only comparison this record supports.
+    - Absolute t/s are BUILD- AND FABRIC-SPECIFIC. Compare within-build only.
+  A dedicated bisect lane is still owed; until it lands, and until a leg
+  witnesses physical card identity, no cross-era absolute may be quoted as a
+  regression figure.
 
 LIMITS
   - 7 legs per arm; one prompt (112 tokens), n_predict 256, one n-max (4).

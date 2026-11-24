@@ -1,4 +1,4 @@
-# taskD1 — VEC_DOT ALU REWRITE for the mmvq family (gfx906)
+# taskD1  -  VEC_DOT ALU REWRITE for the mmvq family (gfx906)
 
 Branch `int4-d1-vecdot` from `int4-fix4` (e3dac6d835; code-identical to 468f0bbd84,
 delta is ledger-only). Big-lane D1: replace the "scalar nibble-decode" in
@@ -12,17 +12,18 @@ head shape (5120x248320) and the Q4_0 attn_q shape (5120x6144) at widths 1-8.
 32/32 shape x width combos, every arm bit=1 det=1; GPU-vs-CPU oracle 12/12 PASS)
 but the go bar is not met: best bit-exact arm per width is **+2.7%..+21.5%** on the
 Q6_K head and **+1.5%..+26.3%** on Q4_0 attn_q (bar: >= 25% at EVERY width on both).
-No e2e legs, no KLD, no production routing. The lane premise — "the shortfall is
-ALU: the scalar nibble-decode" — is refuted by ISA + roofline: the compiler already
+No e2e legs, no KLD, no production routing. The lane premise  -  "the shortfall is
+ALU: the scalar nibble-decode"  -  is refuted by ISA + roofline: the compiler already
 emits `v_dot4_i32_i8` for every integer product (no scalar nibble loop exists in
 this codebase; `v_dot8` does not exist on GCN), the decode+saturation lowering is
+[CORRECTION R-review C1 (2026-11-24): THE CLAIM IN THIS PARAGRAPH IS FALSE. v_dot8 DOES exist on this ISA. It is present in this tree at ggml/src/ggml-cuda/common.cuh lines 755-772 (ggml_cuda_dp8a, __builtin_amdgcn_sdot8 -> v_dot8_i32_i4), guarded by `#if defined(GGML_USE_HIP) && defined(__gfx906__)` because LATER AMD ISAs dropped the 8-way int4 dot - the opposite of the original claim below. The original text is retained unstruck for the record; the strike is authoritative. Standing rule: grep common.cuh before asserting any instruction is absent on this arch. Full strike and consequence: docs/reviews/REVIEW-LEDGER.md, taskD1 CORRECTIONS C1.]
 ~24 of 239 kernel instructions at Q6_K T=1, and removing ALL of it yields <= 16%.
 The mmvq family on gfx906 is bounded by **load latency + L1 activation re-read
 traffic**, not decode ALU. See "Ceiling analysis".
 
 ## Design
 
-`taskD1-mb/d1-mmvq.cuh` — bit-identical twins `mul_mat_vec_q_q6k_d1<T, nwarps, rpb,
+`taskD1-mb/d1-mmvq.cuh`  -  bit-identical twins `mul_mat_vec_q_q6k_d1<T, nwarps, rpb,
 D1_DECODE, UNROLL>` / `mul_mat_vec_q_q40_d1<T, nwarps, rpb, UNROLL>`:
 
 - Geometry mirrors `mul_mat_vec_q` on the GCN table verbatim (review rule 2,
@@ -45,7 +46,7 @@ D1_DECODE, UNROLL>` / `mul_mat_vec_q_q40_d1<T, nwarps, rpb, UNROLL>`:
 - **UNROLL sweep**: `#pragma unroll U` on the kbx loop (generic has it commented
   out); pure scheduling change, per-lane kbx chain order unchanged.
 - **roofline-read** diagnostic kernel: same geometry + same weight-load pattern,
-  no activations, no dots — the weight-read ceiling of the access pattern.
+  no activations, no dots  -  the weight-read ceiling of the access pattern.
 
 ## Verification (template, review rule 6)
 
@@ -97,7 +98,7 @@ Q4_0 ffn   5120x9216     1       69.6      42.4      626     d1-hoist-u4  +25.4 
                          ...    (T=2..8: +3.4..+30.3, full table in mb-full.log)
 ```
 
-Run-to-run variance note: a prior quick run (15 iters, different box power state —
+Run-to-run variance note: a prior quick run (15 iters, different box power state  -
 GPU0 burn-in + sibling lanes share the power budget) gave head T=1 raw +7.8/+10.0%
 vs full-run +16.1/+18.4%. Small-shape attn_q deltas swing widely (+21..+57%); the
 head numbers are the stable, decision-relevant ones. No width on either target
@@ -109,7 +110,8 @@ ISA (pinned compiler, --save-temps, per-kernel counts):
 - **v_dot4_i32_i8 is already emitted for every integer product** in the generic
   kernel (2/4 per kbx at Q6_K T=1, scaling with T; 64 at Q4_0 T=8). gfx906 has
   dot4 (correctness proven by the CPU oracle at T=2,5,8); **v_dot8 does not exist
-  on GCN** — the task's v_dot8 option is not on this ISA, and the PRMT-style
+  on GCN**  -  the task's v_dot8 option is not on this ISA, and the PRMT-style
+  [CORRECTION R-review C1 (2026-11-24): THE CLAIM IN THIS PARAGRAPH IS FALSE. v_dot8 DOES exist on this ISA. It is present in this tree at ggml/src/ggml-cuda/common.cuh lines 755-772 (ggml_cuda_dp8a, __builtin_amdgcn_sdot8 -> v_dot8_i32_i4), guarded by `#if defined(GGML_USE_HIP) && defined(__gfx906__)` because LATER AMD ISAs dropped the 8-way int4 dot - the opposite of the original claim below. The original text is retained unstruck for the record; the strike is authoritative. Standing rule: grep common.cuh before asserting any instruction is absent on this arch. Full strike and consequence: docs/reviews/REVIEW-LEDGER.md, taskD1 CORRECTIONS C1.]
   nibble unpack is already 2-4 VALU ops (and/shift/or), not a scalar loop.
 - Generic Q6_K T=1 kernel: 239 instructions; the `__vsubss4` saturation lowering
   (v_add_u16 + v_add_co/v_addc + v_cmp_lt + v_cndmask x2 dots) is ~24; total
@@ -119,7 +121,7 @@ ISA (pinned compiler, --save-temps, per-kernel counts):
 - No spills anywhere (privseg=0, VGPR 22-64) => occupancy is not register-limited;
   unroll variants only thrash L1 (u2/u4 regress -10..-21% at T>=4).
 - **Roofline-read** (same geometry, weights only): head sustains 630-666 GB/s
-  (~73-78% of the 858 GB/s practical flat-read figure — the 210 B block / 5-load
+  (~73-78% of the 858 GB/s practical flat-read figure  -  the 210 B block / 5-load
   pattern is near its own ceiling). Generic sits at 34-63% of that roof; the gap
   is activation traffic + f16 cvt + fp accumulate, all MANDATORY for bit-exactness:
   at T=8 each block re-reads all T columns' q8_1 blocks (~14x weight bytes in L1

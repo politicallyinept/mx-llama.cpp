@@ -50,7 +50,11 @@ Per-leg detail (from /root/r10/logs/r9_lds_r*.log):
   r2    41.76    254     160 / 376            6132.86 ms / 256 tokens
 
 Every leg evaluated exactly 256 tokens. Every leg accepted exactly 160 of
-376 drafts. Acceptance is bit-identical, so the token path did not change.
+376 drafts. Acceptance is AGGREGATE-identical (walk not compared): the accepted/drafted
+TOTALS match, but n_gen varies between legs, and equal totals over different step counts
+imply the per-step acceptance walk DIFFERS. Aggregate identity therefore does NOT establish
+that the token path is unchanged; the SAME-KERNEL verdict rests on the kernel-trace evidence
+(identical dispatch counts and kernel sets in taskR11), not on this acceptance argument.
 The only quantity that moves is elapsed wall time (4785 to 6133 ms, +28 pct).
 
 n_gen varies inversely with speed (254 at the slowest leg, 183 at the

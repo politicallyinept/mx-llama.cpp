@@ -14,6 +14,14 @@ Placement    : --device ROCm0,ROCm1 -devd ROCm0 -sm tensor
 Flags        : --spec-type draft-dflash --spec-draft-n-max 4 -ctk q4_0 -ctv q4_0 -ngl 99
                -fa on --fit off -c 8192 -ub 1024 -t 16 -np 1 -lm dio --seed 42
 Request      : temp 0 (greedy), seed 42, n_predict 256, cache_prompt false, 112-token prompt
+
+NOTE (2026-11-24): THREE THROUGHPUT METRICS CIRCULATE and they disagree by 5-10 pct:
+  tg_ts (decode only, draft excluded), tg_incl_draft (includes draft time), and the
+  server's bare tg line. Quoting different ones from one dataset has produced a 4x
+  effect-size range across ledgers. ADOPTED PRIMARY METRIC from 2026-11-24:
+  predicted_n / predicted_ms from the response timings block. Verdict lines below
+  quote tg_ts for historical continuity; read them against this note.
+
 Measurement  : server-side response.timings (predicted_ms/predicted_n) + "draft acceptance" log line
 
 --------------------------------------------------------------------------------
